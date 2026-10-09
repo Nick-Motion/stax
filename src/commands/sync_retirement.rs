@@ -944,12 +944,18 @@ else: fail()
 
     #[test]
     fn bb_owner_unresolvable_ancestor_registration_still_fails_closed() {
-        let dir = fixture();
-        add_remote(dir.path());
         // The registered path contains the target but is not a Git worktree:
-        // the prefilter must still send it through the overlap check.
-        let (cli, _, _) = fake_bb(dir.path(), dir.path(), "ancestor");
-        assert!(resolve_bb_owner(dir.path(), "origin", dir.path(), Some(&cli)).is_err());
+        // the prefilter must still send it through the overlap check. A broken
+        // gitfile keeps it unresolvable even when the temp root sits inside
+        // another repository.
+        let outer = tempfile::tempdir().unwrap();
+        fs::write(outer.path().join(".git"), "gitdir: missing\n").unwrap();
+        let repo = outer.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        add_remote(&repo);
+        let (cli, _, _) = fake_bb(&repo, &repo, "ancestor");
+        assert!(resolve_bb_owner(&repo, "origin", &repo, Some(&cli)).is_err());
     }
 
     #[test]

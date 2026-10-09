@@ -6146,6 +6146,8 @@ mod tests {
         let info = |name: &str| MergedBranchInfo {
             branch: name.to_string(),
             merge_type: MergeType::SquashMerge,
+            observed_branch_oid: format!("{name}-head"),
+            merged_pr_head_oid: None,
         };
         let planned = vec![info("m"), info("a"), info("z")];
         let fresh = vec![info("q"), info("b")];

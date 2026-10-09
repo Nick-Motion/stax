@@ -225,11 +225,11 @@ fn sync_confirm_delete_false_still_asks_about_linked_worktree() {
 
     let home = repo.clean_home();
     write_home_config(&home, "[sync]\nconfirm_delete = false\n");
-    // Second option: remove the worktree and delete the branch.
+    // First option: remove the worktree and delete the branch.
     let out = run_stax_in_script_with_env(
         &repo.path(),
         &["sync"],
-        "wait_for_tui_text \"What should stax do?\"; printf '\\033[B\\n'",
+        "wait_for_tui_text \"What should stax do?\"; printf '\\n'",
         &[("HOME", &home)],
     );
     assert!(out.status.success(), "stderr: {}", TestRepo::stderr(&out));

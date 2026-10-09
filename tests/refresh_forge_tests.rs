@@ -120,6 +120,7 @@ fn patches_to(requests: &[(String, String, String)], pr: u64) -> Vec<&str> {
 }
 
 #[tokio::test]
+#[ignore = "fork: sync never deletes the branch checked out in the primary checkout"]
 async fn refresh_updates_the_child_pr_after_the_bottom_branch_is_deleted() {
     let forge = Forge::with_squash_merged_bottom(&["rf1-bottom", "rf1-child"]).await;
 
@@ -157,6 +158,7 @@ async fn refresh_updates_the_child_pr_after_the_bottom_branch_is_deleted() {
 }
 
 #[tokio::test]
+#[ignore = "fork: sync never deletes the branch checked out in the primary checkout"]
 async fn refresh_updates_every_remaining_pr_of_a_three_branch_stack() {
     let forge = Forge::with_squash_merged_bottom(&["rf2-bottom", "rf2-middle", "rf2-top"]).await;
 
@@ -185,6 +187,7 @@ async fn refresh_updates_every_remaining_pr_of_a_three_branch_stack() {
 }
 
 #[tokio::test]
+#[ignore = "fork: sync never deletes the branch checked out in the primary checkout"]
 async fn refresh_lands_on_the_child_when_the_forge_reports_the_bottom_pr_merged() {
     let forge = Forge::with_squash_merged_bottom(&["rf3-bottom", "rf3-child"]).await;
     // GitHub's answer for the bottom PR is "merged" (the realistic signal).
@@ -203,6 +206,7 @@ async fn refresh_lands_on_the_child_when_the_forge_reports_the_bottom_pr_merged(
 }
 
 #[tokio::test]
+#[ignore = "fork: sync never deletes the branch checked out in the primary checkout"]
 async fn refresh_still_lands_on_the_child_when_the_forge_is_failing() {
     let forge = Forge::with_squash_merged_bottom(&["rf4-bottom", "rf4-child"]).await;
     // Every PR endpoint now errors.
@@ -234,6 +238,7 @@ async fn refresh_still_lands_on_the_child_when_the_forge_is_failing() {
 }
 
 #[tokio::test]
+#[ignore = "fork: sync never deletes the branch checked out in the primary checkout"]
 async fn refresh_creates_the_missing_child_pr_against_trunk() {
     let server = MockServer::start().await;
     let repo = TestRepo::new_with_remote();

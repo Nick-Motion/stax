@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use git2::{BranchType, Repository};
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -22,6 +23,8 @@ pub(crate) struct SquashMergedPrefix {
 
 pub struct GitRepo {
     repo: Repository,
+    /// Merge-bases by commit pair. Commits never change, so entries never go stale.
+    merge_bases: RefCell<HashMap<(git2::Oid, git2::Oid), git2::Oid>>,
 }
 
 /// Immutable object IDs for one merge-base branch diff.
@@ -271,6 +274,13 @@ struct BranchParentMetadata {
 }
 
 impl GitRepo {
+    fn new(repo: Repository) -> Self {
+        Self {
+            repo,
+            merge_bases: RefCell::default(),
+        }
+    }
+
     /// Open the repository at the current directory or any parent
     pub fn open() -> Result<Self> {
         let repo = Repository::discover(".").map_err(|_| {
@@ -278,14 +288,14 @@ impl GitRepo {
                 "Not in a Git repository. Run this command from inside a Git repository."
             )
         })?;
-        Ok(Self { repo })
+        Ok(Self::new(repo))
     }
 
     /// Open the repository from a known repository path without rediscovering the cwd.
     pub fn open_from_path(path: &Path) -> Result<Self> {
         let repo = Repository::open(path)
             .with_context(|| format!("Failed to open git repository at '{}'", path.display()))?;
-        Ok(Self { repo })
+        Ok(Self::new(repo))
     }
 
     /// Re-open this repository from scratch, returning a new `GitRepo` with a fresh libgit2
@@ -1925,15 +1935,27 @@ Use --auto-stash-pop or stash/commit changes first.",
             .get()
             .peel_to_commit()?;
 
-        let base = self.repo.merge_base(left_commit.id(), right_commit.id())?;
+        let base = self.merge_base_oid(left_commit.id(), right_commit.id())?;
         Ok(base.to_string())
+    }
+
+    /// Sync asks for the same trunk/branch merge-base several times, and each
+    /// libgit2 walk costs ~15 ms on a large history.
+    fn merge_base_oid(&self, left: git2::Oid, right: git2::Oid) -> Result<git2::Oid, git2::Error> {
+        let cached = self.merge_bases.borrow().get(&(left, right)).copied();
+        if let Some(base) = cached {
+            return Ok(base);
+        }
+        let base = self.repo.merge_base(left, right)?;
+        self.merge_bases.borrow_mut().insert((left, right), base);
+        Ok(base)
     }
 
     /// Find merge-base commit between any two refs (branch names, remote refs, or SHAs).
     pub fn merge_base_refs(&self, left: &str, right: &str) -> Result<String> {
         let left_oid = self.resolve_to_oid(left)?;
         let right_oid = self.resolve_to_oid(right)?;
-        Ok(self.repo.merge_base(left_oid, right_oid)?.to_string())
+        Ok(self.merge_base_oid(left_oid, right_oid)?.to_string())
     }
 
     /// Check whether `ancestor` is an ancestor of `descendant`.
@@ -2004,8 +2026,7 @@ Use --auto-stash-pop or stash/commit changes first.",
                 let Ok(base_commit) = base_branch.get().peel_to_commit() else {
                     return false;
                 };
-                self.repo
-                    .merge_base(base_commit.id(), branch_commit.id())
+                self.merge_base_oid(base_commit.id(), branch_commit.id())
                     .map(|base_oid| base_oid == branch_commit.id())
                     .unwrap_or(false)
             });
@@ -2196,10 +2217,7 @@ Use --auto-stash-pop or stash/commit changes first.",
             .peel_to_commit()?;
 
         // Branch is merged if its commit is an ancestor of trunk
-        Ok(self
-            .repo
-            .merge_base(trunk_commit.id(), branch_commit.id())?
-            == branch_commit.id())
+        Ok(self.merge_base_oid(trunk_commit.id(), branch_commit.id())? == branch_commit.id())
     }
 
     /// Cheap merge-equivalence checks only (ancestor + identical tree). Returns `Some(())` if
@@ -2374,8 +2392,7 @@ Use --auto-stash-pop or stash/commit changes first.",
             .resolve_to_oid(branch)
             .with_context(|| format!("Failed to resolve branch '{branch}' against '{parent}'"))?;
         let merge_base_oid = self
-            .repo
-            .merge_base(parent_oid, branch_oid)
+            .merge_base_oid(parent_oid, branch_oid)
             .with_context(|| {
                 format!("Failed to find merge base for parent '{parent}' and branch '{branch}'")
             })?;
@@ -3062,9 +3079,7 @@ mod tests {
         run_git(path, &["add", "b.txt"]);
         run_git(path, &["commit", "-m", "Feature B"]);
 
-        let repo = GitRepo {
-            repo: Repository::open(path).expect("open repo"),
-        };
+        let repo = GitRepo::new(Repository::open(path).expect("open repo"));
         let pairs = vec![
             ("main".to_string(), "feature-a".to_string()),
             ("main".to_string(), "feature-b".to_string()),
@@ -3125,9 +3140,7 @@ mod tests {
         run_git(path, &["checkout", "-b", "child"]);
         run_git(path, &["checkout", "parent"]);
 
-        let repo = GitRepo {
-            repo: Repository::open(path).expect("open repo"),
-        };
+        let repo = GitRepo::new(Repository::open(path).expect("open repo"));
 
         crate::git::refs::write_metadata(
             &repo.repo,

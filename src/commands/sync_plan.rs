@@ -737,8 +737,8 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
                         .get(branch)
                         .is_some_and(|info| info.pr_number.is_some())
                     || crate::commands::sync::should_spare_empty_never_submitted_branch(
-                        &workdir, &stack, branch,
-                    )?
+                        &repo, &stack, branch,
+                    )
                 {
                     continue;
                 }

@@ -2187,11 +2187,7 @@ impl SyncContext {
                         .branches
                         .get(&branch)
                         .is_some_and(|b| b.pr_number.is_some())
-                    || should_spare_empty_never_submitted_branch(
-                        &self.workdir,
-                        &self.stack,
-                        &branch,
-                    )?
+                    || should_spare_empty_never_submitted_branch(repo, &self.stack, &branch)
                 {
                     continue;
                 }
@@ -3854,15 +3850,15 @@ pub(super) struct PartiallyMergedNote {
 }
 
 pub(super) fn should_spare_empty_never_submitted_branch(
-    workdir: &Path,
+    repo: &GitRepo,
     stack: &Stack,
     branch: &str,
-) -> Result<bool> {
+) -> bool {
     let Some(info) = stack.branches.get(branch) else {
-        return Ok(false);
+        return false;
     };
     if info.pr_number.is_some() {
-        return Ok(false);
+        return false;
     }
 
     // Use the recorded parent revision so branches with real commits that were
@@ -3872,11 +3868,22 @@ pub(super) fn should_spare_empty_never_submitted_branch(
         .as_deref()
         .or(info.parent.as_deref())
         .unwrap_or(&stack.trunk);
-    Ok(!has_unique_commits_since_any_base(
-        workdir,
-        branch,
-        &[parent],
-    )?)
+    // Empty means `parent..branch` lists no commits, so the branch is the
+    // parent or one of its ancestors. A name that does not resolve spares
+    // nothing.
+    let commit = |name: &str| {
+        repo.inner()
+            .revparse_single(&format!("{name}^{{commit}}"))
+            .map(|commit| commit.id())
+    };
+    let (Ok(parent), Ok(tip)) = (commit(parent), commit(branch)) else {
+        return false;
+    };
+    tip == parent
+        || repo
+            .inner()
+            .graph_descendant_of(parent, tip)
+            .unwrap_or(false)
 }
 
 /// Union planned merged branches with a post-trunk fast re-scan. Planned entries
@@ -4004,7 +4011,7 @@ fn find_merged_branches_with_prs_after_enumeration(
             .branches
             .get(branch)
             .is_some_and(|info| info.pr_number.is_none())
-            && !should_spare_empty_never_submitted_branch(workdir, stack, branch)?
+            && !should_spare_empty_never_submitted_branch(repo, stack, branch)
         {
             merged.push(MergedBranchInfo {
                 branch: branch.to_string(),
@@ -4055,7 +4062,7 @@ fn find_merged_branches_with_prs_after_enumeration(
                 .get(branch)
                 .is_some_and(|info| info.pr_number.is_none())
                 && !merged.iter().any(|info| info.branch == branch)
-                && !should_spare_empty_never_submitted_branch(workdir, stack, branch)?
+                && !should_spare_empty_never_submitted_branch(repo, stack, branch)
             {
                 merged.push(MergedBranchInfo {
                     branch: branch.to_string(),
@@ -4119,7 +4126,7 @@ fn find_merged_branches_with_prs_after_enumeration(
         {
             continue;
         }
-        if should_spare_empty_never_submitted_branch(workdir, stack, branch)? {
+        if should_spare_empty_never_submitted_branch(repo, stack, branch) {
             continue;
         }
         // Remote still exists -> not merged via squash-delete; skip expensive check.
@@ -6017,6 +6024,84 @@ mod tests {
                 .copied()
         });
         assert_eq!(counts, [Some(6), Some(4), Some(4), Some(0), None]);
+    }
+
+    #[test]
+    fn spares_only_branches_without_commits_past_their_recorded_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let commit = |file: &str| {
+            std::fs::write(path.join(file), format!("{file}\n")).unwrap();
+            run(&["add", file]);
+            run(&["commit", "-m", file]);
+            run(&["rev-parse", "HEAD"])
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        let base = commit("base.txt");
+        for branch in ["empty", "behind", "lost-parent", "submitted"] {
+            run(&["branch", branch]);
+        }
+        let later = commit("m1.txt");
+        run(&["branch", "named-parent"]);
+        run(&["switch", "-c", "ahead", &base]);
+        commit("a1.txt");
+
+        let entry = |name: &str, parent_revision: Option<&str>, pr_number: Option<u64>| {
+            let info = crate::engine::stack::StackBranch {
+                name: name.to_string(),
+                parent: Some("main".to_string()),
+                parent_revision: parent_revision.map(str::to_string),
+                children: Vec::new(),
+                needs_restack: false,
+                pr_number,
+                pr_state: None,
+                pr_is_draft: None,
+            };
+            (name.to_string(), info)
+        };
+        let stack = Stack {
+            branches: HashMap::from([
+                entry("empty", Some(&base), None),
+                entry("ahead", Some(&base), None),
+                entry("behind", Some(&later), None),
+                entry("named-parent", None, None),
+                entry(
+                    "lost-parent",
+                    Some("0123456789abcdef0123456789abcdef01234567"),
+                    None,
+                ),
+                entry("submitted", Some(&base), Some(7)),
+            ]),
+            trunk: "main".to_string(),
+        };
+        let repo = GitRepo::open_from_path(path).unwrap();
+        let spared = [
+            "empty",
+            "ahead",
+            "behind",
+            "named-parent",
+            "lost-parent",
+            "submitted",
+            "untracked",
+        ]
+        .map(|branch| should_spare_empty_never_submitted_branch(&repo, &stack, branch));
+        assert_eq!(spared, [true, false, true, true, false, false, false]);
     }
 
     fn linked_worktree_cleanup(blockers: &[&'static str]) -> BlockingWorktreeCleanup {

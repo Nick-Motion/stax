@@ -32,6 +32,8 @@ pub(super) const PR_METADATA_REFRESH_CONCURRENCY: usize = 8;
 pub(super) struct SyncHistoryCache {
     patch_ids: HashMap<(String, String), HashSet<String>>,
     counts: HashMap<(String, String), usize>,
+    /// Patch-id by trunk commit. `None` marks a commit with an empty diff.
+    commit_patch_ids: HashMap<String, Option<String>>,
 }
 
 /// Resolve a `base..head` range to object ids, so cache entries stay valid
@@ -60,6 +62,50 @@ fn cached_patch_ids(
     Ok(ids)
 }
 
+/// Patch-ids of the commits in `merge_base..trunk` that can equal a patch-id of
+/// `branch`. A patch-id hashes file names, so a matching trunk commit changes a
+/// file that some branch commit changes. Only those trunk commits are diffed,
+/// each at most once per sync. Diffing all of trunk takes seconds on a monorepo.
+fn cached_trunk_patch_ids(
+    cache: &mut SyncHistoryCache,
+    repo: &GitRepo,
+    workdir: &Path,
+    merge_base: &str,
+    trunk: &str,
+    branch: &str,
+) -> Result<HashSet<String>> {
+    let (base, tip) = range_key(repo, merge_base, branch);
+    // No paths selects every trunk commit, so a path list too long for one
+    // command line still gives the exact answer.
+    let paths = match repo.files_changed_in_range(workdir, &format!("{base}..{tip}")) {
+        Ok(files) if files.len() <= GitRepo::SQUASH_PREFIX_PATHSPEC_CAP => files,
+        _ => Vec::new(),
+    };
+    let (base, tip) = range_key(repo, merge_base, trunk);
+    let candidates = repo.commits_changing(workdir, &format!("{base}..{tip}"), &paths)?;
+    let unseen: Vec<&str> = candidates
+        .iter()
+        .map(String::as_str)
+        .filter(|commit| !cache.commit_patch_ids.contains_key(*commit))
+        .collect();
+    if !unseen.is_empty() {
+        let mut found: HashMap<String, String> = repo
+            .patch_ids_for_commits(workdir, &unseen)?
+            .into_iter()
+            .map(|(patch_id, commit)| (commit, patch_id))
+            .collect();
+        for commit in unseen {
+            cache
+                .commit_patch_ids
+                .insert(commit.to_string(), found.remove(commit));
+        }
+    }
+    Ok(candidates
+        .iter()
+        .filter_map(|commit| cache.commit_patch_ids.get(commit).cloned().flatten())
+        .collect())
+}
+
 /// Many branches share a merge-base with trunk, so `merge_base..trunk` counts repeat.
 fn cached_rev_list_count(
     cache: &mut SyncHistoryCache,
@@ -77,9 +123,9 @@ fn cached_rev_list_count(
     Ok(count)
 }
 
-/// Use the sync-wide immutable history cache for the conservative fallback too.
-/// The cheap ancestry/tree checks have already been attempted by the caller, so
-/// this reproduces only the bounded patch-id portion of the repo helper.
+/// The patch-id part of `GitRepo::is_branch_merged_equivalent_to_trunk`, through
+/// the sync-wide history cache. Callers have already tried the cheap ancestry
+/// and tree checks.
 fn cached_patch_equivalent(
     cache: &mut SyncHistoryCache,
     repo: &GitRepo,
@@ -97,7 +143,7 @@ fn cached_patch_equivalent(
     if branch_ids.is_empty() {
         return Ok(true);
     }
-    let trunk_ids = cached_patch_ids(cache, repo, workdir, merge_base, trunk)?;
+    let trunk_ids = cached_trunk_patch_ids(cache, repo, workdir, merge_base, trunk, branch)?;
     Ok(!trunk_ids.is_empty() && branch_ids.is_subset(&trunk_ids))
 }
 
@@ -4057,121 +4103,17 @@ fn find_merged_branches_with_prs_after_enumeration(
         }
     }
 
-    if !need_patch_id.is_empty() {
-        let mut by_merge_base: HashMap<String, Vec<String>> = HashMap::new();
-        for (branch, mb) in need_patch_id {
-            by_merge_base.entry(mb).or_default().push(branch);
-        }
-
-        for (merge_base, branches) in by_merge_base {
-            let trunk_count =
-                match cached_rev_list_count(history_cache, repo, workdir, &merge_base, trunk) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        for branch in branches {
-                            if cached_patch_equivalent(
-                                history_cache,
-                                repo,
-                                workdir,
-                                &merge_base,
-                                trunk,
-                                &branch,
-                            )
-                            .unwrap_or(false)
-                            {
-                                merged.push(MergedBranchInfo {
-                                    branch: branch.clone(),
-                                    merge_type: MergeType::SquashMerge,
-                                    observed_branch_oid: resolve_ref_oid(
-                                        workdir,
-                                        &format!("refs/heads/{branch}"),
-                                    )
-                                    .unwrap_or_default(),
-                                    merged_pr_head_oid: None,
-                                });
-                            }
-                        }
-                        continue;
-                    }
-                };
-
-            if trunk_count > GitRepo::PATCH_ID_TRUNK_COMMIT_CAP {
-                for branch in branches {
-                    if cached_patch_equivalent(
-                        history_cache,
-                        repo,
-                        workdir,
-                        &merge_base,
-                        trunk,
-                        &branch,
-                    )
-                    .unwrap_or(false)
-                    {
-                        merged.push(MergedBranchInfo {
-                            branch: branch.clone(),
-                            merge_type: MergeType::SquashMerge,
-                            observed_branch_oid: resolve_ref_oid(
-                                workdir,
-                                &format!("refs/heads/{branch}"),
-                            )
-                            .unwrap_or_default(),
-                            merged_pr_head_oid: None,
-                        });
-                    }
-                }
-                continue;
-            }
-
-            let trunk_patch_ids =
-                match cached_patch_ids(history_cache, repo, workdir, &merge_base, trunk) {
-                    Ok(ids) => ids,
-                    Err(_) => {
-                        for branch in branches {
-                            if cached_patch_equivalent(
-                                history_cache,
-                                repo,
-                                workdir,
-                                &merge_base,
-                                trunk,
-                                &branch,
-                            )
-                            .unwrap_or(false)
-                            {
-                                merged.push(MergedBranchInfo {
-                                    branch: branch.clone(),
-                                    merge_type: MergeType::SquashMerge,
-                                    observed_branch_oid: resolve_ref_oid(
-                                        workdir,
-                                        &format!("refs/heads/{branch}"),
-                                    )
-                                    .unwrap_or_default(),
-                                    merged_pr_head_oid: None,
-                                });
-                            }
-                        }
-                        continue;
-                    }
-                };
-
-            for branch in branches {
-                let branch_patch_ids =
-                    match cached_patch_ids(history_cache, repo, workdir, &merge_base, &branch) {
-                        Ok(ids) => ids,
-                        Err(_) => continue,
-                    };
-                if branch_patch_ids.is_empty() || branch_patch_ids.is_subset(&trunk_patch_ids) {
-                    merged.push(MergedBranchInfo {
-                        branch: branch.clone(),
-                        merge_type: MergeType::SquashMerge,
-                        observed_branch_oid: resolve_ref_oid(
-                            workdir,
-                            &format!("refs/heads/{branch}"),
-                        )
-                        .unwrap_or_default(),
-                        merged_pr_head_oid: None,
-                    });
-                }
-            }
+    for (branch, merge_base) in need_patch_id {
+        if cached_patch_equivalent(history_cache, repo, workdir, &merge_base, trunk, &branch)
+            .unwrap_or(false)
+        {
+            merged.push(MergedBranchInfo {
+                observed_branch_oid: resolve_ref_oid(workdir, &format!("refs/heads/{branch}"))
+                    .unwrap_or_default(),
+                branch,
+                merge_type: MergeType::SquashMerge,
+                merged_pr_head_oid: None,
+            });
         }
     }
 
@@ -4250,16 +4192,25 @@ pub(super) fn find_partially_merged_notes(
             if trunk_count == 0 || trunk_count > GitRepo::PATCH_ID_TRUNK_COMMIT_CAP {
                 continue;
             }
-            let trunk_patch_ids =
-                match cached_patch_ids(history_cache, repo, workdir, &merge_base, &trunk) {
-                    Ok(ids) => ids,
-                    Err(_) => continue,
-                };
             let branch_patch_ids =
                 match cached_patch_ids(history_cache, repo, workdir, &merge_base, &branch) {
                     Ok(ids) => ids,
                     Err(_) => continue,
                 };
+            if branch_patch_ids.is_empty() {
+                continue;
+            }
+            let trunk_patch_ids = match cached_trunk_patch_ids(
+                history_cache,
+                repo,
+                workdir,
+                &merge_base,
+                &trunk,
+                &branch,
+            ) {
+                Ok(ids) => ids,
+                Err(_) => continue,
+            };
             if branch_patch_ids.is_disjoint(&trunk_patch_ids) {
                 continue;
             }
@@ -5794,6 +5745,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn cherry_picked_branch_is_patch_equivalent_among_unrelated_trunk_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let commit = |file: &str| {
+            std::fs::write(path.join(file), format!("{file}\n")).unwrap();
+            run(&["add", file]);
+            run(&["commit", "-m", file]);
+            run(&["rev-parse", "HEAD"])
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        commit("base.txt");
+        run(&["switch", "-c", "picked"]);
+        let picks = [commit("a.txt"), commit("b.txt")];
+        run(&["switch", "-c", "partial"]);
+        commit("c.txt");
+        run(&["switch", "main"]);
+        commit("unrelated-1.txt");
+        run(&["cherry-pick", &picks[0]]);
+        commit("unrelated-2.txt");
+        run(&["cherry-pick", &picks[1]]);
+
+        let repo = GitRepo::open_from_path(path).unwrap();
+        let mut cache = SyncHistoryCache::default();
+        let mut equivalent = |branch: &str| {
+            let merge_base = repo.merge_base("main", branch).unwrap();
+            cached_patch_equivalent(&mut cache, &repo, path, &merge_base, "main", branch).unwrap()
+        };
+        assert!(equivalent("picked"));
+        assert!(!equivalent("partial"));
     }
 
     fn linked_worktree_cleanup(blockers: &[&'static str]) -> BlockingWorktreeCleanup {

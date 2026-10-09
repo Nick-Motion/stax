@@ -1470,6 +1470,69 @@ impl GitRepo {
             .collect())
     }
 
+    /// `(patch_id, commit)` for each of `commits`. A commit with an empty diff has none.
+    pub(crate) fn patch_ids_for_commits(
+        &self,
+        cwd: &Path,
+        commits: &[&str],
+    ) -> Result<Vec<(String, String)>> {
+        let mut args = vec!["log", "--format=%H", "-p", "--no-walk=unsorted"];
+        args.extend_from_slice(commits);
+        let output = self.run_git(cwd, &args)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!("git log -p --no-walk failed: {}", stderr);
+        }
+        self.run_patch_id_pairs_from_input(cwd, &output.stdout)
+    }
+
+    /// Paths changed by the non-merge commits in `range`, rename sources included.
+    pub(crate) fn files_changed_in_range(&self, cwd: &Path, range: &str) -> Result<Vec<String>> {
+        let args = [
+            "log",
+            "--format=",
+            "--name-only",
+            "--no-renames",
+            "--no-merges",
+            "-z",
+            range,
+        ];
+        let output = self.run_git(cwd, &args)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!("git {} failed: {}", args.join(" "), stderr);
+        }
+        let mut files = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8(path.to_vec()))
+            .collect::<Result<Vec<_>, _>>()?;
+        files.sort_unstable();
+        files.dedup();
+        Ok(files)
+    }
+
+    /// Non-merge commits in `range` that change any of `paths`, relative to the
+    /// repository root. No paths selects every commit.
+    pub(crate) fn commits_changing(
+        &self,
+        cwd: &Path,
+        range: &str,
+        paths: &[String],
+    ) -> Result<Vec<String>> {
+        let mut args = vec![
+            "--literal-pathspecs",
+            "rev-list",
+            "--no-merges",
+            "--full-history",
+            range,
+            "--",
+        ];
+        args.extend(paths.iter().map(String::as_str));
+        self.git_stdout_lines(cwd, &args)
+    }
+
     /// Find the longest prefix of `branch`'s own commits that already landed on
     /// `parent` as a single squash (or cherry-pick) commit.
     ///

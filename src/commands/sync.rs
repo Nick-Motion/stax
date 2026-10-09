@@ -31,6 +31,17 @@ pub(super) const PR_METADATA_REFRESH_CONCURRENCY: usize = 8;
 #[derive(Debug, Default)]
 pub(super) struct SyncHistoryCache {
     patch_ids: HashMap<(String, String), HashSet<String>>,
+    counts: HashMap<(String, String), usize>,
+}
+
+/// Resolve a `base..head` range to object ids, so cache entries stay valid
+/// after sync moves refs.
+fn range_key(repo: &GitRepo, base: &str, head: &str) -> (String, String) {
+    // Resolve through libgit2. Spawning `git rev-parse` for each endpoint used
+    // to consume the subprocess savings from sharing the patch scans.
+    let base_oid = repo.resolve_ref(base).unwrap_or_else(|_| base.to_string());
+    let head_oid = repo.resolve_ref(head).unwrap_or_else(|_| head.to_string());
+    (base_oid, head_oid)
 }
 
 fn cached_patch_ids(
@@ -40,18 +51,30 @@ fn cached_patch_ids(
     base: &str,
     head: &str,
 ) -> Result<HashSet<String>> {
-    // Resolve through libgit2. Spawning `git rev-parse` for each endpoint used
-    // to consume the subprocess savings from sharing the patch scans.
-    let base_oid = repo.resolve_ref(base).unwrap_or_else(|_| base.to_string());
-    let head_oid = repo.resolve_ref(head).unwrap_or_else(|_| head.to_string());
-    let key = (base_oid.clone(), head_oid.clone());
+    let key = range_key(repo, base, head);
     if let Some(ids) = cache.patch_ids.get(&key) {
         return Ok(ids.clone());
     }
-    let range = format!("{base_oid}..{head_oid}");
-    let ids = repo.patch_ids_for_range(workdir, &range)?;
+    let ids = repo.patch_ids_for_range(workdir, &format!("{}..{}", key.0, key.1))?;
     cache.patch_ids.insert(key, ids.clone());
     Ok(ids)
+}
+
+/// Many branches share a merge-base with trunk, so `merge_base..trunk` counts repeat.
+fn cached_rev_list_count(
+    cache: &mut SyncHistoryCache,
+    repo: &GitRepo,
+    workdir: &Path,
+    base: &str,
+    head: &str,
+) -> Result<usize> {
+    let key = range_key(repo, base, head);
+    if let Some(count) = cache.counts.get(&key) {
+        return Ok(*count);
+    }
+    let count = repo.rev_list_count(workdir, &format!("{}..{}", key.0, key.1))?;
+    cache.counts.insert(key, count);
+    Ok(count)
 }
 
 /// Use the sync-wide immutable history cache for the conservative fallback too.
@@ -65,7 +88,7 @@ fn cached_patch_equivalent(
     trunk: &str,
     branch: &str,
 ) -> Result<bool> {
-    if repo.rev_list_count(workdir, &format!("{merge_base}..{trunk}"))?
+    if cached_rev_list_count(cache, repo, workdir, merge_base, trunk)?
         > GitRepo::PATCH_ID_TRUNK_COMMIT_CAP
     {
         return Ok(false);
@@ -4041,36 +4064,36 @@ fn find_merged_branches_with_prs_after_enumeration(
         }
 
         for (merge_base, branches) in by_merge_base {
-            let trunk_range = format!("{}..{}", merge_base, trunk);
-            let trunk_count = match repo.rev_list_count(workdir, &trunk_range) {
-                Ok(c) => c,
-                Err(_) => {
-                    for branch in branches {
-                        if cached_patch_equivalent(
-                            history_cache,
-                            repo,
-                            workdir,
-                            &merge_base,
-                            trunk,
-                            &branch,
-                        )
-                        .unwrap_or(false)
-                        {
-                            merged.push(MergedBranchInfo {
-                                branch: branch.clone(),
-                                merge_type: MergeType::SquashMerge,
-                                observed_branch_oid: resolve_ref_oid(
-                                    workdir,
-                                    &format!("refs/heads/{branch}"),
-                                )
-                                .unwrap_or_default(),
-                                merged_pr_head_oid: None,
-                            });
+            let trunk_count =
+                match cached_rev_list_count(history_cache, repo, workdir, &merge_base, trunk) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        for branch in branches {
+                            if cached_patch_equivalent(
+                                history_cache,
+                                repo,
+                                workdir,
+                                &merge_base,
+                                trunk,
+                                &branch,
+                            )
+                            .unwrap_or(false)
+                            {
+                                merged.push(MergedBranchInfo {
+                                    branch: branch.clone(),
+                                    merge_type: MergeType::SquashMerge,
+                                    observed_branch_oid: resolve_ref_oid(
+                                        workdir,
+                                        &format!("refs/heads/{branch}"),
+                                    )
+                                    .unwrap_or_default(),
+                                    merged_pr_head_oid: None,
+                                });
+                            }
                         }
+                        continue;
                     }
-                    continue;
-                }
-            };
+                };
 
             if trunk_count > GitRepo::PATCH_ID_TRUNK_COMMIT_CAP {
                 for branch in branches {
@@ -4219,11 +4242,11 @@ pub(super) fn find_partially_merged_notes(
             let Ok(merge_base) = repo.merge_base(&trunk, &branch) else {
                 continue;
             };
-            let trunk_range = format!("{}..{}", merge_base, trunk);
-            let trunk_count = match repo.rev_list_count(workdir, &trunk_range) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
+            let trunk_count =
+                match cached_rev_list_count(history_cache, repo, workdir, &merge_base, &trunk) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
             if trunk_count == 0 || trunk_count > GitRepo::PATCH_ID_TRUNK_COMMIT_CAP {
                 continue;
             }

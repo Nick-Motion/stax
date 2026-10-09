@@ -186,6 +186,34 @@ fn run_git_in(cwd: &Path, args: &[&str]) -> Result<Output> {
     command::output(cwd, args).with_context(|| format!("Failed to run git {}", args.join(" ")))
 }
 
+/// Each commit that `git rev-list --parents` listed, with its parents.
+pub(crate) fn parent_graph(rev_list: &str) -> HashMap<&str, Vec<&str>> {
+    rev_list
+        .lines()
+        .filter_map(|line| {
+            let mut commits = line.split(' ');
+            Some((commits.next()?, commits.collect()))
+        })
+        .collect()
+}
+
+/// The commits of `parents` that `tip` reaches without leaving the graph.
+pub(crate) fn reachable<'a>(
+    parents: &HashMap<&'a str, Vec<&'a str>>,
+    tip: &'a str,
+) -> HashSet<&'a str> {
+    let mut seen = HashSet::new();
+    let mut pending = vec![tip];
+    while let Some(commit) = pending.pop() {
+        if let Some(commit_parents) = parents.get(commit)
+            && seen.insert(commit)
+        {
+            pending.extend_from_slice(commit_parents);
+        }
+    }
+    seen
+}
+
 pub fn checkout_branch_in(workdir: &Path, branch: &str) -> Result<()> {
     let output = command::output(workdir, &["checkout", branch])
         .with_context(|| format!("Failed to run git checkout {}", branch))?;
@@ -2014,6 +2042,72 @@ Use --auto-stash-pop or stash/commit changes first.",
         Ok(base)
     }
 
+    /// Fill the merge-base memo for `trunk` and each of `branches` from one
+    /// `git rev-list` walk instead of a libgit2 walk per branch. A branch that
+    /// the walk does not list is an ancestor of trunk, so it is its own merge
+    /// base. Otherwise every merge base is a trunk commit that one of the
+    /// branch's own commits points at, so a single such commit is the merge
+    /// base. Branches that point at several are left to libgit2.
+    pub fn prefetch_merge_bases(&self, trunk: &str, branches: &[&str]) {
+        let commit = |name: &str| {
+            let branch = self.repo.find_branch(name, BranchType::Local).ok()?;
+            branch.get().peel_to_commit().ok().map(|commit| commit.id())
+        };
+        let Some(trunk) = commit(trunk) else {
+            return;
+        };
+        let mut tips: Vec<git2::Oid> = branches
+            .iter()
+            .filter_map(|branch| commit(branch))
+            .filter(|tip| !self.merge_bases.borrow().contains_key(&(trunk, *tip)))
+            .collect();
+        tips.sort();
+        tips.dedup();
+        // A single branch costs one libgit2 walk anyway.
+        if tips.len() < 2 {
+            return;
+        }
+        let Ok(workdir) = self.workdir() else {
+            return;
+        };
+        // libgit2 ignores replace refs, so the walk must too.
+        let mut args = vec![
+            "--no-replace-objects".to_string(),
+            "rev-list".to_string(),
+            "--parents".to_string(),
+            format!("^{trunk}"),
+        ];
+        args.extend(tips.iter().map(git2::Oid::to_string));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let Some(output) = command::output(workdir, &args)
+            .ok()
+            .filter(|output| output.status.success())
+        else {
+            return;
+        };
+        let walk = String::from_utf8_lossy(&output.stdout);
+        let parents = parent_graph(&walk);
+        for tip in tips {
+            let hex = tip.to_string();
+            let base = if parents.contains_key(hex.as_str()) {
+                let boundary: HashSet<&str> = reachable(&parents, &hex)
+                    .into_iter()
+                    .flat_map(|commit| parents[commit].iter().copied())
+                    .filter(|parent| !parents.contains_key(parent))
+                    .collect();
+                match Vec::from_iter(boundary).as_slice() {
+                    [base] => git2::Oid::from_str(base).ok(),
+                    _ => None,
+                }
+            } else {
+                Some(tip)
+            };
+            if let Some(base) = base {
+                self.merge_bases.borrow_mut().insert((trunk, tip), base);
+            }
+        }
+    }
+
     /// Find merge-base commit between any two refs (branch names, remote refs, or SHAs).
     pub fn merge_base_refs(&self, left: &str, right: &str) -> Result<String> {
         let left_oid = self.resolve_to_oid(left)?;
@@ -3403,5 +3497,48 @@ mod tests {
             .branches_with_configured_upstream()
             .expect("no branch config should not be an error");
         assert!(configured.is_empty());
+    }
+
+    #[test]
+    fn prefetch_merge_bases_remembers_only_unique_trunk_merge_bases() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path();
+        run_git(path, &["init", "-b", "main"]);
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test User"]);
+        let commit = |message: &str| run_git(path, &["commit", "--allow-empty", "-m", message]);
+        commit("base");
+        run_git(path, &["branch", "behind"]);
+        run_git(path, &["branch", "forked"]);
+        commit("m1");
+        run_git(path, &["branch", "later"]);
+        commit("m2");
+        run_git(path, &["switch", "forked"]);
+        commit("f1");
+        commit("f2");
+        run_git(path, &["switch", "later"]);
+        commit("l1");
+        // Two trunk commits under its own commits, but only m1 is a merge base.
+        run_git(path, &["switch", "-c", "merged-trunk", "behind"]);
+        commit("x1");
+        run_git(path, &["merge", "--no-ff", "-m", "x2", "main~1"]);
+        run_git(path, &["switch", "main"]);
+
+        let repo = GitRepo::open_from_path(path).expect("open repo");
+        let branches = ["behind", "forked", "later", "merged-trunk"];
+        repo.prefetch_merge_bases("main", &branches);
+
+        let oid = |rev: &str| {
+            git2::Oid::from_str(run_git_capture(path, &["rev-parse", rev]).trim()).expect("oid")
+        };
+        let main = oid("main");
+        let expected: HashMap<_, _> = ["behind", "forked", "later"]
+            .map(|branch| {
+                let base = run_git_capture(path, &["merge-base", "main", branch]);
+                ((main, oid(branch)), oid(base.trim()))
+            })
+            .into_iter()
+            .collect();
+        assert_eq!(*repo.merge_bases.borrow(), expected);
     }
 }

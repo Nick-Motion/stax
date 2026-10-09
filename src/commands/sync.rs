@@ -9,7 +9,7 @@ use crate::engine::branch_detect::has_unique_commits_since_any_base;
 use crate::engine::{BranchMetadata, PrInfo, Stack};
 use crate::errors::{ConflictStopped, DirtyWorkingTree, SilentExit, exit_codes};
 use crate::forge::ForgeClient;
-use crate::git::repo::{BranchDeleteResolution, BranchDeleteSwitchTarget};
+use crate::git::repo::{BranchDeleteResolution, BranchDeleteSwitchTarget, parent_graph, reachable};
 use crate::git::{GitRepo, RebaseResult, RebaseTimings};
 use crate::github::pr::PrInfo as ForgePrInfo;
 use crate::ops::receipt::{OpKind, PlanSummary};
@@ -4116,6 +4116,7 @@ fn find_merged_branches_with_prs_after_enumeration(
     let trunk = stack.trunk.as_str();
     let mut need_patch_id: Vec<(String, String)> = Vec::new();
 
+    let mut candidates: Vec<&str> = Vec::new();
     for branch in stack.branches.keys() {
         if branch == &stack.trunk
             || merged.iter().any(|m| &m.branch == branch)
@@ -4133,6 +4134,10 @@ fn find_merged_branches_with_prs_after_enumeration(
         if remote_branches.contains(branch.as_str()) {
             continue;
         }
+        candidates.push(branch);
+    }
+    repo.prefetch_merge_bases(trunk, &candidates);
+    for branch in candidates {
         match repo.is_branch_merged_cheap(branch) {
             Ok(Some(())) => {
                 let observed_branch_oid =
@@ -4140,7 +4145,7 @@ fn find_merged_branches_with_prs_after_enumeration(
                 let evidence_is_ancestry = !observed_branch_oid.is_empty()
                     && is_ancestor(workdir, &observed_branch_oid, trunk);
                 merged.push(MergedBranchInfo {
-                    branch: branch.clone(),
+                    branch: branch.to_string(),
                     // `is_branch_merged_cheap` also recognizes identical trees;
                     // carry that as informational equivalence, never ancestry proof.
                     merge_type: if evidence_is_ancestry {
@@ -4154,7 +4159,7 @@ fn find_merged_branches_with_prs_after_enumeration(
             }
             Ok(None) => {
                 if let Ok(mb) = repo.merge_base(trunk, branch) {
-                    need_patch_id.push((branch.clone(), mb));
+                    need_patch_id.push((branch.to_string(), mb));
                 }
             }
             Err(_) => {}
@@ -4355,31 +4360,6 @@ fn count_extra_commits(
             reachable(&parents, tip).difference(&on_remote).count()
         })
         .collect())
-}
-
-/// Each commit that `git rev-list --parents` listed, with its parents.
-fn parent_graph(rev_list: &str) -> HashMap<&str, Vec<&str>> {
-    rev_list
-        .lines()
-        .filter_map(|line| {
-            let mut commits = line.split(' ');
-            Some((commits.next()?, commits.collect()))
-        })
-        .collect()
-}
-
-/// The commits of `parents` that `tip` reaches without leaving the graph.
-fn reachable<'a>(parents: &HashMap<&'a str, Vec<&'a str>>, tip: &'a str) -> HashSet<&'a str> {
-    let mut seen = HashSet::new();
-    let mut pending = vec![tip];
-    while let Some(commit) = pending.pop() {
-        if let Some(commit_parents) = parents.get(commit)
-            && seen.insert(commit)
-        {
-            pending.extend_from_slice(commit_parents);
-        }
-    }
-    seen
 }
 
 pub(super) fn find_upstream_gone_branches(

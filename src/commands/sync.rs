@@ -4028,19 +4028,30 @@ fn find_merged_branches_with_prs_after_enumeration(
         }
     }
 
-    // Method 1b: git branch --merged origin/trunk (handles stale/diverged local trunk)
-    let output = Command::new("git")
-        .args([
-            "for-each-ref",
-            "--merged",
-            &remote_trunk_ref,
-            "--format=%(refname:short) %(objectname)",
-            "refs/heads",
-        ])
-        .current_dir(workdir)
-        .output();
+    // Method 1b: git branch --merged origin/trunk (handles stale/diverged local trunk).
+    // When origin/trunk is the trunk commit, it lists only what Method 1 listed.
+    let commit = |name: &str| {
+        repo.inner()
+            .revparse_single(&format!("{name}^{{commit}}"))
+            .map(|commit| commit.id())
+            .ok()
+    };
+    let remote_trunk_is_trunk =
+        commit(&stack.trunk).is_some_and(|trunk| commit(&remote_trunk_ref) == Some(trunk));
+    let output = (!remote_trunk_is_trunk).then(|| {
+        Command::new("git")
+            .args([
+                "for-each-ref",
+                "--merged",
+                &remote_trunk_ref,
+                "--format=%(refname:short) %(objectname)",
+                "refs/heads",
+            ])
+            .current_dir(workdir)
+            .output()
+    });
 
-    if let Ok(output) = output {
+    if let Some(Ok(output)) = output {
         let merged_output = String::from_utf8_lossy(&output.stdout);
         after_enumeration(&remote_trunk_ref, &merged_output);
 
@@ -5777,8 +5788,8 @@ mod tests {
                 run(&["worktree", "add", target.to_str().unwrap(), "feature/race"]);
                 run(&["merge", "--no-ff", "feature/race", "-m", "merge feature"]);
                 let merge_commit = run(&["rev-parse", "HEAD"]);
+                run(&["update-ref", "refs/remotes/origin/main", &merge_commit]);
                 if remote_trunk {
-                    run(&["update-ref", "refs/remotes/origin/main", &merge_commit]);
                     run(&["reset", "--hard", &base]);
                 }
                 let repo = GitRepo::open_from_path(path).unwrap();
@@ -5791,6 +5802,7 @@ mod tests {
                 let mut history_cache = SyncHistoryCache::default();
                 let mut advanced_oid = None;
                 let mut moved = false;
+                let mut enumerated_trunks = Vec::new();
                 let merged = find_merged_branches_with_prs_after_enumeration(
                     &repo,
                     path,
@@ -5801,6 +5813,7 @@ mod tests {
                     &HashMap::new(),
                     &mut history_cache,
                     |enumerated_trunk, enumerated| {
+                        enumerated_trunks.push(enumerated_trunk.to_string());
                         let expected = if remote_trunk { "origin/main" } else { "main" };
                         if moved || enumerated_trunk != expected {
                             return;
@@ -5832,6 +5845,12 @@ mod tests {
                     moved,
                     "selected production enumeration path was not reached"
                 );
+                let expected_trunks: &[&str] = if remote_trunk {
+                    &["main", "origin/main"]
+                } else {
+                    &["main"]
+                };
+                assert_eq!(enumerated_trunks, expected_trunks);
                 assert!(target.is_dir(), "the linked checkout must remain present");
                 let candidate = merged.iter().find(|item| item.branch == "feature/race");
                 if advance_ref {

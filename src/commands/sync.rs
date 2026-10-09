@@ -4141,34 +4141,29 @@ pub(super) fn find_partially_merged_notes(
 ) -> Result<Vec<PartiallyMergedNote>> {
     let mut notes = Vec::new();
     let trunk = stack.trunk.clone();
+    let branches: Vec<&str> = stack
+        .branches
+        .keys()
+        .map(String::as_str)
+        .filter(|branch| *branch != trunk && !merged.iter().any(|m| m.branch == *branch))
+        .collect();
+    let extra_counts = count_extra_commits(
+        repo,
+        workdir,
+        &trunk,
+        remote_name,
+        remote_branches,
+        &branches,
+    )?;
 
-    for branch in stack.branches.keys() {
-        let branch = branch.clone();
-        if branch == trunk {
-            continue;
-        }
-        if merged.iter().any(|m| m.branch == branch) {
-            continue;
-        }
-        let Some(info) = stack.branches.get(&branch) else {
-            continue;
-        };
-
-        let mut bases: Vec<String> = vec![trunk.clone()];
-        let remote_trunk_ref = format!("{}/{}", remote_name, trunk);
-        if git_ref_exists(workdir, &remote_trunk_ref) {
-            bases.push(remote_trunk_ref);
-        }
-        let remote_branch_ref = format!("{}/{}", remote_name, branch);
-        if remote_branches.contains(&branch) || git_ref_exists(workdir, &remote_branch_ref) {
-            bases.push(remote_branch_ref);
-        }
-        let base_refs: Vec<&str> = bases.iter().map(String::as_str).collect();
-
-        let extra = count_extra_commits(workdir, &branch, &base_refs)?;
+    for (branch, extra) in branches.into_iter().zip(extra_counts) {
         if extra == 0 {
             continue;
         }
+        let branch = branch.to_string();
+        let Some(info) = stack.branches.get(&branch) else {
+            continue;
+        };
 
         let reason = if matches!(
             info.pr_state.as_deref(),
@@ -4228,22 +4223,98 @@ pub(super) fn find_partially_merged_notes(
     Ok(notes)
 }
 
-fn count_extra_commits(workdir: &Path, branch: &str, bases: &[&str]) -> Result<usize> {
-    let mut args: Vec<&str> = vec!["rev-list", "--count", branch, "--not"];
-    args.extend_from_slice(bases);
+/// For each of `branches`, `git rev-list --count <branch> --not <trunk>
+/// <remote>/<trunk> <remote>/<branch>`, leaving out remote refs that do not
+/// exist. One walk lists the commits missing from trunk, and each count searches
+/// that graph: a walk per branch took about 18 ms each on a monorepo. A branch
+/// gets 0 where its own `git rev-list` would fail: its ref does not resolve, or
+/// `remote_branches` lists it but its remote ref does not resolve.
+fn count_extra_commits(
+    repo: &GitRepo,
+    workdir: &Path,
+    trunk: &str,
+    remote_name: &str,
+    remote_branches: &HashSet<String>,
+    branches: &[&str],
+) -> Result<Vec<usize>> {
+    let resolve = |name: &str| {
+        repo.inner()
+            .revparse_single(&format!("{name}^{{commit}}"))
+            .ok()
+            .map(|commit| commit.id().to_string())
+    };
+    let tips: Vec<Option<(String, Option<String>)>> = branches
+        .iter()
+        .map(|branch| {
+            let remote = resolve(&format!("{remote_name}/{branch}"));
+            if remote.is_none() && remote_branches.contains(*branch) {
+                return None;
+            }
+            Some((resolve(branch)?, remote))
+        })
+        .collect();
+    let positives: Vec<&str> = tips
+        .iter()
+        .flatten()
+        .flat_map(|(tip, remote)| std::iter::once(tip.as_str()).chain(remote.as_deref()))
+        .collect();
+    let zeros = vec![0; branches.len()];
+    let Some(trunk_oid) = resolve(trunk) else {
+        return Ok(zeros);
+    };
+    if positives.is_empty() {
+        return Ok(zeros);
+    }
+    let remote_trunk_oid = resolve(&format!("{remote_name}/{trunk}"));
+    let mut args = vec!["rev-list", "--parents"];
+    args.extend(positives);
+    args.push("--not");
+    args.push(&trunk_oid);
+    args.extend(remote_trunk_oid.as_deref());
 
     let output = Command::new("git")
         .args(&args)
         .current_dir(workdir)
         .output()
-        .with_context(|| format!("Failed to count extra commits for '{}'", branch))?;
-
+        .context("Failed to count extra commits")?;
     if !output.status.success() {
-        return Ok(0);
+        return Ok(zeros);
     }
-
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.trim().parse::<usize>().unwrap_or(0))
+    let parents: HashMap<&str, Vec<&str>> = stdout
+        .lines()
+        .filter_map(|line| {
+            let mut commits = line.split(' ');
+            Some((commits.next()?, commits.collect()))
+        })
+        .collect();
+    Ok(tips
+        .iter()
+        .map(|tip| {
+            let Some((tip, remote)) = tip else {
+                return 0;
+            };
+            let on_remote = remote
+                .as_deref()
+                .map(|remote| reachable(&parents, remote))
+                .unwrap_or_default();
+            reachable(&parents, tip).difference(&on_remote).count()
+        })
+        .collect())
+}
+
+/// The commits of `parents` that `tip` reaches without leaving the graph.
+fn reachable<'a>(parents: &HashMap<&'a str, Vec<&'a str>>, tip: &'a str) -> HashSet<&'a str> {
+    let mut seen = HashSet::new();
+    let mut pending = vec![tip];
+    while let Some(commit) = pending.pop() {
+        if let Some(commit_parents) = parents.get(commit)
+            && seen.insert(commit)
+        {
+            pending.extend_from_slice(commit_parents);
+        }
+    }
+    seen
 }
 
 pub(super) fn find_upstream_gone_branches(
@@ -4288,16 +4359,6 @@ pub(super) fn local_branch_exists(workdir: &std::path::Path, branch: &str) -> bo
         .current_dir(workdir)
         .status()
         .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn git_ref_exists(workdir: &Path, refname: &str) -> bool {
-    let commit_ref = format!("{}^{{commit}}", refname);
-    Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", &commit_ref])
-        .current_dir(workdir)
-        .output()
-        .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
@@ -5793,6 +5854,59 @@ mod tests {
         };
         assert!(equivalent("picked"));
         assert!(!equivalent("partial"));
+    }
+
+    #[test]
+    fn extra_commits_leave_out_trunk_remote_trunk_and_remote_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let commit = |file: &str| {
+            std::fs::write(path.join(file), format!("{file}\n")).unwrap();
+            run(&["add", file]);
+            run(&["commit", "-m", file]);
+            run(&["rev-parse", "HEAD"])
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        commit("base.txt");
+        run(&["switch", "-c", "on-remote-trunk"]);
+        let remote_trunk = commit("remote-trunk.txt");
+        run(&["update-ref", "refs/remotes/origin/main", &remote_trunk]);
+        run(&["switch", "-c", "ahead", "main"]);
+        commit("a1.txt");
+        commit("a2.txt");
+        run(&["switch", "-c", "pushed", "main"]);
+        let pushed = commit("p1.txt");
+        run(&["update-ref", "refs/remotes/origin/pushed", &pushed]);
+        commit("p2.txt");
+        run(&["switch", "-c", "unfetched", "main"]);
+        commit("u1.txt");
+        run(&["switch", "-c", "merging", "main"]);
+        commit("x1.txt");
+        run(&["merge", "--no-ff", "-m", "merge ahead", "ahead"]);
+
+        let repo = GitRepo::open_from_path(path).unwrap();
+        let branches = ["ahead", "pushed", "on-remote-trunk", "unfetched", "merging"];
+        let remote_branches = HashSet::from(["unfetched".to_string()]);
+        let counts =
+            count_extra_commits(&repo, path, "main", "origin", &remote_branches, &branches)
+                .unwrap();
+        assert_eq!(counts, [2, 1, 0, 0, 4]);
     }
 
     fn linked_worktree_cleanup(blockers: &[&'static str]) -> BlockingWorktreeCleanup {

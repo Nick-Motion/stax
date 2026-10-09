@@ -2284,15 +2284,11 @@ Use --auto-stash-pop or stash/commit changes first.",
 
     /// Return true when two refs have identical trees (no content diff).
     fn refs_have_no_diff(&self, left: &str, right: &str) -> Result<bool> {
-        let output = self.run_git(self.workdir()?, &["diff", "--quiet", left, right])?;
-        match output.status.code() {
-            Some(0) => Ok(true),
-            Some(1) => Ok(false),
-            _ => {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                anyhow::bail!("git diff --quiet {} {} failed: {}", left, right, stderr)
-            }
-        }
+        let tree = |refspec| -> Result<git2::Oid> {
+            let oid = self.resolve_to_oid(refspec)?;
+            Ok(self.repo.find_object(oid, None)?.peel_to_tree()?.id())
+        };
+        Ok(tree(left)? == tree(right)?)
     }
 
     /// Check if a branch has an origin remote-tracking branch.
@@ -3095,6 +3091,45 @@ mod tests {
                     .expect("single ahead/behind")
             );
         }
+    }
+
+    #[test]
+    fn squash_merged_branch_is_merged_by_identical_tree() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path();
+
+        run_git(path, &["init", "-b", "main"]);
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test User"]);
+
+        fs::write(path.join("README.md"), "base\n").expect("write readme");
+        run_git(path, &["add", "README.md"]);
+        run_git(path, &["commit", "-m", "Initial commit"]);
+
+        run_git(path, &["checkout", "-b", "squashed"]);
+        for file in ["a.txt", "b.txt"] {
+            fs::write(path.join(file), "change\n").expect("write feature file");
+            run_git(path, &["add", file]);
+            run_git(path, &["commit", "-m", file]);
+        }
+        run_git(path, &["checkout", "-b", "unmerged"]);
+        fs::write(path.join("c.txt"), "change\n").expect("write c");
+        run_git(path, &["add", "c.txt"]);
+        run_git(path, &["commit", "-m", "c.txt"]);
+
+        run_git(path, &["checkout", "main"]);
+        run_git(path, &["merge", "--squash", "squashed"]);
+        run_git(path, &["commit", "-m", "Squash merge"]);
+
+        let repo = GitRepo::new(Repository::open(path).expect("open repo"));
+        assert_eq!(
+            repo.is_branch_merged_cheap("squashed").expect("squashed"),
+            Some(())
+        );
+        assert_eq!(
+            repo.is_branch_merged_cheap("unmerged").expect("unmerged"),
+            None
+        );
     }
 
     #[test]

@@ -1,9 +1,8 @@
 use crate::cache::CiCache;
-use crate::commands::ci::{fetch_ci_statuses, record_ci_history};
+use crate::commands::ci::{fetch_ci_statuses_reusing, record_ci_history};
 use crate::commands::restack_conflict::{RestackConflictContext, print_restack_conflict};
-use crate::commands::worktree::{
-    remove::remove_worktree_with_hooks,
-    shared::{compute_worktree_details, worktree_removal_blockers_for_cleanup},
+use crate::commands::worktree::shared::{
+    WorktreeDetails, compute_worktree_removal_details, worktree_removal_blockers,
 };
 use crate::config::Config;
 use crate::engine::branch_detect::has_unique_commits_since_any_base;
@@ -26,7 +25,58 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const PR_METADATA_REFRESH_CONCURRENCY: usize = 8;
+pub(super) const PR_METADATA_REFRESH_CONCURRENCY: usize = 8;
+
+/// Expensive immutable history facts shared for one sync operation.
+#[derive(Debug, Default)]
+pub(super) struct SyncHistoryCache {
+    patch_ids: HashMap<(String, String), HashSet<String>>,
+}
+
+fn cached_patch_ids(
+    cache: &mut SyncHistoryCache,
+    repo: &GitRepo,
+    workdir: &Path,
+    base: &str,
+    head: &str,
+) -> Result<HashSet<String>> {
+    // Resolve through libgit2. Spawning `git rev-parse` for each endpoint used
+    // to consume the subprocess savings from sharing the patch scans.
+    let base_oid = repo.resolve_ref(base).unwrap_or_else(|_| base.to_string());
+    let head_oid = repo.resolve_ref(head).unwrap_or_else(|_| head.to_string());
+    let key = (base_oid.clone(), head_oid.clone());
+    if let Some(ids) = cache.patch_ids.get(&key) {
+        return Ok(ids.clone());
+    }
+    let range = format!("{base_oid}..{head_oid}");
+    let ids = repo.patch_ids_for_range(workdir, &range)?;
+    cache.patch_ids.insert(key, ids.clone());
+    Ok(ids)
+}
+
+/// Use the sync-wide immutable history cache for the conservative fallback too.
+/// The cheap ancestry/tree checks have already been attempted by the caller, so
+/// this reproduces only the bounded patch-id portion of the repo helper.
+fn cached_patch_equivalent(
+    cache: &mut SyncHistoryCache,
+    repo: &GitRepo,
+    workdir: &Path,
+    merge_base: &str,
+    trunk: &str,
+    branch: &str,
+) -> Result<bool> {
+    if repo.rev_list_count(workdir, &format!("{merge_base}..{trunk}"))?
+        > GitRepo::PATCH_ID_TRUNK_COMMIT_CAP
+    {
+        return Ok(false);
+    }
+    let branch_ids = cached_patch_ids(cache, repo, workdir, merge_base, branch)?;
+    if branch_ids.is_empty() {
+        return Ok(true);
+    }
+    let trunk_ids = cached_patch_ids(cache, repo, workdir, merge_base, trunk)?;
+    Ok(!trunk_ids.is_empty() && branch_ids.is_subset(&trunk_ids))
+}
 
 #[derive(Debug, Default)]
 pub(super) struct SyncStats {
@@ -40,6 +90,7 @@ pub(super) struct SyncStats {
     pub(super) protected_branches: Vec<String>,
     pub(super) trunk_not_updated: Option<TrunkNotUpdated>,
     pub(super) cleanup_skips: Vec<CleanupSkip>,
+    pub(super) recovery_artifacts: Vec<RecoveryRecord>,
     pub(super) checkout_change: Option<CheckoutChange>,
     pub(super) stash: StashOutcome,
     pub(super) reconciled_branches: Vec<ReconciledBranchRecord>,
@@ -59,6 +110,14 @@ pub(super) struct DeletedBranchRecord {
     pub(super) scope: &'static str,
     pub(super) tip: Option<String>,
     pub(super) metadata_deleted: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct RecoveryRecord {
+    pub(super) branch: String,
+    pub(super) operation_id: String,
+    pub(super) directory: PathBuf,
+    pub(super) manifest: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -156,20 +215,21 @@ pub(super) enum TrunkSummary {
 pub(super) struct BlockingWorktreeCleanup {
     pub(super) resolution: BranchDeleteResolution,
     pub(super) blockers: Vec<&'static str>,
+    pub(super) lifecycle_hold: Option<String>,
+    lifecycle: Option<RetirementObservation>,
 }
 
 impl BlockingWorktreeCleanup {
-    fn can_remove_during_sync(&self) -> bool {
-        !self.resolution.worktree.is_main && self.blockers.is_empty()
-    }
-
-    fn can_force_remove_dirty_worktree_during_sync(&self) -> bool {
-        !self.resolution.worktree.is_main
-            && !self.blockers.is_empty()
+    pub(super) fn can_remove_during_sync(&self) -> bool {
+        self.lifecycle_hold.is_none()
+            && !self.resolution.worktree.is_main
             && self.blockers.iter().all(|blocker| *blocker == "dirty")
     }
 
     pub(super) fn blocker_summary(&self) -> Option<String> {
+        if let Some(reason) = &self.lifecycle_hold {
+            return Some(reason.clone());
+        }
         if self.resolution.worktree.is_main {
             return Some("it is the main worktree".to_string());
         }
@@ -196,10 +256,11 @@ impl BlockingWorktreeCleanup {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct LocalBranchDeleteOutcome {
     deleted: bool,
     worktree_blocked: bool,
+    recovery: Option<RecoveryRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,6 +406,9 @@ struct SyncContext {
     /// Merged-branch detection from the interactive sync plan (pre-trunk-update).
     /// Reused after trunk moves to avoid a second full patch-id scan of the stack.
     planned_merged_detection: Option<PlannedMergedDetection>,
+    /// Fresh PR reads collected once at sync start and reused by plan/application.
+    live_pr_observations: HashMap<String, crate::forge::PrInfoWithHead>,
+    history_cache: SyncHistoryCache,
     get: bool,
 }
 
@@ -439,6 +503,8 @@ impl SyncContext {
                 trunk_planned: false,
                 delete_confirm_strategy,
                 planned_merged_detection: None,
+                live_pr_observations: HashMap::new(),
+                history_cache: SyncHistoryCache::default(),
                 get,
             },
             repo,
@@ -952,11 +1018,16 @@ impl SyncContext {
         //
         // The sync-wide transaction is threaded in so the metadata blobs this
         // rewrites land in the op receipt (issue #835).
+        self.live_pr_observations.clear();
         let refreshed = {
             let Self {
-                config, quiet, tx, ..
+                config,
+                quiet,
+                tx,
+                live_pr_observations,
+                ..
             } = self;
-            refresh_pr_draft_states(repo, config, *quiet, tx.as_mut())?
+            refresh_pr_draft_states(repo, config, *quiet, tx.as_mut(), live_pr_observations)?
         };
         if let Some(pr_refresh_elapsed) = refreshed {
             self.step_timings
@@ -1011,13 +1082,15 @@ impl SyncContext {
         if self.delete_merged
             && let Some(remote_branches) = self.remote_branches_for_merged.as_ref()
         {
-            let merged = find_merged_branches(
+            let merged = find_merged_branches_with_prs(
                 repo,
                 &self.workdir,
                 &self.stack,
                 &self.remote_name,
                 remote_branches,
                 false,
+                &self.live_pr_observations,
+                &mut self.history_cache,
             )?;
             let partially_merged_notes = find_partially_merged_notes(
                 repo,
@@ -1026,6 +1099,7 @@ impl SyncContext {
                 &self.remote_name,
                 remote_branches,
                 &merged,
+                &mut self.history_cache,
             )?;
             self.planned_merged_detection = Some(PlannedMergedDetection {
                 merged: merged.clone(),
@@ -1161,19 +1235,6 @@ impl SyncContext {
         }
     }
 
-    fn plan_delete_blocker(
-        &self,
-        repo: &GitRepo,
-        branch: &str,
-        is_current_branch: bool,
-    ) -> Result<Option<BlockingWorktreeCleanup>> {
-        if is_current_branch {
-            Ok(None)
-        } else {
-            plan_blocking_worktree_cleanup(repo, branch, self.force)
-        }
-    }
-
     fn decide_delete_action(
         &self,
         branch: &str,
@@ -1181,8 +1242,12 @@ impl SyncContext {
         blocking: Option<&BlockingWorktreeCleanup>,
     ) -> Result<SyncBranchDeleteAction> {
         if self.auto_confirm {
-            if blocking.is_some() {
-                Ok(SyncBranchDeleteAction::PreserveWorktree)
+            if let Some(cleanup) = blocking {
+                if cleanup.can_remove_during_sync() {
+                    Ok(SyncBranchDeleteAction::RemoveWorktree { force: false })
+                } else {
+                    Ok(SyncBranchDeleteAction::Skip)
+                }
             } else {
                 Ok(SyncBranchDeleteAction::DeleteOnly)
             }
@@ -1223,13 +1288,16 @@ impl SyncContext {
         repo: &GitRepo,
         branch: &str,
         blocking: Option<&BlockingWorktreeCleanup>,
+        merged: Option<&MergedBranchInfo>,
     ) -> bool {
         let Some(cleanup) = blocking else {
             self.stats
                 .record_cleanup_skip(branch, "worktree resolution missing");
             return false;
         };
-        if let Err(error) = preserve_worktree_for_sync(repo, cleanup, self.quiet) {
+        if let Err(error) =
+            preserve_worktree_for_sync(repo, cleanup, self.config.remote_name(), merged, self.quiet)
+        {
             self.stats.record_cleanup_skip(
                 branch,
                 format!("couldn't preserve linked worktree: {}", error),
@@ -1264,6 +1332,7 @@ impl SyncContext {
         branch: &str,
         action: SyncBranchDeleteAction,
         blocking: Option<&BlockingWorktreeCleanup>,
+        merge_info: Option<&MergedBranchInfo>,
     ) -> Result<LocalBranchDeleteOutcome> {
         delete_local_branch_for_sync(
             repo,
@@ -1279,6 +1348,8 @@ impl SyncContext {
                 action,
                 SyncBranchDeleteAction::RemoveWorktree { force: true }
             ),
+            self.tx.as_ref().map(|tx| tx.op_id()).unwrap_or_default(),
+            merge_info,
             self.quiet,
         )
     }
@@ -1332,13 +1403,15 @@ impl SyncContext {
                 .expect("remote branch list when deleting merged branches");
             let (merged, partially_merged_notes) =
                 if let Some(planned) = self.planned_merged_detection.take() {
-                    let fresh = find_merged_branches(
+                    let fresh = find_merged_branches_with_prs(
                         &repo,
                         &self.workdir,
                         &self.stack,
                         &self.remote_name,
                         remote_branches,
                         true,
+                        &self.live_pr_observations,
+                        &mut self.history_cache,
                     )?;
                     let merged = merge_planned_merged_detection(planned.merged, fresh);
                     let partially_merged_notes: Vec<PartiallyMergedNote> = planned
@@ -1348,13 +1421,15 @@ impl SyncContext {
                         .collect();
                     (merged, partially_merged_notes)
                 } else {
-                    let merged = find_merged_branches(
+                    let merged = find_merged_branches_with_prs(
                         &repo,
                         &self.workdir,
                         &self.stack,
                         &self.remote_name,
                         remote_branches,
                         false,
+                        &self.live_pr_observations,
+                        &mut self.history_cache,
                     )?;
                     let partially_merged_notes = find_partially_merged_notes(
                         &repo,
@@ -1363,6 +1438,7 @@ impl SyncContext {
                         &self.remote_name,
                         remote_branches,
                         &merged,
+                        &mut self.history_cache,
                     )?;
                     (merged, partially_merged_notes)
                 };
@@ -1399,16 +1475,28 @@ impl SyncContext {
                         client,
                         &merged_branch_names,
                         &self.stack,
+                        &self.live_pr_observations,
                         self.quiet,
                     );
                 }
                 let mut deletion_decisions = Vec::new();
                 for merged_info in &merged {
                     let branch = &merged_info.branch;
+                    // Patch/tree equivalence is useful diagnostic information,
+                    // but it is not proof of ancestry or a merged linked PR.
+                    if matches!(merged_info.merge_type, MergeType::SquashMerge)
+                        && merged_info.merged_pr_head_oid.is_none()
+                    {
+                        self.stats.record_cleanup_skip(
+                            branch,
+                            "patch-equivalent history has no retirement evidence",
+                        );
+                        continue;
+                    }
                     let is_current_branch = branch == &self.current;
 
                     let blocking_worktree_cleanup =
-                        self.plan_delete_blocker(&repo, branch, is_current_branch)?;
+                        plan_merged_worktree_cleanup(&repo, &self.remote_name, merged_info)?;
 
                     // For the prompt we use merged_branch_names (all detected merges) as
                     // the doomed set — an approximation, since the user hasn't confirmed
@@ -1461,6 +1549,11 @@ impl SyncContext {
                             blocking_worktree_cleanup,
                             action,
                         ));
+                    } else if let Some(reason) = blocking_worktree_cleanup
+                        .as_ref()
+                        .and_then(BlockingWorktreeCleanup::blocker_summary)
+                    {
+                        self.stats.record_cleanup_skip(branch, reason);
                     } else {
                         self.record_unconfirmed_skip(branch);
                     }
@@ -1524,6 +1617,7 @@ impl SyncContext {
                             &repo,
                             branch,
                             blocking_worktree_cleanup.as_ref(),
+                            Some(&merged_info),
                         )
                     {
                         continue;
@@ -1749,7 +1843,11 @@ impl SyncContext {
                         branch,
                         action,
                         blocking_worktree_cleanup.as_ref(),
+                        Some(&merged_info),
                     )?;
+                    if let Some(recovery) = local_delete.recovery.clone() {
+                        self.stats.recovery_artifacts.push(recovery);
+                    }
                     let local_deleted = local_delete.deleted;
                     let local_worktree_blocked = local_delete.worktree_blocked;
 
@@ -1956,19 +2054,38 @@ impl SyncContext {
             // mirrors `stax sweep`, which already classifies these branches as
             // active rather than deletable (see commands/sweep.rs).
             let mut gone: Vec<String> = Vec::with_capacity(detected_gone.len());
+            let mut gone_evidence = HashMap::new();
             let mut protected_gone: Vec<String> = Vec::new();
             for branch in detected_gone {
-                if self.stats.closed_prs.contains(&branch) {
+                // A disappeared upstream is not merge evidence. Linked PRs
+                // (including unknown/open/error observations) must go through
+                // the merged-PR classifier; empty never-submitted branches also
+                // retain their dedicated protection.
+                if self.stats.closed_prs.contains(&branch)
+                    || self
+                        .stack
+                        .branches
+                        .get(&branch)
+                        .is_some_and(|b| b.pr_number.is_some())
+                    || should_spare_empty_never_submitted_branch(
+                        &self.workdir,
+                        &self.stack,
+                        &branch,
+                    )?
+                {
                     continue;
                 }
-                if has_unique_commits_since_any_base(
+                match upstream_gone_merge_evidence(
                     &self.workdir,
                     &branch,
-                    &[self.stack.trunk.as_str(), self.remote_trunk_ref.as_str()],
+                    &self.stack.trunk,
+                    &self.remote_trunk_ref,
                 )? {
-                    protected_gone.push(branch);
-                } else {
-                    gone.push(branch);
+                    Some(evidence) => {
+                        gone_evidence.insert(branch.clone(), evidence);
+                        gone.push(branch);
+                    }
+                    None => protected_gone.push(branch),
                 }
             }
 
@@ -2034,8 +2151,13 @@ impl SyncContext {
                     }
 
                     let is_current_branch = branch == &self.current_after_deletions;
+                    // Carry the exact tip whose ancestry was proved, rather
+                    // than relabeling a potentially changed branch as merged.
+                    let merge_info = gone_evidence
+                        .get(branch)
+                        .context("missing upstream-gone merge evidence")?;
                     let blocking_worktree_cleanup =
-                        self.plan_delete_blocker(repo, branch, is_current_branch)?;
+                        plan_merged_worktree_cleanup(repo, &self.remote_name, merge_info)?;
 
                     // Resolve the parent children will be reparented to. Walks up
                     // the recorded-parent chain skipping any branch that is itself
@@ -2081,7 +2203,14 @@ impl SyncContext {
                     )?;
 
                     if action == SyncBranchDeleteAction::Skip {
-                        self.record_unconfirmed_skip(branch);
+                        if let Some(reason) = blocking_worktree_cleanup
+                            .as_ref()
+                            .and_then(BlockingWorktreeCleanup::blocker_summary)
+                        {
+                            self.stats.record_cleanup_skip(branch, reason);
+                        } else {
+                            self.record_unconfirmed_skip(branch);
+                        }
                         continue;
                     }
 
@@ -2090,6 +2219,7 @@ impl SyncContext {
                             repo,
                             branch,
                             blocking_worktree_cleanup.as_ref(),
+                            gone_evidence.get(branch),
                         )
                     {
                         continue;
@@ -2152,7 +2282,11 @@ impl SyncContext {
                         branch,
                         action,
                         blocking_worktree_cleanup.as_ref(),
+                        Some(merge_info),
                     )?;
+                    if let Some(recovery) = local_delete.recovery.clone() {
+                        self.stats.recovery_artifacts.push(recovery);
+                    }
                     let local_deleted = local_delete.deleted;
                     let local_worktree_blocked = local_delete.worktree_blocked;
 
@@ -3171,8 +3305,6 @@ fn run_sync_phases(ctx: &mut SyncContext, repo: GitRepo) -> Result<()> {
 
     ctx.refresh_imported(&repo)?;
 
-    ctx.refresh_pr_states(&repo)?;
-
     let repo = ctx.cleanup_merged_branches(repo)?;
     // Re-check current branch since it may have changed during branch deletion
     ctx.current_after_deletions = repo.current_branch()?;
@@ -3208,6 +3340,7 @@ fn refresh_pr_draft_states(
     config: &Config,
     quiet: bool,
     mut tx: Option<&mut Transaction>,
+    observations: &mut HashMap<String, crate::forge::PrInfoWithHead>,
 ) -> Result<Option<Duration>> {
     let started_at = Instant::now();
     let stack = match Stack::load(repo) {
@@ -3273,7 +3406,7 @@ fn refresh_pr_draft_states(
                 .into_iter()
                 .map(|(branch_name, pr_number)| {
                     let client = client.clone();
-                    async move { (branch_name, client.get_pr(pr_number).await.ok()) }
+                    async move { (branch_name, client.get_pr_with_head(pr_number).await.ok()) }
                 }),
         )
         .buffer_unordered(PR_METADATA_REFRESH_CONCURRENCY)
@@ -3286,12 +3419,13 @@ fn refresh_pr_draft_states(
             continue;
         };
 
+        observations.insert(branch_name.clone(), live_pr.clone());
         apply_live_pr_state(
             repo,
             &stack,
             &cache_dir,
             &branch_name,
-            &live_pr,
+            &live_pr.info,
             tx.as_deref_mut(),
         )?;
     }
@@ -3580,6 +3714,8 @@ pub(super) enum MergeType {
 pub(super) struct MergedBranchInfo {
     pub(super) branch: String,
     pub(super) merge_type: MergeType,
+    pub(super) observed_branch_oid: String,
+    pub(super) merged_pr_head_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3597,7 +3733,7 @@ pub(super) struct PartiallyMergedNote {
     pub(super) extra_commits: usize,
 }
 
-fn should_spare_empty_never_submitted_branch(
+pub(super) fn should_spare_empty_never_submitted_branch(
     workdir: &Path,
     stack: &Stack,
     branch: &str,
@@ -3677,24 +3813,51 @@ pub(super) fn print_retained_closed_prs(stack: &Stack, closed: &[String]) {
     }
 }
 
-pub(super) fn find_merged_branches(
+pub(super) fn find_merged_branches_with_prs(
     repo: &GitRepo,
     workdir: &std::path::Path,
     stack: &Stack,
     remote_name: &str,
     remote_branches: &HashSet<String>,
     skip_patch_id_provenance: bool,
+    live_prs: &HashMap<String, crate::forge::PrInfoWithHead>,
+    history_cache: &mut SyncHistoryCache,
+) -> Result<Vec<MergedBranchInfo>> {
+    find_merged_branches_with_prs_after_enumeration(
+        repo,
+        workdir,
+        stack,
+        remote_name,
+        remote_branches,
+        skip_patch_id_provenance,
+        live_prs,
+        history_cache,
+        |_, _| {},
+    )
+}
+
+fn find_merged_branches_with_prs_after_enumeration(
+    repo: &GitRepo,
+    workdir: &std::path::Path,
+    stack: &Stack,
+    remote_name: &str,
+    remote_branches: &HashSet<String>,
+    skip_patch_id_provenance: bool,
+    live_prs: &HashMap<String, crate::forge::PrInfoWithHead>,
+    history_cache: &mut SyncHistoryCache,
+    mut after_enumeration: impl FnMut(&str, &str),
 ) -> Result<Vec<MergedBranchInfo>> {
     let mut merged = Vec::new();
     let remote_trunk_ref = format!("{}/{}", remote_name, stack.trunk);
 
-    // Method 1: git branch --merged (finds local branches merged into trunk)
+    // Method 1: Git ancestry is merge proof only for branches without a PR
+    // linkage. Linked branches need a fresh forge merge state and exact head.
     let output = Command::new("git")
         .args([
             "for-each-ref",
             "--merged",
             &stack.trunk,
-            "--format=%(refname:short)",
+            "--format=%(refname:short) %(objectname)",
             "refs/heads",
         ])
         .current_dir(workdir)
@@ -3702,9 +3865,14 @@ pub(super) fn find_merged_branches(
         .context("Failed to list merged branches")?;
 
     let merged_output = String::from_utf8_lossy(&output.stdout);
+    after_enumeration(&stack.trunk, &merged_output);
 
     for line in merged_output.lines() {
-        let branch = line.trim();
+        let Some((branch, enumerated_oid)) = line.split_once(' ') else {
+            continue;
+        };
+        let branch = branch.trim();
+        let enumerated_oid = enumerated_oid.trim();
 
         // Skip trunk itself and any non-tracked branches
         if branch == stack.trunk || branch.is_empty() {
@@ -3712,12 +3880,23 @@ pub(super) fn find_merged_branches(
         }
 
         // Only include branches we're tracking
-        if stack.branches.contains_key(branch)
+        if stack
+            .branches
+            .get(branch)
+            .is_some_and(|info| info.pr_number.is_none())
             && !should_spare_empty_never_submitted_branch(workdir, stack, branch)?
         {
             merged.push(MergedBranchInfo {
                 branch: branch.to_string(),
                 merge_type: MergeType::Ancestor,
+                observed_branch_oid: match exact_enumerated_oid(
+                    enumerated_oid,
+                    resolve_ref_oid(workdir, &format!("refs/heads/{branch}")),
+                ) {
+                    Some(oid) => oid,
+                    None => continue,
+                },
+                merged_pr_head_oid: None,
             });
         }
     }
@@ -3728,7 +3907,7 @@ pub(super) fn find_merged_branches(
             "for-each-ref",
             "--merged",
             &remote_trunk_ref,
-            "--format=%(refname:short)",
+            "--format=%(refname:short) %(objectname)",
             "refs/heads",
         ])
         .current_dir(workdir)
@@ -3736,9 +3915,14 @@ pub(super) fn find_merged_branches(
 
     if let Ok(output) = output {
         let merged_output = String::from_utf8_lossy(&output.stdout);
+        after_enumeration(&remote_trunk_ref, &merged_output);
 
         for line in merged_output.lines() {
-            let branch = line.trim();
+            let Some((branch, enumerated_oid)) = line.split_once(' ') else {
+                continue;
+            };
+            let branch = branch.trim();
+            let enumerated_oid = enumerated_oid.trim();
 
             // Skip trunk itself and any non-tracked branches
             if branch == stack.trunk || branch.is_empty() {
@@ -3746,110 +3930,49 @@ pub(super) fn find_merged_branches(
             }
 
             // Only include branches we're tracking (and avoid duplicates)
-            if stack.branches.contains_key(branch)
+            if stack
+                .branches
+                .get(branch)
+                .is_some_and(|info| info.pr_number.is_none())
                 && !merged.iter().any(|info| info.branch == branch)
                 && !should_spare_empty_never_submitted_branch(workdir, stack, branch)?
             {
                 merged.push(MergedBranchInfo {
                     branch: branch.to_string(),
                     merge_type: MergeType::Ancestor,
+                    observed_branch_oid: match exact_enumerated_oid(
+                        enumerated_oid,
+                        resolve_ref_oid(workdir, &format!("refs/heads/{branch}")),
+                    ) {
+                        Some(oid) => oid,
+                        None => continue,
+                    },
+                    merged_pr_head_oid: None,
                 });
             }
         }
     }
 
-    // Method 2: Check PR state from metadata.
-    // Only an explicitly merged PR is a strong enough signal for cleanup here.
-    // Closed-but-unmerged PRs must be preserved unless some other merge/deletion
-    // heuristic below proves the branch is safe to clean up.
-    for (branch, info) in &stack.branches {
-        // Skip trunk
-        if branch == &stack.trunk {
-            continue;
-        }
-
-        // Skip if already in merged list
-        if merged.iter().any(|m| &m.branch == branch) {
-            continue;
-        }
-
-        if matches!(
-            info.pr_state.as_deref(),
-            Some(state) if state.eq_ignore_ascii_case("merged")
-        ) {
-            merged.push(MergedBranchInfo {
-                branch: branch.clone(),
-                merge_type: MergeType::Ancestor,
-            });
-        }
-    }
-
-    // Method 4: Check if the tracked remote branch was deleted (GitHub deletes
-    // branch after merge). This is cheaper and more robust than enumerating the
-    // entire remote ref namespace in very large repos.
-    for (branch, info) in &stack.branches {
-        // Skip trunk
-        if branch == &stack.trunk {
-            continue;
-        }
-
-        // Skip if already in merged list
-        if merged.iter().any(|m| &m.branch == branch) {
-            continue;
-        }
-
-        // Only consider "remote deleted" if branch had a PR before (was pushed)
-        // This prevents false positives for branches that were never pushed
-        if info.pr_number.is_none() {
-            continue;
-        }
-
-        // A deleted remote head does not prove integration when the PR was
-        // explicitly closed without merging.
-        if !remote_branches.contains(branch.as_str())
-            && !matches!(
-                info.pr_state.as_deref(),
-                Some(state) if state.eq_ignore_ascii_case("closed")
-            )
+    // A linked branch needs a fresh forge state and the exact PR head must be
+    // contained by its current local tip. A stale state or a missing remote
+    // head is never merge evidence.
+    for (branch, pr) in live_prs {
+        if branch == &stack.trunk
+            || !pr.info.state.eq_ignore_ascii_case("merged")
+            || pr.head_sha.is_empty()
+            || merged.iter().any(|item| &item.branch == branch)
         {
-            // Remote branch doesn't exist and had a PR - likely merged and deleted
-            merged.push(MergedBranchInfo {
-                branch: branch.clone(),
-                merge_type: MergeType::Ancestor,
-            });
-        }
-    }
-
-    // Method 5: Find orphaned branches (tracked but no longer exist locally or remotely)
-    let local_output = Command::new("git")
-        .args(["branch", "--format=%(refname:short)"])
-        .current_dir(workdir)
-        .output()
-        .context("Failed to list local branches")?;
-    let local_branches: std::collections::HashSet<String> =
-        String::from_utf8_lossy(&local_output.stdout)
-            .lines()
-            .map(|s| s.trim().to_string())
-            .collect();
-    for branch in stack.branches.keys() {
-        // Skip trunk
-        if branch == &stack.trunk {
             continue;
         }
-
-        // Skip if already in merged list
-        if merged.iter().any(|m| &m.branch == branch) {
+        let Some(local_head) = resolve_ref_oid(workdir, &format!("refs/heads/{branch}")) else {
             continue;
-        }
-
-        let local_exists = local_branches.contains(branch);
-        let remote_exists = remote_branches.contains(branch.as_str());
-
-        // If branch doesn't exist locally AND doesn't exist remotely, it's orphaned
-        if !local_exists && !remote_exists {
+        };
+        if is_ancestor(workdir, &pr.head_sha, &local_head) {
             merged.push(MergedBranchInfo {
                 branch: branch.clone(),
-                merge_type: MergeType::Ancestor,
+                merge_type: MergeType::SquashMerge,
+                observed_branch_oid: local_head,
+                merged_pr_head_oid: Some(pr.head_sha.clone()),
             });
         }
     }
@@ -3867,7 +3990,13 @@ pub(super) fn find_merged_branches(
     let mut need_patch_id: Vec<(String, String)> = Vec::new();
 
     for branch in stack.branches.keys() {
-        if branch == &stack.trunk || merged.iter().any(|m| &m.branch == branch) {
+        if branch == &stack.trunk
+            || merged.iter().any(|m| &m.branch == branch)
+            || stack
+                .branches
+                .get(branch)
+                .is_some_and(|info| info.pr_number.is_some())
+        {
             continue;
         }
         if should_spare_empty_never_submitted_branch(workdir, stack, branch)? {
@@ -3878,10 +4007,24 @@ pub(super) fn find_merged_branches(
             continue;
         }
         match repo.is_branch_merged_cheap(branch) {
-            Ok(Some(())) => merged.push(MergedBranchInfo {
-                branch: branch.clone(),
-                merge_type: MergeType::Ancestor,
-            }),
+            Ok(Some(())) => {
+                let observed_branch_oid =
+                    resolve_ref_oid(workdir, &format!("refs/heads/{branch}")).unwrap_or_default();
+                let evidence_is_ancestry = !observed_branch_oid.is_empty()
+                    && is_ancestor(workdir, &observed_branch_oid, trunk);
+                merged.push(MergedBranchInfo {
+                    branch: branch.clone(),
+                    // `is_branch_merged_cheap` also recognizes identical trees;
+                    // carry that as informational equivalence, never ancestry proof.
+                    merge_type: if evidence_is_ancestry {
+                        MergeType::Ancestor
+                    } else {
+                        MergeType::SquashMerge
+                    },
+                    observed_branch_oid,
+                    merged_pr_head_oid: None,
+                });
+            }
             Ok(None) => {
                 if let Ok(mb) = repo.merge_base(trunk, branch) {
                     need_patch_id.push((branch.clone(), mb));
@@ -3903,13 +4046,25 @@ pub(super) fn find_merged_branches(
                 Ok(c) => c,
                 Err(_) => {
                     for branch in branches {
-                        if repo
-                            .is_branch_merged_equivalent_to_trunk(&branch)
-                            .unwrap_or(false)
+                        if cached_patch_equivalent(
+                            history_cache,
+                            repo,
+                            workdir,
+                            &merge_base,
+                            trunk,
+                            &branch,
+                        )
+                        .unwrap_or(false)
                         {
                             merged.push(MergedBranchInfo {
-                                branch,
-                                merge_type: MergeType::Ancestor,
+                                branch: branch.clone(),
+                                merge_type: MergeType::SquashMerge,
+                                observed_branch_oid: resolve_ref_oid(
+                                    workdir,
+                                    &format!("refs/heads/{branch}"),
+                                )
+                                .unwrap_or_default(),
+                                merged_pr_head_oid: None,
                             });
                         }
                     }
@@ -3919,47 +4074,78 @@ pub(super) fn find_merged_branches(
 
             if trunk_count > GitRepo::PATCH_ID_TRUNK_COMMIT_CAP {
                 for branch in branches {
-                    if repo
-                        .is_branch_merged_equivalent_to_trunk(&branch)
-                        .unwrap_or(false)
+                    if cached_patch_equivalent(
+                        history_cache,
+                        repo,
+                        workdir,
+                        &merge_base,
+                        trunk,
+                        &branch,
+                    )
+                    .unwrap_or(false)
                     {
                         merged.push(MergedBranchInfo {
-                            branch,
-                            merge_type: MergeType::Ancestor,
+                            branch: branch.clone(),
+                            merge_type: MergeType::SquashMerge,
+                            observed_branch_oid: resolve_ref_oid(
+                                workdir,
+                                &format!("refs/heads/{branch}"),
+                            )
+                            .unwrap_or_default(),
+                            merged_pr_head_oid: None,
                         });
                     }
                 }
                 continue;
             }
 
-            let trunk_patch_ids = match repo.patch_ids_for_range(workdir, &trunk_range) {
-                Ok(ids) => ids,
-                Err(_) => {
-                    for branch in branches {
-                        if repo
-                            .is_branch_merged_equivalent_to_trunk(&branch)
+            let trunk_patch_ids =
+                match cached_patch_ids(history_cache, repo, workdir, &merge_base, trunk) {
+                    Ok(ids) => ids,
+                    Err(_) => {
+                        for branch in branches {
+                            if cached_patch_equivalent(
+                                history_cache,
+                                repo,
+                                workdir,
+                                &merge_base,
+                                trunk,
+                                &branch,
+                            )
                             .unwrap_or(false)
-                        {
-                            merged.push(MergedBranchInfo {
-                                branch,
-                                merge_type: MergeType::Ancestor,
-                            });
+                            {
+                                merged.push(MergedBranchInfo {
+                                    branch: branch.clone(),
+                                    merge_type: MergeType::SquashMerge,
+                                    observed_branch_oid: resolve_ref_oid(
+                                        workdir,
+                                        &format!("refs/heads/{branch}"),
+                                    )
+                                    .unwrap_or_default(),
+                                    merged_pr_head_oid: None,
+                                });
+                            }
                         }
+                        continue;
                     }
-                    continue;
-                }
-            };
+                };
 
             for branch in branches {
-                let branch_range = format!("{}..{}", merge_base, branch);
-                let branch_patch_ids = match repo.patch_ids_for_range(workdir, &branch_range) {
-                    Ok(ids) => ids,
-                    Err(_) => continue,
-                };
+                let branch_patch_ids =
+                    match cached_patch_ids(history_cache, repo, workdir, &merge_base, &branch) {
+                        Ok(ids) => ids,
+                        Err(_) => continue,
+                    };
                 if branch_patch_ids.is_empty() || branch_patch_ids.is_subset(&trunk_patch_ids) {
                     merged.push(MergedBranchInfo {
-                        branch,
+                        branch: branch.clone(),
                         merge_type: MergeType::SquashMerge,
+                        observed_branch_oid: resolve_ref_oid(
+                            workdir,
+                            &format!("refs/heads/{branch}"),
+                        )
+                        .unwrap_or_default(),
+                        merged_pr_head_oid: None,
                     });
                 }
             }
@@ -3969,6 +4155,10 @@ pub(super) fn find_merged_branches(
     // The passes above iterate `HashMap`s; sort so prompts and output are stable.
     merged.sort_by(|a, b| a.branch.cmp(&b.branch));
     Ok(merged)
+}
+
+fn exact_enumerated_oid(enumerated_oid: &str, current_oid: Option<String>) -> Option<String> {
+    current_oid.filter(|current| current == enumerated_oid)
 }
 
 /// Surface tracked branches that sync deliberately spares from deletion
@@ -3982,6 +4172,7 @@ pub(super) fn find_partially_merged_notes(
     remote_name: &str,
     remote_branches: &HashSet<String>,
     merged: &[MergedBranchInfo],
+    history_cache: &mut SyncHistoryCache,
 ) -> Result<Vec<PartiallyMergedNote>> {
     let mut notes = Vec::new();
     let trunk = stack.trunk.clone();
@@ -4036,15 +4227,16 @@ pub(super) fn find_partially_merged_notes(
             if trunk_count == 0 || trunk_count > GitRepo::PATCH_ID_TRUNK_COMMIT_CAP {
                 continue;
             }
-            let trunk_patch_ids = match repo.patch_ids_for_range(workdir, &trunk_range) {
-                Ok(ids) => ids,
-                Err(_) => continue,
-            };
-            let branch_range = format!("{}..{}", merge_base, branch);
-            let branch_patch_ids = match repo.patch_ids_for_range(workdir, &branch_range) {
-                Ok(ids) => ids,
-                Err(_) => continue,
-            };
+            let trunk_patch_ids =
+                match cached_patch_ids(history_cache, repo, workdir, &merge_base, &trunk) {
+                    Ok(ids) => ids,
+                    Err(_) => continue,
+                };
+            let branch_patch_ids =
+                match cached_patch_ids(history_cache, repo, workdir, &merge_base, &branch) {
+                    Ok(ids) => ids,
+                    Err(_) => continue,
+                };
             if branch_patch_ids.is_disjoint(&trunk_patch_ids) {
                 continue;
             }
@@ -4207,34 +4399,236 @@ fn print_cleanup_candidate_branch(name: &str, stack: Option<&Stack>) {
     println!();
 }
 
-pub(super) fn plan_blocking_worktree_cleanup(
-    repo: &GitRepo,
+/// Observe the same eligible trunk OIDs for upstream-gone planning and effects.
+pub(super) fn upstream_gone_merge_evidence(
+    workdir: &std::path::Path,
     branch: &str,
-    force: bool,
-) -> Result<Option<BlockingWorktreeCleanup>> {
-    let Some(resolution) = repo.branch_delete_resolution(branch)? else {
+    trunk: &str,
+    remote_trunk: &str,
+) -> Result<Option<MergedBranchInfo>> {
+    let Some(head) = resolve_ref_oid(workdir, &format!("refs/heads/{branch}")) else {
         return Ok(None);
     };
-
-    if resolution.worktree.is_main {
-        return Ok(Some(BlockingWorktreeCleanup {
-            resolution,
-            blockers: Vec::new(),
-        }));
+    let bases: Vec<String> = [trunk, remote_trunk]
+        .iter()
+        .filter_map(|base| resolve_ref_oid(workdir, base))
+        .collect();
+    if !bases.iter().any(|base| is_ancestor(workdir, &head, base))
+        || has_unique_commits_since_any_base(
+            workdir,
+            &head,
+            &bases.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?
+    {
+        return Ok(None);
     }
+    Ok(Some(MergedBranchInfo {
+        branch: branch.to_string(),
+        merge_type: MergeType::Ancestor,
+        observed_branch_oid: head,
+        merged_pr_head_oid: None,
+    }))
+}
 
-    let details = compute_worktree_details(repo, resolution.worktree.clone())?;
+/// Owned shell facts; the same pure lifecycle decision feeds plans and effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetirementObservation {
+    head: String,
+    owner: Option<crate::commands::sync_retirement::BbEnvironmentIdentity>,
+    decision: crate::engine::sync_lifecycle::LifecycleDecision,
+}
+
+fn observe_retirement(
+    repo: &GitRepo,
+    remote: &str,
+    details: &WorktreeDetails,
+    merged: Option<&MergedBranchInfo>,
+    bb_cli: Option<&crate::commands::sync_retirement::BbCli>,
+) -> Result<RetirementObservation> {
+    use crate::engine::sync_lifecycle::{
+        CheckoutKind, MergeEvidence, Observation, OperationState, Owner, decide,
+    };
+    let worktree = &details.info;
+    let head = repo.resolve_ref(
+        worktree
+            .branch
+            .as_deref()
+            .context("checkout has no branch")?,
+    )?;
+    let owner_result = crate::commands::sync_retirement::resolve_bb_owner(
+        &repo.main_repo_workdir()?,
+        remote,
+        &worktree.path,
+        bb_cli,
+    );
+    let active = match owner_result.as_ref() {
+        Ok(Some(identity)) => crate::commands::sync_retirement::bb_environment_has_active_threads(
+            identity,
+            bb_cli.context("BB identity requires configured CLI")?,
+        ),
+        _ => Ok(false),
+    };
+    let owner = match owner_result.as_ref() {
+        Err(_) => Owner::Unknown,
+        Ok(Some(identity)) => match identity.path.to_str() {
+            Some(path) => Owner::BbEnvironment {
+                id: &identity.id,
+                path,
+            },
+            None => Owner::Unknown,
+        },
+        Ok(None) if details.is_managed => Owner::Stax,
+        Ok(None) => Owner::Unmanaged,
+    };
+    let (evidence, contains_head) = match merged {
+        Some(info) => match info.merged_pr_head_oid.as_deref() {
+            Some(pr_head) => {
+                let contains = is_ancestor(repo.workdir()?, pr_head, &head);
+                (
+                    MergeEvidence::MergedPullRequest {
+                        head_oid: pr_head,
+                        branch_contains_head: contains,
+                    },
+                    contains,
+                )
+            }
+            None if matches!(info.merge_type, MergeType::Ancestor) => (
+                MergeEvidence::Ancestry {
+                    branch_oid: &info.observed_branch_oid,
+                },
+                false,
+            ),
+            None => (MergeEvidence::Unknown, false),
+        },
+        None => (MergeEvidence::Unknown, false),
+    };
+    let protected_operation = crate::commands::sync_retirement::protected_operation(&worktree.path);
+    let operation = if worktree.is_locked {
+        OperationState::Locked
+    } else if matches!(
+        protected_operation,
+        Ok(crate::commands::sync_retirement::ProtectedOperation::Unknown) | Err(_)
+    ) {
+        OperationState::Unknown
+    } else if matches!(
+        protected_operation,
+        Ok(crate::commands::sync_retirement::ProtectedOperation::Known)
+    ) || details.rebase_in_progress
+        || details.merge_in_progress
+    {
+        OperationState::RebaseOrMerge
+    } else if details.has_conflicts {
+        OperationState::Conflicts
+    } else if worktree.is_current || active.is_err() {
+        OperationState::Unknown
+    } else if active.unwrap_or(false) {
+        OperationState::ActiveAgentWork
+    } else {
+        OperationState::Idle
+    };
+    let decision = if merged.is_some_and(|info| info.observed_branch_oid != head) {
+        use crate::engine::sync_lifecycle::{LifecycleDecision, RetentionReason};
+        LifecycleDecision::Keep(RetentionReason::HeadChanged)
+    } else {
+        decide(Observation {
+            checkout: if worktree.is_main {
+                CheckoutKind::Primary
+            } else {
+                CheckoutKind::Linked
+            },
+            owner,
+            evidence,
+            branch_oid: &head,
+            branch_contains_merge_head: contains_head,
+            operation,
+        })
+    };
+    Ok(RetirementObservation {
+        head,
+        owner: owner_result.ok().flatten(),
+        decision,
+    })
+}
+
+pub(super) fn plan_merged_worktree_cleanup(
+    repo: &GitRepo,
+    remote: &str,
+    merged: &MergedBranchInfo,
+) -> Result<Option<BlockingWorktreeCleanup>> {
+    let Some(resolution) = repo.branch_delete_resolution(&merged.branch)? else {
+        return Ok(None);
+    };
+    let details = compute_worktree_removal_details(repo, resolution.worktree.clone())?;
+    let bb_cli = crate::commands::sync_retirement::BbCli::from_env()
+        .map(|cli| cli.with_deadline(Instant::now() + Duration::from_secs(20)));
+    let observed = observe_retirement(repo, remote, &details, Some(merged), bb_cli.as_ref())?;
+    let lifecycle_hold = match observed.decision {
+        crate::engine::sync_lifecycle::LifecycleDecision::Keep(reason) => {
+            Some(format!("sync lifecycle retained checkout: {reason:?}"))
+        }
+        crate::engine::sync_lifecycle::LifecycleDecision::RecoverThenRetire => None,
+    };
     Ok(Some(BlockingWorktreeCleanup {
         resolution,
-        blockers: worktree_removal_blockers_for_cleanup(&details, force),
+        // Force controls confirmation, never the immutable safety observations.
+        blockers: worktree_removal_blockers(&details),
+        lifecycle_hold,
+        lifecycle: Some(observed),
     }))
+}
+
+/// Refresh inventory as well as file state: lock/current flags in the planned
+/// WorktreeInfo must not be reused at an effect boundary.
+fn refresh_retirement_details(
+    repo: &GitRepo,
+    expected: &crate::git::repo::WorktreeInfo,
+) -> Result<WorktreeDetails> {
+    let current = repo
+        .branch_worktree(
+            expected
+                .branch
+                .as_deref()
+                .context("checkout has no branch")?,
+        )?
+        .context("target checkout disappeared after planning; retry sync")?;
+    if current.path != expected.path {
+        anyhow::bail!("target checkout moved after planning; retry sync");
+    }
+    compute_worktree_removal_details(repo, current)
+}
+
+fn validate_planned_retirement(
+    repo: &GitRepo,
+    remote: &str,
+    cleanup: &BlockingWorktreeCleanup,
+    merged: Option<&MergedBranchInfo>,
+    bb_cli: Option<&crate::commands::sync_retirement::BbCli>,
+) -> Result<RetirementObservation> {
+    let details = refresh_retirement_details(repo, &cleanup.resolution.worktree)?;
+    let observed = observe_retirement(repo, remote, &details, merged, bb_cli)?;
+    if cleanup
+        .lifecycle
+        .as_ref()
+        .is_none_or(|planned| planned != &observed)
+    {
+        anyhow::bail!("worktree lifecycle changed after planning; retry sync");
+    }
+    if let crate::engine::sync_lifecycle::LifecycleDecision::Keep(reason) = observed.decision {
+        anyhow::bail!("sync lifecycle kept worktree ({reason:?}); retry after resolving it");
+    }
+    Ok(observed)
 }
 
 fn preserve_worktree_for_sync(
     repo: &GitRepo,
     cleanup: &BlockingWorktreeCleanup,
+    remote: &str,
+    merged: Option<&MergedBranchInfo>,
     quiet: bool,
 ) -> Result<()> {
+    let bb_cli = crate::commands::sync_retirement::BbCli::from_env()
+        .map(|cli| cli.with_deadline(Instant::now() + Duration::from_secs(20)));
+    validate_planned_retirement(repo, remote, cleanup, merged, bb_cli.as_ref())?;
     let target = repo.switch_worktree_for_branch_delete(&cleanup.resolution)?;
     if !quiet {
         let destination = match target {
@@ -4258,31 +4652,185 @@ fn delete_local_branch_for_sync(
     workdir: &std::path::Path,
     branch: &str,
     blocking_worktree_cleanup: Option<&BlockingWorktreeCleanup>,
-    force_remove_linked_worktree: bool,
+    _force_remove_linked_worktree: bool,
+    operation_id: &str,
+    merge_info: Option<&MergedBranchInfo>,
     quiet: bool,
 ) -> Result<LocalBranchDeleteOutcome> {
-    let mut outcome = attempt_local_branch_delete(workdir, branch);
-    if outcome.deleted || !outcome.worktree_blocked {
-        return Ok(outcome);
+    // No destructive attempt is allowed ahead of lifecycle validation. Even
+    // a detached planned checkout must retain a branch that changed meanwhile.
+    if merge_info.is_none_or(|info| {
+        resolve_ref_oid(workdir, &format!("refs/heads/{branch}")).as_deref()
+            != Some(info.observed_branch_oid.as_str())
+    }) {
+        eprintln!("Sync kept '{branch}': branch head changed after planning; retry sync.");
+        return Ok(LocalBranchDeleteOutcome {
+            worktree_blocked: blocking_worktree_cleanup.is_some(),
+            ..Default::default()
+        });
     }
-
     let Some(cleanup) = blocking_worktree_cleanup else {
-        return Ok(outcome);
+        return Ok(attempt_local_branch_delete(
+            workdir,
+            branch,
+            &merge_info
+                .context("validated merge observation missing")?
+                .observed_branch_oid,
+        ));
+    };
+    let mut outcome = LocalBranchDeleteOutcome {
+        worktree_blocked: true,
+        ..Default::default()
     };
 
-    let force_remove_linked_worktree =
-        force_remove_linked_worktree && cleanup.can_force_remove_dirty_worktree_during_sync();
-    if !cleanup.can_remove_during_sync() && !force_remove_linked_worktree {
+    if !cleanup.can_remove_during_sync() {
         return Ok(outcome);
     }
 
-    let removed_worktree = remove_worktree_with_hooks(
-        repo,
-        config,
-        &cleanup.resolution.worktree,
-        force_remove_linked_worktree,
-        crate::commands::worktree::remove::RemovalMode::AllowParking,
-    );
+    let mut recovery_record = None;
+    let removed_worktree = (|| {
+        let worktree = &cleanup.resolution.worktree;
+        let teardown_deadline = Instant::now() + Duration::from_secs(20);
+        let bb_cli = crate::commands::sync_retirement::BbCli::from_env()
+            .map(|cli| cli.with_deadline(teardown_deadline));
+        // Both planning and execution use this observation/decision boundary.
+        // Refresh before recovery; never act on a stale planned capability.
+        let observed = validate_planned_retirement(
+            repo,
+            config.remote_name(),
+            cleanup,
+            merge_info,
+            bb_cli.as_ref(),
+        )?;
+        let owner = observed.owner;
+        let head = observed.head;
+        let trunk = repo.trunk_branch()?;
+        let trunk_refs = [
+            format!("refs/heads/{trunk}"),
+            format!("refs/remotes/{}/{trunk}", config.remote_name()),
+        ];
+        let recovery = crate::commands::sync_retirement::save_recovery(
+            &repo.common_git_dir()?,
+            &worktree.path,
+            operation_id,
+            branch,
+            &head,
+            &trunk_refs,
+        )?;
+        recovery_record = Some(RecoveryRecord {
+            branch: branch.to_string(),
+            operation_id: recovery.operation_id().to_string(),
+            directory: recovery.directory().to_path_buf(),
+            manifest: recovery.directory().join("manifest.json"),
+        });
+
+        // Revalidate the same owner, operation state, branch tip, and dirty
+        // contents after recovery and immediately before teardown.
+        let verified_owner = crate::commands::sync_retirement::resolve_bb_owner(
+            &repo.main_repo_workdir()?,
+            config.remote_name(),
+            &worktree.path,
+            bb_cli.as_ref(),
+        )?;
+        if owner != verified_owner {
+            anyhow::bail!("worktree ownership changed during recovery; retry sync");
+        }
+        crate::commands::sync_retirement::verify_recovery(&recovery, &worktree.path)?;
+        let details = refresh_retirement_details(repo, worktree)?;
+        if details.info.is_locked
+            || details.rebase_in_progress
+            || details.merge_in_progress
+            || details.has_conflicts
+            || details.info.is_current
+            || crate::commands::sync_retirement::has_protected_operation(&worktree.path)
+                .unwrap_or(true)
+        {
+            anyhow::bail!("worktree entered a protected operation during recovery; retry sync");
+        }
+
+        let display_name = match owner {
+            Some(identity) => {
+                crate::commands::sync_retirement::retire_bb_environment(
+                    &identity,
+                    bb_cli.as_ref().context("BB identity has no CLI adapter")?,
+                )?;
+                worktree
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| worktree.name.clone())
+            }
+            None => {
+                crate::commands::worktree::shared::run_blocking_hook(
+                    config.worktree.hooks.pre_remove.as_deref(),
+                    &worktree.path,
+                    "pre_remove",
+                )?;
+                crate::commands::sync_retirement::verify_recovery(&recovery, &worktree.path)?;
+                let removed_worktree_path = worktree.path.clone();
+                let latest_details = refresh_retirement_details(repo, worktree)?;
+                if latest_details.info.is_locked
+                    || latest_details.rebase_in_progress
+                    || latest_details.merge_in_progress
+                    || latest_details.has_conflicts
+                    || latest_details.info.is_current
+                    || crate::commands::sync_retirement::has_protected_operation(&worktree.path)
+                        .unwrap_or(true)
+                {
+                    anyhow::bail!("worktree entered a protected operation in the removal hook");
+                }
+                // Hooks can transfer ownership without changing any Git data.
+                // A new owner (or an uncertain inventory) cannot authorize the
+                // direct Git remover selected for the original unowned target.
+                let latest_owner = crate::commands::sync_retirement::resolve_bb_owner(
+                    &repo.main_repo_workdir()?,
+                    config.remote_name(),
+                    &worktree.path,
+                    bb_cli.as_ref(),
+                )
+                .context("cannot revalidate ownership after removal hook; retry sync")?;
+                if latest_owner.is_some() {
+                    anyhow::bail!("worktree ownership changed in the removal hook; retry sync");
+                }
+                crate::commands::worktree::remove::retire_worktree(
+                    repo,
+                    config,
+                    worktree,
+                    latest_details.dirty,
+                    crate::commands::worktree::remove::RemovalMode::RealRemove,
+                )?;
+                crate::commands::worktree::shared::spawn_post_remove_hook(
+                    config.worktree.hooks.post_remove.as_deref(),
+                    &removed_worktree_path,
+                )?;
+                worktree
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| worktree.name.clone())
+            }
+        };
+        if !quiet {
+            println!(
+                "    {} recovery saved at {} (operation {})",
+                "↳".cyan(),
+                recovery.directory().display(),
+                recovery.operation_id()
+            );
+            println!(
+                "      `stax undo {}` restores branch and metadata only; it does not recreate the worktree or BB session.",
+                recovery.operation_id()
+            );
+            println!(
+                "      Apply staged.patch with `git apply --cached` and `git apply`, then apply unstaged.patch and copy each manifest-listed untracked entry from this directory."
+            );
+        } else {
+            eprintln!(
+                "Sync recovery saved at {}. Run `stax undo {}` for branch/metadata, then restore workspace files from manifest.json, staged.patch, unstaged.patch, and untracked/. The worktree or BB session is not recreated.",
+                recovery.directory().display(),
+                recovery.operation_id()
+            );
+        }
+        Ok(display_name)
+    })();
     match removed_worktree {
         Ok(display_name) => {
             if !quiet {
@@ -4292,7 +4840,14 @@ fn delete_local_branch_for_sync(
                     display_name.cyan()
                 );
             }
-            outcome = attempt_local_branch_delete(workdir, branch);
+            outcome = attempt_local_branch_delete(
+                workdir,
+                branch,
+                &merge_info
+                    .context("validated merge observation missing")?
+                    .observed_branch_oid,
+            );
+            outcome.recovery = recovery_record;
             Ok(outcome)
         }
         Err(error) => {
@@ -4307,6 +4862,10 @@ fn delete_local_branch_for_sync(
                     .dimmed()
                 );
             }
+            if quiet {
+                eprintln!("Sync kept '{branch}': {error}; retry sync.");
+            }
+            outcome.recovery = recovery_record;
             Ok(outcome)
         }
     }
@@ -4315,21 +4874,21 @@ fn delete_local_branch_for_sync(
 fn attempt_local_branch_delete(
     workdir: &std::path::Path,
     branch: &str,
+    expected_oid: &str,
 ) -> LocalBranchDeleteOutcome {
-    let local_output = Command::new("git")
-        .args(["branch", "-D", branch])
-        .current_dir(workdir)
-        .output();
-
-    match local_output {
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            LocalBranchDeleteOutcome {
-                deleted: out.status.success(),
-                worktree_blocked: stderr.contains("used by worktree"),
-            }
+    match crate::commands::sync_retirement::delete_branch_at_expected_oid(
+        workdir,
+        branch,
+        expected_oid,
+    ) {
+        Ok(()) => LocalBranchDeleteOutcome {
+            deleted: true,
+            ..Default::default()
+        },
+        Err(error) => {
+            eprintln!("Sync kept local ref '{branch}': {error}; ref retained, retry sync.");
+            LocalBranchDeleteOutcome::default()
         }
-        Err(_) => LocalBranchDeleteOutcome::default(),
     }
 }
 
@@ -4362,20 +4921,7 @@ fn sync_delete_prompt(
             );
         }
 
-        if cleanup.can_force_remove_dirty_worktree_during_sync() {
-            if let Some(reason) = reason {
-                return format!(
-                    "Delete '{}' ({reason}) and force-remove dirty linked worktree '{}'?",
-                    branch, cleanup.resolution.worktree.name
-                );
-            }
-
-            return format!(
-                "Delete '{}' and force-remove dirty linked worktree '{}'?",
-                branch, cleanup.resolution.worktree.name
-            );
-        }
-
+        // Dirty linked worktrees stay in place until durable recovery is available.
         if let Some(reason) = reason {
             return format!(
                 "Delete '{}' ({reason}; keep linked worktree '{}')?",
@@ -4399,6 +4945,9 @@ fn sync_delete_prompt(
 fn linked_worktree_delete_options(
     cleanup: &BlockingWorktreeCleanup,
 ) -> Vec<(String, SyncBranchDeleteAction)> {
+    if !cleanup.can_remove_during_sync() {
+        return vec![("Skip".to_string(), SyncBranchDeleteAction::Skip)];
+    }
     let keep_label = match &cleanup.resolution.switch_target {
         BranchDeleteSwitchTarget::Branch(target) => {
             format!(
@@ -4410,20 +4959,18 @@ fn linked_worktree_delete_options(
             "Keep worktree, detach HEAD, and delete branch".to_string()
         }
     };
-    let mut options = vec![(keep_label, SyncBranchDeleteAction::PreserveWorktree)];
+    let mut options = Vec::new();
+    let label = if cleanup.blockers.is_empty() {
+        "Remove worktree and delete branch"
+    } else {
+        "Save recovery and remove worktree"
+    };
+    options.push((
+        label.to_string(),
+        SyncBranchDeleteAction::RemoveWorktree { force: false },
+    ));
 
-    if cleanup.can_remove_during_sync() {
-        options.push((
-            "Remove worktree and delete branch".to_string(),
-            SyncBranchDeleteAction::RemoveWorktree { force: false },
-        ));
-    } else if cleanup.can_force_remove_dirty_worktree_during_sync() {
-        options.push((
-            "Force-remove dirty worktree and delete branch".to_string(),
-            SyncBranchDeleteAction::RemoveWorktree { force: true },
-        ));
-    }
-
+    options.push((keep_label, SyncBranchDeleteAction::PreserveWorktree));
     options.push(("Skip".to_string(), SyncBranchDeleteAction::Skip));
     options
 }
@@ -4722,6 +5269,7 @@ fn record_ci_history_for_merged(
     client: &ForgeClient,
     merged_branches: &[String],
     stack: &Stack,
+    live_pr_observations: &HashMap<String, crate::forge::PrInfoWithHead>,
     quiet: bool,
 ) {
     // Only process branches that still exist locally (can get their commit SHA)
@@ -4737,8 +5285,16 @@ fn record_ci_history_for_merged(
 
     let ci_timer = LiveTimer::maybe_new(!quiet, "Record CI history");
 
-    // Fetch CI statuses for merged branches
-    match fetch_ci_statuses(repo, rt, client, stack, &branches_to_check) {
+    // Fetch CI statuses for merged branches. History is informational, so the
+    // PR refreshed earlier in this sync is reused rather than fetched twice.
+    match fetch_ci_statuses_reusing(
+        repo,
+        rt,
+        client,
+        stack,
+        &branches_to_check,
+        live_pr_observations,
+    ) {
         Ok(statuses) => {
             record_ci_history(repo, &statuses);
             LiveTimer::maybe_finish_timed(ci_timer);
@@ -5104,6 +5660,119 @@ mod tests {
     use colored::control;
     use std::path::PathBuf;
 
+    #[test]
+    fn merged_enumeration_race_is_rejected_for_local_and_remote_trunks() {
+        for remote_trunk in [false, true] {
+            for advance_ref in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path();
+                let run = |args: &[&str]| {
+                    let output = Command::new("git")
+                        .args(args)
+                        .current_dir(path)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "git {:?}: {}",
+                        args,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                };
+                run(&["init", "-b", "main"]);
+                run(&["config", "user.email", "test@example.com"]);
+                run(&["config", "user.name", "Test"]);
+                std::fs::write(path.join("base.txt"), "base\n").unwrap();
+                run(&["add", "base.txt"]);
+                run(&["commit", "-m", "base"]);
+                let base = run(&["rev-parse", "HEAD"]);
+                run(&["switch", "-c", "feature/race"]);
+                std::fs::write(path.join("feature.txt"), "merged\n").unwrap();
+                run(&["add", "feature.txt"]);
+                run(&["commit", "-m", "merged feature"]);
+                let merged_oid = run(&["rev-parse", "HEAD"]);
+                run(&["switch", "main"]);
+                let target = path.join("linked-feature");
+                run(&["worktree", "add", target.to_str().unwrap(), "feature/race"]);
+                run(&["merge", "--no-ff", "feature/race", "-m", "merge feature"]);
+                let merge_commit = run(&["rev-parse", "HEAD"]);
+                if remote_trunk {
+                    run(&["update-ref", "refs/remotes/origin/main", &merge_commit]);
+                    run(&["reset", "--hard", &base]);
+                }
+                let repo = GitRepo::open_from_path(path).unwrap();
+                repo.set_trunk("main").unwrap();
+                BranchMetadata::new("main", &base)
+                    .write(repo.inner(), "feature/race")
+                    .unwrap();
+                let stack = Stack::load(&repo).unwrap();
+                let remote_branches = HashSet::from(["feature/race".to_string()]);
+                let mut history_cache = SyncHistoryCache::default();
+                let mut advanced_oid = None;
+                let mut moved = false;
+                let merged = find_merged_branches_with_prs_after_enumeration(
+                    &repo,
+                    path,
+                    &stack,
+                    "origin",
+                    &remote_branches,
+                    true,
+                    &HashMap::new(),
+                    &mut history_cache,
+                    |enumerated_trunk, enumerated| {
+                        let expected = if remote_trunk { "origin/main" } else { "main" };
+                        if moved || enumerated_trunk != expected {
+                            return;
+                        }
+                        moved = true;
+                        assert!(
+                            enumerated
+                                .lines()
+                                .any(|line| line.starts_with("feature/race ")),
+                            "production enumeration did not include merged feature: {enumerated}"
+                        );
+                        if advance_ref {
+                            let tree = run(&["rev-parse", "feature/race^{tree}"]);
+                            let later = run(&[
+                                "commit-tree",
+                                &tree,
+                                "-p",
+                                &merged_oid,
+                                "-m",
+                                "later unmerged work",
+                            ]);
+                            run(&["update-ref", "refs/heads/feature/race", &later]);
+                            advanced_oid = Some(later);
+                        }
+                    },
+                )
+                .unwrap();
+                assert!(
+                    moved,
+                    "selected production enumeration path was not reached"
+                );
+                assert!(target.is_dir(), "the linked checkout must remain present");
+                let candidate = merged.iter().find(|item| item.branch == "feature/race");
+                if advance_ref {
+                    assert!(
+                        candidate.is_none(),
+                        "advanced unmerged ref became a candidate: {candidate:?}"
+                    );
+                    assert_eq!(
+                        run(&["rev-parse", "refs/heads/feature/race"]),
+                        advanced_oid.unwrap()
+                    );
+                } else {
+                    assert_eq!(
+                        candidate.map(|item| item.observed_branch_oid.as_str()),
+                        Some(merged_oid.as_str())
+                    );
+                }
+            }
+        }
+    }
+
     fn linked_worktree_cleanup(blockers: &[&'static str]) -> BlockingWorktreeCleanup {
         BlockingWorktreeCleanup {
             resolution: crate::git::repo::BranchDeleteResolution {
@@ -5122,6 +5791,8 @@ mod tests {
                 switch_target: crate::git::repo::BranchDeleteSwitchTarget::Detach,
             },
             blockers: blockers.to_vec(),
+            lifecycle_hold: None,
+            lifecycle: None,
         }
     }
 
@@ -5324,15 +5995,15 @@ mod tests {
     }
 
     #[test]
-    fn linked_worktree_delete_options_default_to_preserve() {
+    fn linked_worktree_delete_options_default_to_removal_for_clean_target() {
         let options = linked_worktree_delete_options(&linked_worktree_cleanup(&[]));
 
-        assert_eq!(options[0].1, SyncBranchDeleteAction::PreserveWorktree);
-        assert!(options[0].0.contains("Keep worktree"));
         assert_eq!(
-            options[1].1,
+            options[0].1,
             SyncBranchDeleteAction::RemoveWorktree { force: false }
         );
+        assert!(options[0].0.contains("Remove worktree"));
+        assert_eq!(options[1].1, SyncBranchDeleteAction::PreserveWorktree);
         assert_eq!(
             options.last().expect("skip option").1,
             SyncBranchDeleteAction::Skip
@@ -5355,25 +6026,26 @@ mod tests {
     }
 
     #[test]
-    fn linked_worktree_delete_options_label_dirty_removal_as_destructive() {
+    fn linked_worktree_delete_options_recovers_dirty_target_before_removal() {
         let options = linked_worktree_delete_options(&linked_worktree_cleanup(&["dirty"]));
 
         assert_eq!(
-            options[1].1,
-            SyncBranchDeleteAction::RemoveWorktree { force: true }
+            options[0].1,
+            SyncBranchDeleteAction::RemoveWorktree { force: false }
         );
-        assert!(
-            options[1]
-                .0
-                .contains("Force-remove dirty worktree and delete branch")
+        assert!(options[0].0.contains("Save recovery"));
+        assert_eq!(
+            options.last().expect("skip option").1,
+            SyncBranchDeleteAction::Skip
         );
+        assert_eq!(options[1].1, SyncBranchDeleteAction::PreserveWorktree);
     }
 
     #[test]
     fn linked_worktree_delete_options_omit_remove_for_locked_worktree() {
         let options = linked_worktree_delete_options(&linked_worktree_cleanup(&["locked"]));
 
-        assert_eq!(options.len(), 2);
+        assert_eq!(options.len(), 1);
         assert!(
             options.iter().all(|(_, action)| !matches!(
                 action,
@@ -5388,7 +6060,7 @@ mod tests {
         cleanup.resolution.worktree.is_main = true;
         let options = linked_worktree_delete_options(&cleanup);
 
-        assert_eq!(options.len(), 2);
+        assert_eq!(options.len(), 1);
         assert!(
             options.iter().all(|(_, action)| !matches!(
                 action,
@@ -5487,10 +6159,14 @@ mod tests {
         let planned = vec![MergedBranchInfo {
             branch: "squash-only".to_string(),
             merge_type: MergeType::SquashMerge,
+            observed_branch_oid: "squash-head".to_string(),
+            merged_pr_head_oid: None,
         }];
         let fresh = vec![MergedBranchInfo {
             branch: "ancestor".to_string(),
             merge_type: MergeType::Ancestor,
+            observed_branch_oid: "ancestor-head".to_string(),
+            merged_pr_head_oid: None,
         }];
         let merged = super::merge_planned_merged_detection(planned, fresh);
         assert_eq!(merged.len(), 2);
@@ -5529,6 +6205,138 @@ mod tests {
             .output()
             .expect("git");
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn cycle3_changed_plan_retains_branch_and_checkout_before_delete_or_preserve() {
+        for mutation in [
+            "detach-advance",
+            "switch",
+            "lock",
+            "operation",
+            "head",
+            "owner",
+        ] {
+            for preserve in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path();
+                let head = init_repo_with_two_branches(path);
+                let run = |args: &[&str]| {
+                    let out = Command::new("git")
+                        .args(args)
+                        .current_dir(path)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        out.status.success(),
+                        "{:?}: {}",
+                        args,
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    String::from_utf8_lossy(&out.stdout).trim().to_string()
+                };
+                let target = path.join("linked");
+                let t = target.to_str().unwrap();
+                run(&["worktree", "add", t, "branch-a"]);
+                let repo = GitRepo::open_from_path(path).unwrap();
+                repo.set_trunk("main").unwrap();
+                let info = MergedBranchInfo {
+                    branch: "branch-a".into(),
+                    merge_type: MergeType::Ancestor,
+                    observed_branch_oid: head,
+                    merged_pr_head_oid: None,
+                };
+                let cleanup = plan_merged_worktree_cleanup(&repo, "origin", &info)
+                    .unwrap()
+                    .unwrap();
+                assert!(cleanup.can_remove_during_sync());
+                match mutation {
+                    "detach-advance" => {
+                        run(&["-C", t, "checkout", "--detach"]);
+                        run(&["-C", t, "commit", "--allow-empty", "-m", "new work"]);
+                        let advanced = run(&["-C", t, "rev-parse", "HEAD"]);
+                        run(&["update-ref", "refs/heads/branch-a", &advanced]);
+                    }
+                    "switch" => {
+                        run(&["-C", t, "switch", "branch-b"]);
+                    }
+                    "lock" => {
+                        run(&["worktree", "lock", t]);
+                    }
+                    "operation" => {
+                        let gitdir = run(&["-C", t, "rev-parse", "--absolute-git-dir"]);
+                        std::fs::write(
+                            PathBuf::from(gitdir).join("MERGE_HEAD"),
+                            &info.observed_branch_oid,
+                        )
+                        .unwrap();
+                    }
+                    "head" => {
+                        run(&["-C", t, "commit", "--allow-empty", "-m", "new work"]);
+                    }
+                    "owner" => {}
+                    _ => unreachable!(),
+                }
+                let refs = run(&["show-ref"]);
+                let checkout = run(&["-C", t, "branch", "--show-current"]);
+                if mutation == "owner" {
+                    use std::os::unix::fs::PermissionsExt;
+                    run(&["remote", "add", "origin", "https://example/repo.git"]);
+                    let cli_path = path.join("bb.py");
+                    let script = format!(
+                        r#"#!/usr/bin/env python3
+import json,sys
+a=sys.argv[1:]
+if a == ['status','--json']:
+ print(json.dumps({{'thread':{{'environment':{{'hostId':'host','display':{{'id':'current-owner'}}}}}}}}))
+elif a[:2] == ['environment','list']:
+ print(json.dumps([{{'id':'current-owner','path':{target}}}]))
+else: sys.exit(41)
+"#,
+                        target = serde_json::to_string(&target).unwrap()
+                    );
+                    std::fs::write(&cli_path, script).unwrap();
+                    std::fs::set_permissions(&cli_path, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                    let cli = crate::commands::sync_retirement::BbCli::test_cli(cli_path);
+                    // Both effect paths call this boundary before Git switch or delete.
+                    assert!(
+                        validate_planned_retirement(
+                            &repo,
+                            "origin",
+                            &cleanup,
+                            Some(&info),
+                            Some(&cli)
+                        )
+                        .is_err()
+                    );
+                    // Remote configuration does not change any refs or checkout.
+                } else if preserve {
+                    assert!(
+                        preserve_worktree_for_sync(&repo, &cleanup, "origin", Some(&info), true)
+                            .is_err()
+                    );
+                } else {
+                    let outcome = delete_local_branch_for_sync(
+                        &repo,
+                        &Config::default(),
+                        path,
+                        "branch-a",
+                        Some(&cleanup),
+                        false,
+                        "cycle3-test",
+                        Some(&info),
+                        true,
+                    )
+                    .unwrap();
+                    assert!(!outcome.deleted, "{mutation}");
+                }
+                assert!(target.exists(), "{mutation}");
+                assert_eq!(run(&["show-ref"]), refs, "{mutation}");
+                assert_eq!(run(&["-C", t, "branch", "--show-current"]), checkout);
+                assert!(!path.join(".git/stax/recovery").exists());
+            }
+        }
     }
 
     #[test]

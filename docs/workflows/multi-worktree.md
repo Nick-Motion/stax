@@ -9,14 +9,22 @@ This page covers repo-wide behavior across linked checkouts. For the `st worktre
 - `st restack` and `st sync --restack` run `git rebase` in the target worktree when needed.
 - `st cascade` fast-forwards trunk before restacking, even if trunk is checked out elsewhere.
 - `st sync` updates trunk in whichever worktree currently has trunk checked out.
-- `st sync` cleanup preserves a linked worktree that owns a merged or upstream-gone branch by switching it to trunk or detaching `HEAD` before deleting the branch.
+- `st sync` removes a linked worktree only after merge proof and a durable recovery archive. A fresh merged PR must match its exact head; branches without PR linkage may use confirmed Git history. A missing remote branch by itself is not merge proof.
 - Metadata (`refs/branch-metadata/*`) is shared across all worktrees automatically.
 
 ## Sync cleanup
 
-When a cleanup candidate is checked out in another worktree, interactive sync offers to keep the worktree (the default), remove it, or skip the branch. Keeping it preserves ignored, untracked, and modified files. If switching the worktree to trunk would overwrite local changes, stax leaves it on a detached `HEAD` at its existing commit instead.
+When a confirmed merged branch is checked out in another linked worktree, sync offers removal first for a clean worktree, followed by keeping it or skipping the branch. Sync uses a real Git worktree removal, so warm-slot recycling does not keep the retired directory around. If the branch is checked out in the primary worktree, or the linked worktree is locked or has an operation/conflicts in progress, sync keeps it and reports why.
 
-`st sync --force` also keeps the worktree. In this command, `--force` skips prompts but never authorizes worktree removal. If stax cannot switch or detach the worktree safely—for example, because a merge is in progress—it keeps the worktree, branch, remote branch, and metadata and reports the commands needed for manual recovery.
+Dirty tracked, untracked, and ignored files are copied to a versioned recovery directory under the common Git directory before sync removes the worktree. The manifest records the operation, original path, branch head, patches, and file mapping. Archive files and directories are synced before the worktree can be removed. If saving or immediate revalidation fails, sync keeps the worktree and branch for retry. Ownership is checked again after `pre_remove`. If teardown advances or reuses the branch, sync retains the local ref and reports a retry; the archive still covers only the original manifest head. JSON output includes `recovery_artifacts` when an archive was saved. `st sync --force` skips confirmation; it never authorizes discarding dirty work.
+
+`st sync --dry-run --json --force` reports `would_recover_then_delete` for eligible linked checkouts, including dirty ones; `--force` does not hide the recovery requirement. Plans use the same lifecycle observations as execution and retain protected or uncertain BB targets. Dry-run creates no recovery archives and makes no Git or BB mutations.
+
+Run `stax undo <operation-id>` to restore branch refs and metadata. Undo does not recreate the worktree directory or a BB session. To recover local file changes, use the `staged.patch` and `unstaged.patch` in the recorded directory and copy each entry listed in `manifest.json` from `untracked/` to its original path. For the staged patch, apply it both to the index (`git apply --cached --binary`) and worktree (`git apply --binary`) before applying `unstaged.patch`.
+
+BB-managed worktrees are identified by their exact registered environment path, provider, host, and project remote. Sync archives only idle threads associated with that environment and asks BB to delete it; active work, uncertain ownership, a refusal, or a teardown timeout keeps the branch and recovery archive for retry.
+
+For plain Git worktrees, sync runs `pre_remove` from the verified target worktree. Since the directory is gone when `post_remove` runs, that hook starts in a fresh empty temporary directory, so relative effects cannot modify the primary checkout, and receives the removed target's absolute path in `STAX_REMOVED_WORKTREE_PATH`.
 
 ## Dirty worktrees
 

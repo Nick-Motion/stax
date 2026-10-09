@@ -102,3 +102,57 @@ pub(crate) async fn mount_pr_create_and_refresh(
         .mount(mock_server)
         .await;
 }
+
+/// Give a synthetic repository fresh merged-PR evidence for its exact branch
+/// head. Preserve the existing parent boundary; all Git traffic stays local.
+pub(crate) async fn merged_pr_fixture(
+    root: &Path,
+    branch: &str,
+) -> (MockServer, tempfile::TempDir) {
+    use super::OutputAssertions;
+    let git = |args: &[&str]| {
+        let output = super::hermetic_git_command()
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        output.assert_success();
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let head = git(&["rev-parse", branch]);
+    let metadata_ref = format!("refs/branch-metadata/{branch}");
+    let mut metadata: serde_json::Value =
+        serde_json::from_str(&git(&["show", &metadata_ref])).unwrap();
+    metadata["prInfo"] = serde_json::json!({"number": 991, "state": "OPEN"});
+    let file = tempfile::NamedTempFile::new().unwrap();
+    fs::write(file.path(), metadata.to_string()).unwrap();
+    let oid = git(&["hash-object", "-w", file.path().to_str().unwrap()]);
+    git(&["update-ref", &metadata_ref, &oid]);
+    let remote = git(&["remote", "get-url", "origin"]);
+    let url = "https://github.com/test-owner/test-repo.git";
+    git(&["remote", "set-url", "origin", url]);
+    git(&["remote", "set-url", "--push", "origin", &remote]);
+    git(&[
+        "config",
+        "--local",
+        &format!("url.file://{}.insteadOf", remote.trim_end_matches('/')),
+        url,
+    ]);
+    let server = MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    write_stax_config(home.path(), &server.uri(), "");
+    Mock::given(method("GET"))
+        .and(path("/repos/test-owner/test-repo/pulls/991"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "url":"https://api.github.com/repos/test-owner/test-repo/pulls/991",
+            "id":991, "number":991, "state":"closed", "merged":true,
+            "merged_at":"2026-01-01T00:00:00Z", "draft":false, "title":"Merged fixture", "body":"",
+            "head":{"ref":branch,"sha":head,"label":format!("test-owner:{branch}")},
+            "base":{"ref":"main","sha":git(&["rev-parse", "main"])},
+            "html_url":"https://github.com/test-owner/test-repo/pull/991"
+        })))
+        .expect(1..)
+        .mount(&server)
+        .await;
+    (server, home)
+}

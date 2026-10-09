@@ -80,6 +80,9 @@ pub struct PrInfo {
 pub struct PrInfoWithHead {
     pub info: PrInfo,
     pub head: String,
+    /// Exact source revision returned by the forge. Empty only when a forge
+    /// response omitted it; consumers requiring identity must then fail closed.
+    pub head_sha: String,
     pub head_label: Option<String>,
     pub title: String,
 }

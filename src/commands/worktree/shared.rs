@@ -750,7 +750,32 @@ pub fn generate_random_lane_slug(repo: &GitRepo, config: &Config) -> Result<Stri
     bail!("Could not generate a unique random worktree name");
 }
 
+/// Whether to walk history for the ahead/behind display counts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Divergence {
+    Compute,
+    Skip,
+}
+
 pub fn compute_worktree_details(repo: &GitRepo, worktree: WorktreeInfo) -> Result<WorktreeDetails> {
+    compute_worktree_details_with(repo, worktree, Divergence::Compute)
+}
+
+/// Removal-safety observations (inventory entry, stax metadata, dirty and
+/// operation state) without the ahead/behind history walk, which no removal
+/// decision reads; `ahead` and `behind` are `None`.
+pub fn compute_worktree_removal_details(
+    repo: &GitRepo,
+    worktree: WorktreeInfo,
+) -> Result<WorktreeDetails> {
+    compute_worktree_details_with(repo, worktree, Divergence::Skip)
+}
+
+fn compute_worktree_details_with(
+    repo: &GitRepo,
+    worktree: WorktreeInfo,
+    divergence: Divergence,
+) -> Result<WorktreeDetails> {
     let branch_label = worktree
         .branch
         .clone()
@@ -763,7 +788,9 @@ pub fn compute_worktree_details(repo: &GitRepo, worktree: WorktreeInfo) -> Resul
             let marker = repo.worktree_marker(branch);
             let fallback_trunk = repo.trunk_branch().ok();
             let diff_base = parent.as_deref().or(fallback_trunk.as_deref());
-            let diff_pair = diff_base.and_then(|base| repo.commits_ahead_behind(base, branch).ok());
+            let diff_pair = diff_base
+                .filter(|_| divergence == Divergence::Compute)
+                .and_then(|base| repo.commits_ahead_behind(base, branch).ok());
 
             (
                 meta.is_some(),
@@ -1120,6 +1147,28 @@ pub fn spawn_background_hook(command: Option<&str>, cwd: &Path, label: &str) -> 
         .spawn()
         .with_context(|| format!("Failed to start {} hook", label))?;
 
+    Ok(())
+}
+
+/// Start a post-removal hook after the target directory is gone while keeping
+/// its identity explicit for scripts that need to clean up target-specific data.
+pub fn spawn_post_remove_hook(command: Option<&str>, removed_path: &Path) -> Result<()> {
+    let Some(command) = command.filter(|cmd| !cmd.trim().is_empty()) else {
+        return Ok(());
+    };
+    let context = tempfile::tempdir().context("Failed to create post_remove hook context")?;
+    let mut child = platform_shell(command)
+        .current_dir(context.path())
+        .env("STAX_REMOVED_WORKTREE_PATH", removed_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Failed to start post_remove hook")?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        drop(context);
+    });
     Ok(())
 }
 
@@ -1501,11 +1550,34 @@ mod tests {
         ExistingTmuxSessionBehavior, LaunchOptions, LaunchSpec, WorktreeDetails,
         build_agent_launch_spec_with_options, build_launch_spec, build_tmux_launch_spec,
         default_tmux_session_name, is_tmux_no_server_error, parse_tmux_sessions_output,
-        worktree_removal_blockers_for_cleanup, yolo_flag_for_agent,
+        spawn_post_remove_hook, worktree_removal_blockers_for_cleanup, yolo_flag_for_agent,
     };
     use crate::config::Config;
     use crate::git::repo::WorktreeInfo;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn post_remove_hook_receives_removed_target_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary");
+        let removed = dir.path().join("removed-worktree");
+        std::fs::create_dir(&primary).unwrap();
+        let log = dir.path().join("hook-path");
+        let command = format!(
+            "printf '%s' \"$STAX_REMOVED_WORKTREE_PATH\" > '{}'",
+            log.display()
+        );
+        spawn_post_remove_hook(Some(&command), &removed).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !log.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            removed.to_string_lossy()
+        );
+    }
 
     fn sample_worktree_details() -> WorktreeDetails {
         WorktreeDetails {

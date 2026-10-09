@@ -5,6 +5,7 @@ pub mod restack_preflight;
 pub mod snapshot;
 pub mod stack;
 pub mod stats;
+pub mod sync_lifecycle;
 
 pub use metadata::{BranchMetadata, PrInfo};
 pub use picker::build_parent_candidates;

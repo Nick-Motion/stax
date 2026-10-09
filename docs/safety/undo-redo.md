@@ -41,7 +41,9 @@ re-advanced to the post-sync SHA.
 
 **Not restored by undo** (intentional scope limits):
 
-- Removed linked worktrees (`stax worktree remove` within sync is not tracked).
+- Removed linked worktree directories and BB sessions.
+
+Sync's confirmed-merge worktree cleanup writes a separate recovery archive before removal. The archive contains a bundle for the branch commits, staged and unstaged patches, and copied untracked files. `stax undo` restores branch and metadata refs; it does not recreate the removed directory or a BB session. Sync prints and emits the recovery location so the file changes can be restored separately. For manual restoration at the archived head, apply a nonempty `staged.patch` with `git apply --cached` and then `git apply`; apply a nonempty `unstaged.patch` with `git apply`. Skip empty patches. Restore archived untracked paths from the manifest to their original relative paths.
 - Forge PR base updates (GitHub/GitLab API side-effects are external to git).
 - CI history writes.
 

@@ -28,7 +28,7 @@ stax submit|ss                 # Submit full stack
 stax stack link                # Register current PR stack as native GitHub Stack (GitHub + gh-stack)
 stax stack unlink <stack-number> # Unstack a native GitHub Stack remotely; omit number for active local tracking
 stax merge                     # Merge PRs from stack bottom upward
-stax sync|rs                   # Sync trunk + clean merged branches; report closed PRs without deleting
+stax sync|rs                   # Sync trunk + clean confirmed-merged branches; archive dirty work before linked-worktree retirement
 stax sweep                     # Classify merged/closed-pr/gone/stale/active; --delete --include-closed opts into discarding closed PR branches
 stax stats                     # Single-screen local stacking health snapshot (--current, --json, --ci)
 stax restack                   # Rebase branch/stack onto parents
@@ -803,3 +803,5 @@ Symbols:
 - Use `stax worktree go` (or `sw`) + shell integration to switch between stacks without `cd` gymnastics.
 - Use `stax worktree promote` when a lane should become the main-worktree checkout; it refuses dirty or conflicted checkouts instead of stashing automatically. If Git reports a removal failure after already retiring the lane, Stax keeps the completed promotion and warns you to inspect leftover files.
 - `stax worktree list` shows ALL worktrees including those created externally via `git worktree add`.
+
+Sync retirement runs `pre_remove` inside the verified linked worktree. After removal, `post_remove` runs in an empty temporary directory with `STAX_REMOVED_WORKTREE_PATH` identifying the removed target; use explicit paths for target-specific cleanup.

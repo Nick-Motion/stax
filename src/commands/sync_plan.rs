@@ -1,20 +1,20 @@
 use crate::commands::sync::{
-    BlockingWorktreeCleanup, MergeType, MergedBranchInfo, PartialMergeReason, StashPolicy,
-    count_commits_between, diff_line_stats_between, find_merged_branches,
+    BlockingWorktreeCleanup, MergeType, MergedBranchInfo, PR_METADATA_REFRESH_CONCURRENCY,
+    PartialMergeReason, StashPolicy, count_commits_between, diff_line_stats_between,
     find_partially_merged_notes, find_upstream_gone_branches, imported_branches_for_cleanup,
-    init_forge_client, is_ancestor, local_branch_exists, plan_blocking_worktree_cleanup,
+    init_forge_client, is_ancestor, local_branch_exists, plan_merged_worktree_cleanup,
     print_cleanup_candidates, print_retained_closed_prs, resolve_fallback_parent_skipping_doomed,
     resolve_ref_oid, retained_closed_prs,
 };
 use crate::config::Config;
-use crate::engine::branch_detect::has_unique_commits_since_any_base;
 use crate::engine::{BranchMetadata, Stack};
 use crate::git::GitRepo;
 use crate::progress::LiveTimer;
 use crate::remote;
 use anyhow::Result;
 use colored::Colorize;
-use std::collections::HashSet;
+use futures_util::stream::{self, StreamExt};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -282,9 +282,13 @@ pub(super) fn would_need_restack(
         .collect()
 }
 
-fn patch_stack_pr_states_in_memory(stack: &mut Stack, repo: &GitRepo, config: &Config) {
+fn patch_stack_pr_states_in_memory(
+    stack: &mut Stack,
+    repo: &GitRepo,
+    config: &Config,
+) -> HashMap<String, crate::forge::PrInfoWithHead> {
     let Some((rt, client)) = init_forge_client(repo, config) else {
-        return;
+        return HashMap::new();
     };
 
     let tracked: Vec<(String, u64)> = stack
@@ -294,14 +298,27 @@ fn patch_stack_pr_states_in_memory(stack: &mut Stack, repo: &GitRepo, config: &C
         .filter_map(|(name, info)| info.pr_number.map(|n| (name.clone(), n)))
         .collect();
 
-    for (branch_name, pr_number) in tracked {
-        if let Ok(live_pr) = rt.block_on(client.get_pr(pr_number))
+    // Same bounded concurrency as sync's live refresh; `buffered` keeps the
+    // tracked order so the plan is deterministic.
+    let live_prs = rt.block_on(
+        stream::iter(tracked.into_iter().map(|(branch_name, pr_number)| {
+            let client = client.clone();
+            async move { (branch_name, client.get_pr_with_head(pr_number).await) }
+        }))
+        .buffered(PR_METADATA_REFRESH_CONCURRENCY)
+        .collect::<Vec<_>>(),
+    );
+    let mut observations = HashMap::new();
+    for (branch_name, live_pr) in live_prs {
+        if let Ok(live_pr) = live_pr
             && let Some(br) = stack.branches.get_mut(&branch_name)
         {
-            br.pr_state = Some(live_pr.state.to_uppercase());
-            br.pr_is_draft = Some(live_pr.is_draft);
+            br.pr_state = Some(live_pr.info.state.to_uppercase());
+            br.pr_is_draft = Some(live_pr.info.is_draft);
+            observations.insert(branch_name, live_pr);
         }
     }
+    observations
 }
 
 pub fn run(options: SyncPlanOptions) -> Result<()> {
@@ -430,7 +447,7 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
     let current = repo.current_branch()?;
 
     // Patch PR states in memory BEFORE any &Stack borrows for detection
-    patch_stack_pr_states_in_memory(&mut stack, &repo, &config);
+    let live_pr_observations = patch_stack_pr_states_in_memory(&mut stack, &repo, &config);
 
     // --- Trunk section ---
     let on_trunk = current == trunk;
@@ -561,13 +578,16 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
             );
         }
     } else {
-        let merged = find_merged_branches(
+        let mut history_cache = crate::commands::sync::SyncHistoryCache::default();
+        let merged = crate::commands::sync::find_merged_branches_with_prs(
             &repo,
             &workdir,
             &stack,
             &remote_name,
             &remote_branch_set,
             false,
+            &live_pr_observations,
+            &mut history_cache,
         )?;
         let merged_names: Vec<String> = merged.iter().map(|info| info.branch.clone()).collect();
         plan_data.closed_prs = retained_closed_prs(&stack, &merged_names);
@@ -582,6 +602,7 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
             &remote_name,
             &remote_branch_set,
             &merged,
+            &mut history_cache,
         )?;
 
         // Collect partially_merged for JSON (always, outside !quiet gate).
@@ -617,7 +638,7 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
             for merged_info in &merged {
                 let branch = &merged_info.branch;
                 let is_current = *branch == current;
-                let blocking = plan_blocking_worktree_cleanup(&repo, branch, force).unwrap_or(None);
+                let blocking = plan_merged_worktree_cleanup(&repo, &remote_name, merged_info)?;
                 let (fallback_parent, _) = resolve_fallback_parent_skipping_doomed(
                     &workdir,
                     &stack,
@@ -707,26 +728,41 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
         } else {
             let mut protected: Vec<String> = Vec::new();
             let mut deletable: Vec<String> = Vec::new();
+            let mut recovering = HashSet::new();
 
             for branch in &gone {
-                if plan_data.closed_prs.contains(branch) {
+                if plan_data.closed_prs.contains(branch)
+                    || stack
+                        .branches
+                        .get(branch)
+                        .is_some_and(|info| info.pr_number.is_some())
+                    || crate::commands::sync::should_spare_empty_never_submitted_branch(
+                        &workdir, &stack, branch,
+                    )?
+                {
                     continue;
                 }
                 if branch == &trunk {
                     continue;
                 }
-                let parent = stack
-                    .branches
-                    .get(branch.as_str())
-                    .and_then(|b| b.parent.clone())
-                    .unwrap_or_else(|| trunk.clone());
-                let has_unique =
-                    has_unique_commits_since_any_base(&workdir, branch, &[parent.as_str()])
-                        .unwrap_or(false);
-                if has_unique {
-                    protected.push(branch.clone());
+                if let Some(merge_info) = crate::commands::sync::upstream_gone_merge_evidence(
+                    &workdir,
+                    branch,
+                    &trunk,
+                    &remote_trunk_ref,
+                )? {
+                    match plan_merged_worktree_cleanup(&repo, &remote_name, &merge_info)? {
+                        Some(cleanup) if !cleanup.can_remove_during_sync() => {
+                            protected.push(branch.clone());
+                        }
+                        Some(_) => {
+                            recovering.insert(branch.clone());
+                            deletable.push(branch.clone());
+                        }
+                        None => deletable.push(branch.clone()),
+                    }
                 } else {
-                    deletable.push(branch.clone());
+                    protected.push(branch.clone());
                 }
             }
 
@@ -736,7 +772,9 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
                 plan_data.upstream_gone_deletable.push(
                     crate::commands::sync_json::UpstreamGoneDeleteJson {
                         name: b.clone(),
-                        disposition: if force {
+                        disposition: if force && recovering.contains(b) {
+                            "would_recover_then_delete"
+                        } else if force {
                             "would_delete"
                         } else {
                             "would_prompt_then_delete"
@@ -752,7 +790,7 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
                             "  {} {} {}",
                             "↷".yellow(),
                             b.cyan(),
-                            "(upstream-gone; protected — has unique commits)".dimmed()
+                            "(upstream-gone; protected — local work or checkout safety)".dimmed()
                         );
                     }
                 }
@@ -763,6 +801,13 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
                 if !quiet {
                     print_cleanup_candidates("upstream-gone", &deletable);
                     for branch in &deletable {
+                        if recovering.contains(branch) {
+                            println!(
+                                "  {} {} (would archive recovery data before removing worktree)",
+                                "↳".cyan(),
+                                branch.bright_black()
+                            );
+                        }
                         if force {
                             println!(
                                 "  {} {} {}",
@@ -977,8 +1022,20 @@ fn render_merged_branch_plan(
     exempt_imported: &HashSet<String>,
     remote_branches: &HashSet<String>,
 ) {
+    if matches!(merged_info.merge_type, MergeType::SquashMerge)
+        && merged_info.merged_pr_head_oid.is_none()
+    {
+        println!(
+            "  {} {} {}",
+            "○".yellow(),
+            branch.bright_black(),
+            "(patch-equivalent only; no retirement evidence)".dimmed()
+        );
+        return;
+    }
     // Blocking worktree takes priority
     if let Some(blocker) = blocking
+        && !blocker.can_remove_during_sync()
         && let Some(reason) = blocker.blocker_summary()
     {
         println!(
@@ -988,6 +1045,15 @@ fn render_merged_branch_plan(
             format!("(would keep worktree: {})", reason).dimmed()
         );
         return;
+    }
+
+    if blocking.is_some_and(BlockingWorktreeCleanup::can_remove_during_sync) {
+        println!(
+            "  {} {} {}",
+            "↳".cyan(),
+            branch.bright_black(),
+            "(would archive recovery data before removing worktree)".dimmed()
+        );
     }
 
     // Missing local parent → would skip
@@ -1083,7 +1149,22 @@ fn classify_merged_candidate(
 ) -> crate::commands::sync_json::MergedCandidateJson {
     use crate::commands::sync_json::MergedCandidateJson;
 
+    if matches!(merged_info.merge_type, MergeType::SquashMerge)
+        && merged_info.merged_pr_head_oid.is_none()
+    {
+        return MergedCandidateJson {
+            name: branch.to_string(),
+            disposition: "would_skip",
+            scope: None,
+            keep_reason: Some(
+                "patch-equivalent history is informational without ancestry proof".into(),
+            ),
+            children: vec![],
+        };
+    }
+
     if let Some(blocker) = blocking
+        && !blocker.can_remove_during_sync()
         && let Some(reason) = blocker.blocker_summary()
     {
         return MergedCandidateJson {
@@ -1094,6 +1175,8 @@ fn classify_merged_candidate(
             children: vec![],
         };
     }
+
+    let recovery_required = blocking.is_some_and(BlockingWorktreeCleanup::can_remove_during_sync);
 
     if !parent_exists && fallback_parent != stack.trunk {
         return MergedCandidateJson {
@@ -1132,7 +1215,9 @@ fn classify_merged_candidate(
 
     MergedCandidateJson {
         name: branch.to_string(),
-        disposition: if force {
+        disposition: if recovery_required {
+            "would_recover_then_delete"
+        } else if force {
             "would_delete"
         } else {
             "would_prompt_then_delete"

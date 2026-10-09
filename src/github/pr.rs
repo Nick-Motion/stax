@@ -70,10 +70,15 @@ fn octocrab_pr_base(pr: &PullRequest) -> &Base {
 }
 
 fn octocrab_pr_state(pr: &PullRequest) -> String {
-    pr.state
-        .as_ref()
-        .map(|s| format!("{:?}", s))
-        .unwrap_or_default()
+    if pr.merged_at.is_some() {
+        "MERGED".to_string()
+    } else {
+        pr.state
+            .as_ref()
+            .map(|s| format!("{:?}", s))
+            .unwrap_or_default()
+            .to_uppercase()
+    }
 }
 
 fn octocrab_pr_info_with_state(pr: &PullRequest, state: String) -> Result<PrInfo> {
@@ -97,6 +102,7 @@ fn octocrab_pr_info_with_head(pr: &PullRequest) -> Result<PrInfoWithHead> {
         title: pr.title.clone().unwrap_or_default(),
         info: octocrab_pr_info(pr)?,
         head: head.ref_field.clone(),
+        head_sha: head.sha.clone(),
     })
 }
 
@@ -541,17 +547,7 @@ impl GitHubClient {
             .await
             .context("Failed to get PR")?;
 
-        let state = if pr.merged_at.is_some() {
-            "MERGED".to_string()
-        } else {
-            pr.state
-                .as_ref()
-                .map(|s| format!("{:?}", s))
-                .unwrap_or_default()
-                .to_uppercase()
-        };
-
-        octocrab_pr_info_with_state(&pr, state)
+        octocrab_pr_info(&pr)
     }
 
     /// Get a PR by number, including head branch name

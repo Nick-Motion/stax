@@ -123,9 +123,18 @@ fn sanitized_stax_command() -> Command {
 
 fn apply_sanitized_test_env(cmd: &mut Command) {
     let null_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    for (key, _) in std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("BB_"))
+    {
+        cmd.env_remove(key);
+    }
     // Keep tests hermetic and avoid accidentally hitting real GitHub APIs.
     cmd.env_remove("GITHUB_TOKEN")
         .env_remove("STAX_GITHUB_TOKEN")
+        // BB lifecycle tests must opt into an explicit fake executable; never
+        // let an agent shell's real BB identity leak into fixture repositories.
+        .env_remove("BB_CLI")
+        .env_remove("BB_THREAD_ID")
+        .env_remove("BB_ENVIRONMENT_ID")
         .env_remove("STAX_SHELL_INTEGRATION")
         .env_remove("STAX_CONFIG_DIR")
         .env_remove("GH_TOKEN")
@@ -1017,4 +1026,135 @@ mod tests {
             );
         }
     }
+}
+
+/// Restore a retired linked fixture into a new disposable repository, using
+/// only its bundle and manifest. Returning the directory lets each regression
+/// compare its original tracked, staged, untracked and ignored contents.
+pub(crate) fn restore_sync_recovery(root: &Path, branch: &str, original: &Path) -> TempDir {
+    assert!(
+        !original.exists(),
+        "retired directory must actually be removed"
+    );
+    let git = |cwd: &Path, args: &[&str]| {
+        let output = hermetic_git_command()
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        output.assert_success();
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let worktrees = git(root, &["worktree", "list", "--porcelain"]);
+    assert!(
+        !worktrees
+            .lines()
+            .any(|line| line == format!("worktree {}", original.display()))
+    );
+    let manifest = fs::read_dir(root.join(".git/stax/recovery"))
+        .unwrap()
+        .flat_map(|op| fs::read_dir(op.unwrap().path()).unwrap())
+        .map(|entry| entry.unwrap().path().join("manifest.json"))
+        .find(|path| {
+            fs::read(path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .is_some_and(|v| v["branch"] == branch)
+        })
+        .expect("branch recovery manifest");
+    let json: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    let version = json["version"].as_u64().expect("recovery manifest version");
+    match version {
+        1 => assert!(
+            json.get("bundle_prerequisites").is_none()
+                || json["bundle_prerequisites"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty),
+            "v1 recovery manifests must describe a self-contained bundle"
+        ),
+        2 => {
+            let prerequisites = json["bundle_prerequisites"]
+                .as_array()
+                .expect("v2 bundle prerequisites array");
+            for prerequisite in prerequisites {
+                let trunk_ref = prerequisite["trunk_ref"]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .expect("prerequisite trunk ref");
+                let trunk_oid = prerequisite["trunk_oid"]
+                    .as_str()
+                    .expect("prerequisite trunk oid");
+                let merge_base = prerequisite["merge_base"]
+                    .as_str()
+                    .expect("prerequisite merge base");
+                for oid in [trunk_oid, merge_base] {
+                    assert!(
+                        (oid.len() == 40 || oid.len() == 64)
+                            && oid.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                        "invalid prerequisite object id: {oid}"
+                    );
+                }
+                assert_eq!(git(root, &["rev-parse", trunk_ref]), trunk_oid);
+                assert_eq!(
+                    git(root, &["merge-base", head_oid(&json), trunk_oid]),
+                    merge_base,
+                    "prerequisite must be the exact merge base of archived head and trunk"
+                );
+            }
+        }
+        other => panic!("unsupported recovery manifest version {other}"),
+    }
+    let manifest_path = Path::new(json["original_path"].as_str().unwrap());
+    let canonical_parent = original.parent().unwrap().canonicalize().unwrap();
+    assert_eq!(
+        canonical_parent.join(original.file_name().unwrap()),
+        manifest_path
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join(manifest_path.file_name().unwrap()),
+        "recovery manifest must retain the retired worktree path"
+    );
+    let head = json["observed_head"].as_str().unwrap();
+    assert_eq!(
+        git(root, &["rev-parse", json["branch_ref"].as_str().unwrap()]),
+        head
+    );
+    let archive = manifest.parent().unwrap();
+    let restored = test_tempdir();
+    git(restored.path(), &["init"]);
+    git(
+        restored.path(),
+        &[
+            "fetch",
+            archive.join("branch.bundle").to_str().unwrap(),
+            json["branch_ref"].as_str().unwrap(),
+        ],
+    );
+    git(restored.path(), &["checkout", "--detach", "FETCH_HEAD"]);
+    assert_eq!(git(restored.path(), &["rev-parse", "HEAD"]), head);
+    for (field, cached) in [("staged_patch", true), ("unstaged_patch", false)] {
+        let patch = archive.join(json[field].as_str().unwrap());
+        if !fs::read(&patch).unwrap().is_empty() {
+            if cached {
+                git(
+                    restored.path(),
+                    &["apply", "--cached", patch.to_str().unwrap()],
+                );
+            }
+            git(restored.path(), &["apply", patch.to_str().unwrap()]);
+        }
+    }
+    for entry in json["untracked"].as_array().unwrap() {
+        let (path, saved) = entry.as_str().unwrap().split_once('\t').unwrap();
+        let target = restored.path().join(path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(archive.join(saved), target).unwrap();
+    }
+    restored
+}
+
+fn head_oid(manifest: &Value) -> &str {
+    manifest["observed_head"].as_str().expect("observed head")
 }

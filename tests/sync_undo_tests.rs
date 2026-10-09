@@ -1,4 +1,4 @@
-use crate::common::TestRepo;
+use crate::common::{OutputAssertions, TestRepo};
 
 /// Helper: read the parentBranchName from stax metadata for `branch`.
 fn read_parent_branch(repo: &TestRepo, branch: &str) -> String {
@@ -137,6 +137,561 @@ fn sync_undo_restores_a_merged_branch_at_its_old_tip() {
         resolve_ref(&repo, &format!("refs/branch-metadata/{feature}")).is_some(),
         "undo should restore the metadata ref for {feature}"
     );
+}
+
+#[test]
+fn sync_retires_clean_merged_linked_worktree_and_undo_keeps_directory_retired() {
+    let repo = TestRepo::new_with_remote();
+    repo.run_stax(&["bc", "linked-cleanup"]);
+    let feature = repo.current_branch();
+    repo.create_file("linked.txt", "feature\n");
+    repo.commit("feature");
+    repo.git(&["push", "-u", "origin", &feature]);
+    repo.run_stax(&["t"]);
+
+    let parent = tempfile::tempdir().expect("linked worktree parent");
+    let linked = parent.path().join("linked");
+    let add = repo.git(&[
+        "worktree",
+        "add",
+        linked.to_str().expect("worktree path"),
+        &feature,
+    ]);
+    assert!(
+        add.status.success(),
+        "worktree add failed: {}",
+        TestRepo::stderr(&add)
+    );
+    repo.merge_branch_on_remote(&feature);
+    repo.git(&["pull", "origin", "main"]);
+
+    let sync = repo.run_stax(&["sync", "--force"]);
+    assert!(
+        sync.status.success(),
+        "sync failed: {}",
+        TestRepo::stderr(&sync)
+    );
+    assert!(!linked.exists(), "merged linked worktree must be removed");
+    assert!(
+        !branch_exists(&repo, &feature),
+        "merged branch must be deleted"
+    );
+
+    let recovery_root = repo.path().join(".git/stax/recovery");
+    let manifest = std::fs::read_dir(&recovery_root)
+        .expect("recovery root")
+        .flat_map(|operation| std::fs::read_dir(operation.unwrap().path()).unwrap())
+        .map(|entry| entry.unwrap().path().join("manifest.json"))
+        .find(|path| {
+            std::fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|json| json["branch"] == feature)
+        })
+        .expect("recovery manifest for merged branch");
+    assert!(manifest.parent().unwrap().join("branch.bundle").is_file());
+
+    let undo = repo.run_stax(&["undo", "--yes"]);
+    assert!(
+        undo.status.success(),
+        "undo failed: {}",
+        TestRepo::stderr(&undo)
+    );
+    assert!(
+        branch_exists(&repo, &feature),
+        "undo should restore branch ref"
+    );
+    assert!(
+        !linked.exists(),
+        "undo must not promise to recreate retired worktree"
+    );
+}
+
+#[test]
+fn sync_archives_dirty_linked_worktree_before_removal() {
+    let repo = TestRepo::new_with_remote();
+    repo.run_stax(&["bc", "linked-dirty-cleanup"]);
+    let feature = repo.current_branch();
+    repo.create_file("linked.txt", "feature\n");
+    repo.commit("feature");
+    repo.git(&["push", "-u", "origin", &feature]);
+    repo.run_stax(&["t"]);
+
+    let parent = tempfile::tempdir().expect("linked worktree parent");
+    let linked = parent.path().join("linked");
+    let add = repo.git(&[
+        "worktree",
+        "add",
+        linked.to_str().expect("worktree path"),
+        &feature,
+    ]);
+    assert!(
+        add.status.success(),
+        "worktree add failed: {}",
+        TestRepo::stderr(&add)
+    );
+    std::fs::write(linked.join("linked.txt"), "staged\n").unwrap();
+    let add = std::process::Command::new("git")
+        .args(["add", "linked.txt"])
+        .current_dir(&linked)
+        .output()
+        .unwrap();
+    assert!(add.status.success());
+    std::fs::write(linked.join("linked.txt"), "unstaged\n").unwrap();
+    std::fs::write(linked.join("untracked.txt"), "untracked\n").unwrap();
+    std::fs::write(linked.join("ignored-local.txt"), "ignored local config\n").unwrap();
+    let mut exclude = std::fs::OpenOptions::new()
+        .append(true)
+        .open(repo.path().join(".git/info/exclude"))
+        .unwrap();
+    use std::io::Write;
+    writeln!(exclude, "ignored-local.txt").unwrap();
+
+    repo.merge_branch_on_remote(&feature);
+    repo.git(&["pull", "origin", "main"]);
+    let sync = repo.run_stax(&["sync", "--force"]);
+    assert!(
+        sync.status.success(),
+        "sync failed: {}",
+        TestRepo::stderr(&sync)
+    );
+    assert!(
+        !linked.exists(),
+        "recovered dirty linked worktree must be removed; stdout: {}; stderr: {}",
+        TestRepo::stdout(&sync),
+        TestRepo::stderr(&sync)
+    );
+
+    let recovery_root = repo.path().join(".git/stax/recovery");
+    let manifest = std::fs::read_dir(&recovery_root)
+        .expect("recovery root")
+        .flat_map(|operation| std::fs::read_dir(operation.unwrap().path()).unwrap())
+        .map(|entry| entry.unwrap().path().join("manifest.json"))
+        .find(|path| {
+            std::fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|json| json["branch"] == feature)
+        })
+        .expect("recovery manifest for dirty branch");
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    let recovery_dir = manifest.parent().unwrap();
+    assert!(recovery_dir.join("branch.bundle").is_file());
+    assert!(
+        !std::fs::read(recovery_dir.join("staged.patch"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !std::fs::read(recovery_dir.join("unstaged.patch"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        json["untracked"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty())
+    );
+    let ignored_archive = json["untracked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|entry| {
+            let value = entry.as_str()?;
+            let (path, archived) = value.split_once('\t')?;
+            (path == "ignored-local.txt").then(|| recovery_dir.join(archived))
+        })
+        .expect("ignored local file must be listed in recovery manifest");
+    assert_eq!(
+        std::fs::read_to_string(ignored_archive).unwrap(),
+        "ignored local config\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_retains_linked_worktree_when_pre_remove_hook_starts_bisect_marker() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TestRepo::new_with_remote();
+    repo.run_stax(&["bc", "linked-hook-operation"]);
+    let branch = repo.current_branch();
+    repo.create_file("feature.txt", "merged\n");
+    repo.commit("feature");
+    repo.git(&["push", "-u", "origin", &branch]);
+    repo.run_stax(&["t"]);
+    let parent = tempfile::tempdir().unwrap();
+    let linked = parent.path().join("linked");
+    assert!(
+        repo.git(&["worktree", "add", linked.to_str().unwrap(), &branch])
+            .status
+            .success()
+    );
+    repo.merge_branch_on_remote(&branch);
+    repo.git(&["pull", "origin", "main"]);
+
+    let hook = parent.path().join("pre-remove.sh");
+    let marker = std::path::PathBuf::from(
+        TestRepo::stdout(&repo.git(&[
+            "-C",
+            linked.to_str().unwrap(),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "BISECT_START",
+        ]))
+        .trim(),
+    );
+    std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&hook, permissions).unwrap();
+    std::fs::write(
+        repo.path().join("stax.toml"),
+        format!(
+            "[worktree.hooks]\npre_remove = {}\n",
+            serde_json::to_string(hook.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let sync = repo.run_stax(&["sync", "--force"]);
+    assert!(
+        sync.status.success(),
+        "sync failed: {}",
+        TestRepo::stderr(&sync)
+    );
+    assert!(marker.is_file(), "pre_remove hook must create the marker");
+    assert!(
+        linked.is_dir(),
+        "operation started by hook must retain the checkout"
+    );
+    assert!(
+        branch_exists(&repo, &branch),
+        "retained checkout branch must remain"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_pre_remove_permission_change_retains_worktree_and_unchanged_mode_allows_removal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (name, change_mode) in [("chmod-change", true), ("chmod-control", false)] {
+        let repo = TestRepo::new_with_remote();
+        repo.run_stax(&["bc", name]);
+        let branch = repo.current_branch();
+        repo.create_file("feature.txt", "merged\n");
+        repo.commit("feature");
+        repo.git(&["push", "-u", "origin", &branch]);
+        repo.run_stax(&["t"]);
+        let parent = tempfile::tempdir().unwrap();
+        let linked = parent.path().join("linked");
+        assert!(
+            repo.git(&["worktree", "add", linked.to_str().unwrap(), &branch])
+                .status
+                .success()
+        );
+        let script = linked.join("recoverable.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        repo.merge_branch_on_remote(&branch);
+        repo.git(&["pull", "origin", "main"]);
+
+        let hook = parent.path().join("pre-remove.sh");
+        let hook_body = if change_mode {
+            "#!/bin/sh\nchmod 755 recoverable.sh\n"
+        } else {
+            "#!/bin/sh\nexit 0\n"
+        };
+        std::fs::write(&hook, hook_body).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            repo.path().join("stax.toml"),
+            format!(
+                "[worktree.hooks]\npre_remove = {}\n",
+                serde_json::to_string(hook.to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let sync = repo.run_stax(&["sync", "--force"]);
+        assert!(sync.status.success(), "{name}: {}", TestRepo::stderr(&sync));
+        if change_mode {
+            assert!(linked.is_dir(), "permission-only edit must retain worktree");
+            assert!(
+                branch_exists(&repo, &branch),
+                "permission-only edit must retain branch"
+            );
+            assert_eq!(
+                std::fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        } else {
+            assert!(!linked.exists(), "unchanged mode should permit removal");
+            assert!(
+                !branch_exists(&repo, &branch),
+                "unchanged mode should permit branch removal"
+            );
+        }
+    }
+}
+
+#[test]
+fn sync_retains_linked_worktree_with_attached_no_checkout_bisect() {
+    let repo = TestRepo::new_with_remote();
+    repo.run_stax(&["bc", "linked-bisect-operation"]);
+    let branch = repo.current_branch();
+    repo.create_file("feature.txt", "merged\n");
+    repo.commit("feature");
+    repo.git(&["push", "-u", "origin", &branch]);
+    repo.run_stax(&["t"]);
+    let parent = tempfile::tempdir().unwrap();
+    let linked = parent.path().join("linked");
+    assert!(
+        repo.git(&["worktree", "add", linked.to_str().unwrap(), &branch])
+            .status
+            .success()
+    );
+    repo.merge_branch_on_remote(&branch);
+    repo.git(&["pull", "origin", "main"]);
+
+    let good_revision = format!("{branch}^");
+    let bisect = repo.git(&[
+        "-C",
+        linked.to_str().unwrap(),
+        "bisect",
+        "start",
+        "--no-checkout",
+        &branch,
+        &good_revision,
+    ]);
+    assert!(
+        bisect.status.success(),
+        "bisect start failed: {}",
+        TestRepo::stderr(&bisect)
+    );
+    assert!(
+        std::fs::read_dir(repo.path().join(".git/worktrees"))
+            .unwrap()
+            .any(|entry| {
+                let admin = entry.unwrap().path();
+                admin.join("BISECT_START").exists()
+            }),
+        "git bisect start must create worktree operation state"
+    );
+
+    let sync = repo.run_stax(&["sync", "--force"]);
+    assert!(
+        sync.status.success(),
+        "sync failed: {}",
+        TestRepo::stderr(&sync)
+    );
+    assert!(linked.is_dir(), "bisect-active checkout must be retained");
+    assert!(
+        branch_exists(&repo, &branch),
+        "bisect-active branch must remain"
+    );
+}
+
+#[test]
+fn sync_retains_upstream_gone_linked_pr_with_ancestor_tip_when_pr_state_is_unknown() {
+    let repo = TestRepo::new_with_remote();
+    repo.run_stax(&["bc", "gone-linked-pr"]);
+    let branch = repo.current_branch();
+    repo.create_file("linked-pr.txt", "integrated work\n");
+    repo.commit("linked PR work");
+    repo.git(&["push", "-u", "origin", &branch]);
+    let tip = repo.get_commit_sha(&branch);
+
+    let parent_revision = TestRepo::stdout(&repo.git(&["rev-parse", "main"]))
+        .trim()
+        .to_string();
+    let metadata = serde_json::json!({
+        "parentBranchName": "main",
+        "parentBranchRevision": parent_revision,
+        "prInfo": { "number": 991, "state": "OPEN", "isDraft": false }
+    })
+    .to_string();
+    let mut hash = std::process::Command::new("git")
+        .args(["hash-object", "-w", "--stdin"])
+        .current_dir(repo.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    hash.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(metadata.as_bytes())
+        .unwrap();
+    let hash = hash.wait_with_output().unwrap();
+    assert!(hash.status.success());
+    let metadata_oid = TestRepo::stdout(&hash).trim().to_string();
+    repo.git(&[
+        "update-ref",
+        &format!("refs/branch-metadata/{branch}"),
+        &metadata_oid,
+    ]);
+
+    repo.git(&["checkout", "main"]);
+    repo.git(&["merge", "--ff-only", &branch]);
+    repo.git(&["push", "origin", "main"]);
+    repo.git(&["push", "origin", "--delete", &branch]);
+
+    let sync = repo.run_stax(&["sync", "--no-delete", "--force", "--delete-upstream-gone"]);
+    assert!(
+        sync.status.success(),
+        "sync failed: {}",
+        TestRepo::stderr(&sync)
+    );
+    assert!(
+        repo.list_branches().contains(&branch),
+        "linked PR branch at {tip} must remain when remote disappears and fresh PR state is unavailable"
+    );
+    assert_eq!(repo.get_commit_sha(&branch), tip);
+}
+
+#[test]
+fn sync_does_not_retire_patch_equivalent_non_ancestor_branch() {
+    let repo = TestRepo::new_with_remote();
+    repo.run_stax(&["bc", "patch-equivalent"]);
+    let branch = repo.current_branch();
+    repo.create_file("patch-equivalent.txt", "same patch\n");
+    repo.commit("patch-equivalent change");
+    repo.git(&["push", "-u", "origin", &branch]);
+    let tip = repo.get_commit_sha(&branch);
+
+    repo.git(&["checkout", "main"]);
+    // A different message guarantees a different object even with identical
+    // Docker author/committer identities and second-resolution timestamps.
+    repo.git(&["cherry-pick", "--no-commit", &tip])
+        .assert_success();
+    repo.git(&[
+        "commit",
+        "-m",
+        "Independent integration of equivalent patch",
+    ])
+    .assert_success();
+    assert_ne!(repo.get_commit_sha("main"), tip);
+    assert_eq!(
+        repo.git(&["merge-base", "--is-ancestor", &tip, "main"])
+            .status
+            .code(),
+        Some(1)
+    );
+    let metadata_ref = format!("refs/branch-metadata/{branch}");
+    let metadata_before = TestRepo::stdout(&repo.git(&["show", &metadata_ref]));
+    repo.git(&["push", "origin", "main"]);
+    repo.git(&["push", "origin", "--delete", &branch]);
+
+    let sync = repo.run_stax(&["sync", "--force"]);
+    assert!(
+        sync.status.success(),
+        "sync failed: {}",
+        TestRepo::stderr(&sync)
+    );
+    assert!(
+        repo.list_branches().contains(&branch),
+        "patch equivalence without ancestry or merged-PR proof must remain informational"
+    );
+    assert_eq!(repo.get_commit_sha(&branch), tip);
+    assert_eq!(
+        TestRepo::stdout(&repo.git(&["show", &metadata_ref])),
+        metadata_before
+    );
+    assert!(!repo.path().join(".git/stax/recovery").exists());
+}
+
+#[test]
+fn sync_keeps_locked_and_operation_protected_worktrees_unchanged() {
+    for protection in ["locked", "rebase"] {
+        let repo = TestRepo::new_with_remote();
+        repo.run_stax(&["bc", &format!("protected-{protection}")]);
+        let branch = repo.current_branch();
+        repo.create_file("protected.txt", "merged content\n");
+        repo.commit("protected branch commit");
+        repo.git(&["push", "-u", "origin", &branch]);
+        repo.git(&["checkout", "main"]);
+        let parent = tempfile::tempdir().expect("linked worktree parent");
+        let linked = parent.path().join("protected");
+        let add = repo.git(&["worktree", "add", linked.to_str().unwrap(), &branch]);
+        assert!(
+            add.status.success(),
+            "worktree add failed: {}",
+            TestRepo::stderr(&add)
+        );
+        repo.git(&["merge", "--ff-only", &branch]);
+        repo.git(&["push", "origin", "main"]);
+
+        if protection == "locked" {
+            let lock = repo.git(&["worktree", "lock", linked.to_str().unwrap()]);
+            assert!(
+                lock.status.success(),
+                "worktree lock failed: {}",
+                TestRepo::stderr(&lock)
+            );
+        } else {
+            let state = std::process::Command::new("git")
+                .args(["rev-parse", "--git-path", "rebase-merge"])
+                .current_dir(&linked)
+                .output()
+                .unwrap();
+            assert!(state.status.success());
+            std::fs::create_dir_all(TestRepo::stdout(&state).trim()).unwrap();
+        }
+        let head_before = repo.git(&["-C", linked.to_str().unwrap(), "rev-parse", "HEAD"]);
+        let branch_before = repo.git(&["-C", linked.to_str().unwrap(), "branch", "--show-current"]);
+        let metadata_before = repo.git(&["show", &format!("refs/branch-metadata/{branch}")]);
+
+        let refs_before = TestRepo::stdout(&repo.git(&["show-ref"]));
+        let plan = repo.run_stax(&["sync", "--dry-run", "--json", "--force"]);
+        assert!(plan.status.success(), "{}", TestRepo::stderr(&plan));
+        let json: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
+        let candidate = json["merged_candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == branch)
+            .unwrap();
+        assert_eq!(
+            candidate["disposition"], "would_keep_worktree",
+            "{protection}: {json}"
+        );
+        assert_eq!(TestRepo::stdout(&repo.git(&["show-ref"])), refs_before);
+        assert!(!repo.path().join(".git/stax/recovery").exists());
+
+        let sync = repo.run_stax(&["sync", "--force"]);
+        assert!(
+            sync.status.success(),
+            "{protection} sync failed: {}",
+            TestRepo::stderr(&sync)
+        );
+        assert!(linked.exists(), "{protection} worktree must remain");
+        assert!(
+            repo.list_branches().contains(&branch),
+            "{protection} branch must remain"
+        );
+        assert_eq!(
+            TestRepo::stdout(&repo.git(&["-C", linked.to_str().unwrap(), "rev-parse", "HEAD"])),
+            TestRepo::stdout(&head_before)
+        );
+        assert_eq!(
+            TestRepo::stdout(&repo.git(&[
+                "-C",
+                linked.to_str().unwrap(),
+                "branch",
+                "--show-current"
+            ])),
+            TestRepo::stdout(&branch_before)
+        );
+        assert_eq!(
+            TestRepo::stdout(&repo.git(&["show", &format!("refs/branch-metadata/{branch}")])),
+            TestRepo::stdout(&metadata_before)
+        );
+    }
 }
 
 // ─── Test 2 ──────────────────────────────────────────────────────────────────
@@ -355,8 +910,15 @@ fn sync_undo_then_redo_replays_deletions_and_trunk() {
     let feature_sha = resolve_ref(&repo, &format!("refs/heads/{feature}"))
         .expect("feature branch should exist before sync");
 
-    // Checkout feature so trunk is updated via the non-checked-out path.
-    repo.run_stax(&["checkout", &feature]);
+    // Keep trunk un-checked-out, while leaving the merged deletion target
+    // unoccupied: sync now protects the caller's primary checkout as well.
+    // A separate unmerged caller preserves this test's non-checked-out trunk
+    // path and all branch deletion / undo / redo assertions.
+    repo.run_stax(&["bc", "undo-redo-caller"]);
+    repo.create_file("caller.txt", "ongoing caller work");
+    repo.commit("caller work must survive sync");
+    let caller = repo.current_branch();
+    let caller_head = repo.get_commit_sha("HEAD");
 
     let sync_out = repo.run_stax(&["sync", "--force"]);
     assert!(
@@ -364,6 +926,9 @@ fn sync_undo_then_redo_replays_deletions_and_trunk() {
         "sync failed: {}",
         TestRepo::stderr(&sync_out)
     );
+
+    assert_eq!(repo.current_branch(), caller);
+    assert_eq!(repo.get_commit_sha("HEAD"), caller_head);
 
     // Verify sync deleted feature and advanced trunk.
     assert!(

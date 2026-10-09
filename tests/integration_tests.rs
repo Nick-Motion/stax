@@ -2795,8 +2795,8 @@ fn test_refresh_no_submit_preserves_squash_merged_middle_branch() {
     );
 }
 
-#[test]
-fn test_refresh_delete_merged_removes_squash_merged_middle_branch() {
+#[tokio::test]
+async fn test_refresh_delete_merged_removes_squash_merged_middle_branch() {
     let repo = TestRepo::new_with_remote();
 
     repo.run_stax(&["bc", "refresh-squash-parent"]);
@@ -2841,7 +2841,15 @@ fn test_refresh_delete_merged_removes_squash_merged_middle_branch() {
 
     repo.run_stax(&["checkout", &child]);
 
-    let output = repo.run_stax(&["refresh", "--no-submit", "--force", "--delete-merged"]);
+    let (_merged_pr, proof_home) =
+        crate::common::github_mock::merged_pr_fixture(&repo.path(), &parent).await;
+    let output = repo.run_stax_with_env(
+        &["refresh", "--no-submit", "--force", "--delete-merged"],
+        &[
+            ("HOME", proof_home.path()),
+            ("STAX_GITHUB_TOKEN", Path::new("isolated-fixture-token")),
+        ],
+    );
     assert!(
         output.status.success(),
         "refresh --no-submit --delete-merged failed\nstdout: {}\nstderr: {}",
@@ -3778,22 +3786,20 @@ fn test_sync_force_preserves_worktree_for_merged_branch() {
         "sync failed: {}",
         TestRepo::stderr(&output)
     );
-    assert!(
-        worktree.exists(),
-        "sync --force should preserve the linked worktree"
-    );
+    let restored = crate::common::restore_sync_recovery(&repo.path(), &branch, &worktree);
+    let worktree = restored.path();
     assert_eq!(
         fs::read_to_string(worktree.join(".env")).expect("read preserved env file"),
         "TOKEN=local\n"
     );
     assert!(
         !repo.list_branches().contains(&branch),
-        "merged branch should be deleted after its worktree is preserved\nstdout:\n{}\nstderr:\n{}",
+        "merged branch should be deleted after its worktree is recovered and removed\nstdout:\n{}\nstderr:\n{}",
         TestRepo::stdout(&output),
         TestRepo::stderr(&output)
     );
 
-    let head = repo.git_in(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let head = repo.git_in(worktree, &["rev-parse", "--abbrev-ref", "HEAD"]);
     assert!(
         head.status.success(),
         "failed to inspect linked worktree HEAD"
@@ -3833,7 +3839,7 @@ fn test_sync_interactive_removes_linked_worktree() {
     let output = crate::common::run_stax_in_script(
         &repo.path(),
         &["sync"],
-        "wait_for_tui_text \"How should sync proceed?\"; printf '\\033[B\\n'; wait_for_tui_text \"What should stax do?\"; printf '\\033[B\\n'",
+        "wait_for_tui_text \"How should sync proceed?\"; printf '\\033[B\\n'; wait_for_tui_text \"What should stax do?\"; printf '\\n'",
     );
     assert!(
         output.status.success(),
@@ -3935,14 +3941,14 @@ fn test_sync_failed_explicit_removal_keeps_all_refs() {
     let config_dir = test_tempdir();
     fs::write(
         config_dir.path().join("config.toml"),
-        "[worktree.hooks]\npre_remove = \"exit 17\"\n",
+        "[worktree.hooks]\npre_remove = \"touch removal-hook-ran; exit 17\"\n",
     )
     .expect("write failing pre-remove hook config");
     let config_dir_value = config_dir.path().to_string_lossy().into_owned();
     let output = crate::common::run_stax_in_script_with_env(
         &repo.path(),
         &["sync"],
-        "wait_for_tui_text \"How should sync proceed?\"; printf '\\033[B\\n'; wait_for_tui_text \"What should stax do?\"; printf '\\033[B\\n'",
+        "wait_for_tui_text \"How should sync proceed?\"; printf '\\033[B\\n'; wait_for_tui_text \"What should stax do?\"; printf '\\n'",
         &[("STAX_CONFIG_DIR", config_dir_value.as_str())],
     );
     assert!(
@@ -3950,6 +3956,10 @@ fn test_sync_failed_explicit_removal_keeps_all_refs() {
         "interactive sync failed\nstdout:\n{}\nstderr:\n{}",
         TestRepo::stdout(&output),
         TestRepo::stderr(&output)
+    );
+    assert!(
+        worktree.join("removal-hook-ran").is_file(),
+        "pre-remove hook must actually run"
     );
     assert!(worktree.exists());
     assert!(repo.list_branches().contains(&branch));
@@ -4006,6 +4016,12 @@ fn test_sync_force_preserves_dirty_linked_worktree() {
         .status
         .success()
     );
+    fs::write(worktree.join("shared.txt"), "staged local change\n").unwrap();
+    assert!(
+        repo.git_in(&worktree, &["add", "shared.txt"])
+            .status
+            .success()
+    );
     fs::write(worktree.join("shared.txt"), "local tracked change\n").expect("write tracked change");
     fs::write(worktree.join("scratch.txt"), "local untracked file\n")
         .expect("write untracked file");
@@ -4018,7 +4034,8 @@ fn test_sync_force_preserves_dirty_linked_worktree() {
         TestRepo::stdout(&output),
         TestRepo::stderr(&output)
     );
-    assert!(worktree.exists());
+    let restored = crate::common::restore_sync_recovery(&repo.path(), &branch, &worktree);
+    let worktree = restored.path();
     assert_eq!(
         fs::read_to_string(worktree.join("shared.txt")).expect("read tracked change"),
         "local tracked change\n"
@@ -4031,8 +4048,12 @@ fn test_sync_force_preserves_dirty_linked_worktree() {
         fs::read_to_string(worktree.join(".env")).expect("read ignored env file"),
         "TOKEN=dirty-local\n"
     );
+    assert_eq!(
+        TestRepo::stdout(&repo.git_in(worktree, &["show", ":shared.txt"])),
+        "staged local change\n"
+    );
     assert!(!repo.list_branches().contains(&branch));
-    let head = repo.git_in(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let head = repo.git_in(worktree, &["rev-parse", "--abbrev-ref", "HEAD"]);
     assert_eq!(TestRepo::stdout(&head).trim(), "HEAD");
 }
 
@@ -4080,9 +4101,14 @@ fn test_sync_force_preserves_upstream_gone_linked_worktree() {
         fs::read_to_string(worktree.join("local-note.txt")).expect("read local note"),
         "keep me\n"
     );
-    assert!(!repo.list_branches().contains(&branch));
+    assert!(repo.list_branches().contains(&branch));
+    assert!(
+        repo.git(&["show", &format!("refs/branch-metadata/{branch}")])
+            .status
+            .success()
+    );
     let head = repo.git_in(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]);
-    assert_eq!(TestRepo::stdout(&head).trim(), "HEAD");
+    assert_eq!(TestRepo::stdout(&head).trim(), branch);
 }
 
 #[test]
@@ -4150,22 +4176,22 @@ fn test_sync_preservation_failure_keeps_all_refs() {
         repo.git(&["show-ref", "--verify", &metadata_ref])
             .status
             .success(),
-        "failed preservation must keep branch metadata"
+        "operation protection must keep branch metadata"
     );
     assert!(
         worktree.join(".git").exists(),
-        "failed preservation must keep the worktree"
+        "operation protection must keep the worktree"
+    );
+    assert!(TestRepo::stdout(&output).contains("OperationInProgress"));
+    assert!(
+        repo.git_in(&worktree, &["rev-parse", "--verify", "MERGE_HEAD"])
+            .status
+            .success()
     );
     assert!(
-        TestRepo::stdout(&output).contains("couldn't preserve linked worktree"),
-        "expected preservation failure guidance\nstdout:\n{}",
-        TestRepo::stdout(&output)
-    );
-    assert!(
-        TestRepo::stdout(&output).contains("git switch main failed")
-            && TestRepo::stdout(&output).contains("git switch --detach failed"),
-        "guidance should report both failed preservation attempts\nstdout:\n{}",
-        TestRepo::stdout(&output)
+        !TestRepo::stdout(&repo.git_in(&worktree, &["diff", "--name-only", "--diff-filter=U"]))
+            .trim()
+            .is_empty()
     );
 }
 
@@ -6114,8 +6140,8 @@ fn test_sync_preserves_empty_never_pushed_branch() {
     );
 }
 
-#[test]
-fn test_sync_deletes_empty_branch_with_pr_metadata() {
+#[tokio::test]
+async fn test_sync_deletes_empty_branch_with_pr_metadata() {
     let repo = TestRepo::new_with_remote();
 
     let create = repo.run_stax(&["bc", "empty-with-pr"]);
@@ -6128,7 +6154,28 @@ fn test_sync_deletes_empty_branch_with_pr_metadata() {
     write_branch_pr_metadata(&repo, &branch_name, "main", 4242);
 
     repo.run_stax(&["t"]);
-    let output = repo.run_stax(&["sync", "--force"]);
+    let before = repo.get_commit_sha(&branch_name);
+    let metadata_ref = format!("refs/branch-metadata/{branch_name}");
+    let metadata_before = TestRepo::stdout(&repo.git(&["show", &metadata_ref]));
+    // Cached linkage is not proof, even when this empty branch equals trunk.
+    let unknown = repo.run_stax(&["sync", "--force"]);
+    assert!(unknown.status.success());
+    assert!(repo.list_branches().contains(&branch_name));
+    assert_eq!(repo.get_commit_sha(&branch_name), before);
+    assert_eq!(
+        TestRepo::stdout(&repo.git(&["show", &metadata_ref])),
+        metadata_before
+    );
+
+    let (_merged_pr, proof_home) =
+        crate::common::github_mock::merged_pr_fixture(&repo.path(), &branch_name).await;
+    let output = repo.run_stax_with_env(
+        &["sync", "--force"],
+        &[
+            ("HOME", proof_home.path()),
+            ("STAX_GITHUB_TOKEN", Path::new("isolated-fixture-token")),
+        ],
+    );
     assert!(
         output.status.success(),
         "Sync failed: {}",
@@ -6304,9 +6351,12 @@ fn test_sync_on_merged_branch_with_missing_parent_falls_back_to_trunk() {
     // Mark child branch as merged on remote.
     repo.merge_branch_on_remote(&child_branch);
 
-    // Stay on child branch so sync has to checkout a parent before deleting it.
+    // Even a missing parent cannot authorize departure from the primary checkout.
     assert_eq!(repo.current_branch(), child_branch);
 
+    let protected_head = repo.get_commit_sha(&child_branch);
+    let protected_metadata =
+        TestRepo::stdout(&repo.git(&["show", &format!("refs/branch-metadata/{child_branch}")]));
     let output = repo.run_stax(&["sync", "--force"]);
     assert!(
         output.status.success(),
@@ -6314,15 +6364,13 @@ fn test_sync_on_merged_branch_with_missing_parent_falls_back_to_trunk() {
         TestRepo::stderr(&output)
     );
 
-    // Sync should fall back to trunk and still delete the merged child branch.
+    assert_eq!(repo.current_branch(), child_branch);
+    assert!(repo.list_branches().contains(&child_branch));
+    assert!(TestRepo::stdout(&output).contains("PrimaryCheckout"));
+    assert_eq!(repo.get_commit_sha(&child_branch), protected_head);
     assert_eq!(
-        repo.current_branch(),
-        "main",
-        "Expected sync to fallback to trunk when parent branch is missing"
-    );
-    assert!(
-        !repo.list_branches().iter().any(|b| b == &child_branch),
-        "Expected merged child branch to be deleted"
+        TestRepo::stdout(&repo.git(&["show", &format!("refs/branch-metadata/{child_branch}")])),
+        protected_metadata
     );
 }
 
@@ -6432,9 +6480,7 @@ fn test_sync_preserves_branch_with_remote() {
 
 #[test]
 fn test_sync_updates_trunk_after_branch_deletion_checkout() {
-    // This test verifies the fix for the issue where trunk update would fail
-    // when on a merged branch because the trunk update happened BEFORE branch
-    // deletion, but we end up on trunk AFTER deletion.
+    // Trunk must update while the merged primary checkout remains protected.
     let repo = TestRepo::new_with_remote();
 
     // Create a feature branch
@@ -6459,10 +6505,10 @@ fn test_sync_updates_trunk_after_branch_deletion_checkout() {
     // Verify we're still on the feature branch locally
     assert!(repo.current_branch().contains("feature-trunk-update-order"));
 
-    // Sync should:
-    // 1. Detect the branch as merged (commits are in main)
-    // 2. Delete it and checkout main
-    // 3. THEN update main successfully (using git pull since we're now on it)
+    // Update trunk without leaving or retiring the primary checkout.
+    let protected_head = repo.get_commit_sha(&branch_name);
+    let protected_metadata =
+        TestRepo::stdout(&repo.git(&["show", &format!("refs/branch-metadata/{branch_name}")]));
     let output = repo.run_stax(&["sync", "--force"]);
     assert!(
         output.status.success(),
@@ -6472,11 +6518,10 @@ fn test_sync_updates_trunk_after_branch_deletion_checkout() {
 
     let stdout = TestRepo::stdout(&output);
 
-    // Should NOT show "failed (may need manual update)" for trunk update
-    // because trunk update now happens AFTER we checkout to main
+    // Updating the non-current trunk should still succeed.
     assert!(
         !stdout.contains("failed (may need manual update)"),
-        "Trunk update should not fail when we end up on trunk after branch deletion. Got:\n{}",
+        "Trunk update should not fail while retaining the primary checkout. Got:\n{}",
         stdout
     );
 
@@ -6487,29 +6532,36 @@ fn test_sync_updates_trunk_after_branch_deletion_checkout() {
         stdout
     );
     assert!(
-        stdout.contains("cleaned 1 merged"),
-        "Expected merged cleanup count in sync footer. Got:\n{}",
+        stdout.contains("PrimaryCheckout"),
+        "Expected explicit primary-checkout retention reason. Got:\n{}",
         stdout
     );
 
-    // Should be on main after sync
+    // The caller stays on its protected branch.
     assert_eq!(
         repo.current_branch(),
-        "main",
-        "Should be on main after sync deletes the feature branch"
+        branch_name,
+        "Should retain the primary checkout after sync"
     );
 
-    // Main should have the remote update (trunk was pulled correctly)
+    // Inspect trunk directly: its tree advanced without changing caller HEAD.
     assert!(
-        repo.path().join("remote-main-update.txt").exists(),
+        repo.git(&["cat-file", "-e", "main:remote-main-update.txt"])
+            .status
+            .success(),
         "Expected main to have the remote update after sync"
+    );
+    assert!(TestRepo::stdout(&output).contains("PrimaryCheckout"));
+    assert_eq!(repo.get_commit_sha(&branch_name), protected_head);
+    assert_eq!(
+        TestRepo::stdout(&repo.git(&["show", &format!("refs/branch-metadata/{branch_name}")])),
+        protected_metadata
     );
 }
 
 #[test]
 fn test_sync_trunk_update_order_with_diverged_main() {
-    // Test that trunk update works correctly even when local main had been
-    // behind remote. The reordering ensures we use `git pull` when on trunk.
+    // Trunk updates even when behind remote and the merged caller is protected.
     let repo = TestRepo::new_with_remote();
 
     // Create feature branch and push
@@ -6529,7 +6581,10 @@ fn test_sync_trunk_update_order_with_diverged_main() {
     // Stay on feature branch locally
     assert!(repo.current_branch().contains("feature-diverged-main"));
 
-    // Run sync - should detect branch as merged, delete it, checkout main, then update main
+    // Run sync: retain the primary checkout and update the trunk ref.
+    let protected_head = repo.get_commit_sha(&branch_name);
+    let protected_metadata =
+        TestRepo::stdout(&repo.git(&["show", &format!("refs/branch-metadata/{branch_name}")]));
     let output = repo.run_stax(&["sync", "--force"]);
     assert!(
         output.status.success(),
@@ -6546,10 +6601,24 @@ fn test_sync_trunk_update_order_with_diverged_main() {
         stdout
     );
 
-    // Should be on main with all remote updates
-    assert_eq!(repo.current_branch(), "main");
-    assert!(repo.path().join("update1.txt").exists());
-    assert!(repo.path().join("update2.txt").exists());
+    // Stay on the feature; inspect the updated trunk tree without checking it out.
+    assert_eq!(repo.current_branch(), branch_name);
+    assert!(
+        repo.git(&["cat-file", "-e", "main:update1.txt"])
+            .status
+            .success()
+    );
+    assert!(
+        repo.git(&["cat-file", "-e", "main:update2.txt"])
+            .status
+            .success()
+    );
+    assert!(TestRepo::stdout(&output).contains("PrimaryCheckout"));
+    assert_eq!(repo.get_commit_sha(&branch_name), protected_head);
+    assert_eq!(
+        TestRepo::stdout(&repo.git(&["show", &format!("refs/branch-metadata/{branch_name}")])),
+        protected_metadata
+    );
 }
 
 #[test]
@@ -6617,6 +6686,9 @@ fn test_sync_detects_merged_branch_when_local_trunk_diverged() {
             .contains("feature-merged-diverged-trunk")
     );
 
+    let protected_head = repo.get_commit_sha(&branch_name);
+    let protected_metadata =
+        TestRepo::stdout(&repo.git(&["show", &format!("refs/branch-metadata/{branch_name}")]));
     let output = repo.run_stax(&["sync", "--force"]);
     assert!(
         output.status.success(),
@@ -6639,27 +6711,24 @@ fn test_sync_detects_merged_branch_when_local_trunk_diverged() {
         "Switching branches cannot repair a diverged trunk. Got: {}",
         stdout
     );
+    assert!(stdout.contains("PrimaryCheckout"));
+    assert!(repo.list_branches().contains(&branch_name));
+    assert_eq!(repo.current_branch(), branch_name);
     assert!(
-        stdout.contains(&format!(
-            "Checked out main after cleanup (was {})",
-            branch_name
-        )),
-        "Expected checkout-change summary, got: {}",
-        stdout
+        repo.git(&["cat-file", "-e", "main:local-main-only.txt"])
+            .status
+            .success()
     );
-
-    // Branch should be deleted as merged even though local main diverged
-    let branches = repo.list_branches();
-    assert!(
-        !branches
-            .iter()
-            .any(|b| b.contains("feature-merged-diverged-trunk")),
-        "Expected merged branch to be deleted even with diverged local trunk"
+    assert!(TestRepo::stdout(&output).contains("PrimaryCheckout"));
+    assert_eq!(repo.get_commit_sha(&branch_name), protected_head);
+    assert_eq!(
+        TestRepo::stdout(&repo.git(&["show", &format!("refs/branch-metadata/{branch_name}")])),
+        protected_metadata
     );
 }
 
-#[test]
-fn test_sync_restack_handles_squash_merged_middle_branch() {
+#[tokio::test]
+async fn test_sync_restack_handles_squash_merged_middle_branch() {
     let repo = TestRepo::new_with_remote();
 
     // Build stack: main -> parent -> child
@@ -6706,7 +6775,15 @@ fn test_sync_restack_handles_squash_merged_middle_branch() {
 
     repo.run_stax(&["checkout", &child]);
 
-    let output = repo.run_stax(&["sync", "--restack", "--force"]);
+    let (_merged_pr, proof_home) =
+        crate::common::github_mock::merged_pr_fixture(&repo.path(), &parent).await;
+    let output = repo.run_stax_with_env(
+        &["sync", "--restack", "--force"],
+        &[
+            ("HOME", proof_home.path()),
+            ("STAX_GITHUB_TOKEN", Path::new("isolated-fixture-token")),
+        ],
+    );
     assert!(
         output.status.success(),
         "sync --restack failed\nstdout: {}\nstderr: {}",
@@ -6738,8 +6815,8 @@ fn test_sync_restack_handles_squash_merged_middle_branch() {
     );
 }
 
-#[test]
-fn test_sync_restack_handles_squash_merged_parent_after_trunk_advances() {
+#[tokio::test]
+async fn test_sync_restack_handles_squash_merged_parent_after_trunk_advances() {
     let repo = TestRepo::new_with_remote();
 
     // Build stack: main -> parent -> child
@@ -6788,7 +6865,15 @@ fn test_sync_restack_handles_squash_merged_parent_after_trunk_advances() {
 
     repo.run_stax(&["checkout", &child]);
 
-    let output = repo.run_stax(&["sync", "--restack", "--force"]);
+    let (_merged_pr, proof_home) =
+        crate::common::github_mock::merged_pr_fixture(&repo.path(), &parent).await;
+    let output = repo.run_stax_with_env(
+        &["sync", "--restack", "--force"],
+        &[
+            ("HOME", proof_home.path()),
+            ("STAX_GITHUB_TOKEN", Path::new("isolated-fixture-token")),
+        ],
+    );
     assert!(
         output.status.success(),
         "sync --restack failed after trunk advanced\nstdout: {}\nstderr: {}",
@@ -6838,8 +6923,8 @@ fn test_sync_restack_handles_squash_merged_parent_after_trunk_advances() {
 /// stack, not just the first stale branch.  With a 3-level stack
 /// `main <- A <- B <- C`, squash-merging A and running sync --restack should
 /// restack both B (onto main) and C (onto the updated B).
-#[test]
-fn test_sync_restack_restacks_full_chain_after_squash_merge() {
+#[tokio::test]
+async fn test_sync_restack_restacks_full_chain_after_squash_merge() {
     let repo = TestRepo::new_with_remote();
 
     // Build 3-level stack: main -> branch_a -> branch_b -> branch_c
@@ -6891,7 +6976,15 @@ fn test_sync_restack_restacks_full_chain_after_squash_merge() {
     // Check out branch_c (top of the stack) and run sync --restack
     repo.run_stax(&["checkout", &branch_c]);
 
-    let output = repo.run_stax(&["sync", "--restack", "--force"]);
+    let (_merged_pr, proof_home) =
+        crate::common::github_mock::merged_pr_fixture(&repo.path(), &branch_a).await;
+    let output = repo.run_stax_with_env(
+        &["sync", "--restack", "--force"],
+        &[
+            ("HOME", proof_home.path()),
+            ("STAX_GITHUB_TOKEN", Path::new("isolated-fixture-token")),
+        ],
+    );
     assert!(
         output.status.success(),
         "sync --restack failed\nstdout: {}\nstderr: {}",
@@ -6951,8 +7044,8 @@ fn test_sync_restack_restacks_full_chain_after_squash_merge() {
 ///   3. First `sync --restack`: rebases A onto main (A absorbed into main)
 ///   4. Second `sync --restack`: detects A as merged, deletes it, reparents B → main
 ///   5. B must have only its OWN commit relative to main (no ghost commits from A)
-#[test]
-fn test_sync_restack_no_ghost_commits_after_two_step_squash_merge() {
+#[tokio::test]
+async fn test_sync_restack_no_ghost_commits_after_two_step_squash_merge() {
     let repo = TestRepo::new_with_remote();
 
     // Build stack: main -> branch_a (3 commits) -> branch_b (1 commit)
@@ -7002,7 +7095,15 @@ fn test_sync_restack_no_ghost_commits_after_two_step_squash_merge() {
     // First sync --restack: A may get rebased onto main (absorbed), or detected
     // as merged.  Either way this is the first step of the two-step scenario.
     repo.run_stax(&["checkout", &branch_b]);
-    let output1 = repo.run_stax(&["sync", "--restack", "--force"]);
+    let (_merged_pr, proof_home) =
+        crate::common::github_mock::merged_pr_fixture(&repo.path(), &branch_a).await;
+    let output1 = repo.run_stax_with_env(
+        &["sync", "--restack", "--force"],
+        &[
+            ("HOME", proof_home.path()),
+            ("STAX_GITHUB_TOKEN", Path::new("isolated-fixture-token")),
+        ],
+    );
     assert!(
         output1.status.success(),
         "First sync --restack failed\nstdout: {}\nstderr: {}",
@@ -7011,7 +7112,13 @@ fn test_sync_restack_no_ghost_commits_after_two_step_squash_merge() {
     );
 
     // Second sync --restack: picks up any remaining reparent/delete/restack
-    let output2 = repo.run_stax(&["sync", "--restack", "--force"]);
+    let output2 = repo.run_stax_with_env(
+        &["sync", "--restack", "--force"],
+        &[
+            ("HOME", proof_home.path()),
+            ("STAX_GITHUB_TOKEN", Path::new("isolated-fixture-token")),
+        ],
+    );
     assert!(
         output2.status.success(),
         "Second sync --restack failed\nstdout: {}\nstderr: {}",
@@ -7044,8 +7151,8 @@ fn test_sync_restack_no_ghost_commits_after_two_step_squash_merge() {
 /// error instead of silently claiming success and stamping the trunk tip as
 /// the child's `parentBranchRevision` — a boundary the child was never
 /// actually rebased onto.
-#[test]
-fn test_sync_child_boundary_stays_in_ancestry_when_squash_parent_rebase_conflicts() {
+#[tokio::test]
+async fn test_sync_child_boundary_stays_in_ancestry_when_squash_parent_rebase_conflicts() {
     let repo = TestRepo::new_with_remote();
 
     // Build stack: main -> A -> B
@@ -7116,7 +7223,15 @@ fn test_sync_child_boundary_stays_in_ancestry_when_squash_parent_rebase_conflict
     run_remote_git(&["push", "origin", "--delete", &branch_a]);
 
     repo.run_stax(&["checkout", &branch_b]);
-    let output = repo.run_stax(&["sync", "--force"]);
+    let (_merged_pr, proof_home) =
+        crate::common::github_mock::merged_pr_fixture(&repo.path(), &branch_a).await;
+    let output = repo.run_stax_with_env(
+        &["sync", "--force"],
+        &[
+            ("HOME", proof_home.path()),
+            ("STAX_GITHUB_TOKEN", Path::new("isolated-fixture-token")),
+        ],
+    );
 
     assert!(
         !output.status.success(),
@@ -7176,8 +7291,8 @@ fn test_sync_child_boundary_stays_in_ancestry_when_squash_parent_rebase_conflict
 /// Companion test to the #830 regression above: on the clean (non-conflicting)
 /// path, the child's new boundary must match the new base it actually landed
 /// on (the trunk tip), and subsequent restacks must not re-replay commits.
-#[test]
-fn test_sync_squash_merged_child_boundary_matches_new_base() {
+#[tokio::test]
+async fn test_sync_squash_merged_child_boundary_matches_new_base() {
     let repo = TestRepo::new_with_remote();
 
     // Build stack: main -> A -> B
@@ -7224,7 +7339,15 @@ fn test_sync_squash_merged_child_boundary_matches_new_base() {
     run_remote_git(&["push", "origin", "--delete", &branch_a]);
 
     repo.run_stax(&["checkout", &branch_b]);
-    let output = repo.run_stax(&["sync", "--force"]);
+    let (_merged_pr, proof_home) =
+        crate::common::github_mock::merged_pr_fixture(&repo.path(), &branch_a).await;
+    let output = repo.run_stax_with_env(
+        &["sync", "--force"],
+        &[
+            ("HOME", proof_home.path()),
+            ("STAX_GITHUB_TOKEN", Path::new("isolated-fixture-token")),
+        ],
+    );
     assert!(
         output.status.success(),
         "sync --force failed on clean squash-merge path\nstdout: {}\nstderr: {}",
@@ -7277,7 +7400,13 @@ fn test_sync_squash_merged_child_boundary_matches_new_base() {
     run_remote_git(&["commit", "-m", "Yet another trunk commit"]);
     run_remote_git(&["push", "origin", "main"]);
 
-    let output2 = repo.run_stax(&["sync", "--restack", "--force"]);
+    let output2 = repo.run_stax_with_env(
+        &["sync", "--restack", "--force"],
+        &[
+            ("HOME", proof_home.path()),
+            ("STAX_GITHUB_TOKEN", Path::new("isolated-fixture-token")),
+        ],
+    );
     assert!(
         output2.status.success(),
         "sync --restack failed on follow-up trunk advance\nstdout: {}\nstderr: {}",
@@ -17431,7 +17560,26 @@ exit 1
         squash_merge_branch_on_fake_remote_keep_branch(&remote_root, &branch);
         let _ = remote_root.keep();
 
-        let mut merged_pr = github_pull_fixture(501, &branch, "main", "aaaa");
+        // Retirement is allowed for linked worktrees; the caller's primary
+        // checkout is intentionally protected. Move this fixture's target to
+        // a linked worktree so the test continues to exercise actual cleanup.
+        repo.git(&["checkout", "main"]);
+        let linked_root = super::test_tempdir();
+        let linked = linked_root.path().join("merged-feature");
+        let add = repo.git(&[
+            "worktree",
+            "add",
+            linked.to_str().expect("utf8 linked worktree path"),
+            &branch,
+        ]);
+        assert!(
+            add.status.success(),
+            "Failed to prepare linked merged worktree: {}",
+            TestRepo::stderr(&add)
+        );
+
+        let merged_head = repo.get_commit_sha(&branch);
+        let mut merged_pr = github_pull_fixture(501, &branch, "main", &merged_head);
         merged_pr["state"] = serde_json::json!("closed");
         merged_pr["merged_at"] = serde_json::json!("2026-05-20T10:00:00Z");
 
@@ -17464,6 +17612,10 @@ exit 1
         assert!(
             !repo.list_branches().contains(&branch),
             "Expected squash-merged branch to be deleted on first sync"
+        );
+        assert!(
+            !linked.exists(),
+            "Expected squash-merged linked worktree to be removed on first sync"
         );
     }
 

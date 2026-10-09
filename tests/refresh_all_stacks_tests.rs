@@ -114,8 +114,8 @@ fn all_stacks_rejects_dirty_tree_without_auto_stash_pop() {
     output.assert_stderr_contains("--auto-stash-pop");
 }
 
-#[test]
-fn all_stacks_delete_merged_removes_squash_merged_branch_and_preserves_other_stack() {
+#[tokio::test]
+async fn all_stacks_delete_merged_removes_squash_merged_branch_and_preserves_other_stack() {
     let repo = TestRepo::new_with_remote();
     let (stack_a, stack_b) = build_two_stacks(&repo);
     let parent = &stack_a[0];
@@ -128,14 +128,22 @@ fn all_stacks_delete_merged_removes_squash_merged_branch_and_preserves_other_sta
     repo.squash_merge_branch_on_remote(parent);
     repo.git(&["checkout", child]).assert_success();
 
-    repo.run_stax(&[
-        "refresh",
-        "--all-stacks",
-        "--no-submit",
-        "--force",
-        "--yes",
-        "--delete-merged",
-    ])
+    let (_merged_pr, proof_home) =
+        crate::common::github_mock::merged_pr_fixture(&repo.path(), parent).await;
+    repo.run_stax_with_env(
+        &[
+            "refresh",
+            "--all-stacks",
+            "--no-submit",
+            "--force",
+            "--yes",
+            "--delete-merged",
+        ],
+        &[
+            ("HOME", proof_home.path().to_str().unwrap()),
+            ("STAX_GITHUB_TOKEN", "isolated-fixture-token"),
+        ],
+    )
     .assert_success();
 
     let branches = repo.list_branches();

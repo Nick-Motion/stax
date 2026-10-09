@@ -61,6 +61,7 @@ pub mod sweep;
 pub mod sync;
 pub(crate) mod sync_json;
 pub mod sync_plan;
+pub(crate) mod sync_retirement;
 pub mod tmux;
 pub mod undo;
 pub mod upstack;

@@ -690,6 +690,7 @@ fn pr_to_info_with_head(pr: GiteaPull) -> PrInfoWithHead {
     PrInfoWithHead {
         info: pr_to_info(&pr),
         head: pr.head.ref_name.clone(),
+        head_sha: pr.head.sha.clone().unwrap_or_default(),
         head_label: pr.head.label.clone(),
         title: pr.title.clone(),
     }

@@ -123,6 +123,57 @@ fn cached_rev_list_count(
     Ok(count)
 }
 
+/// Fill the count cache with `merge_base..trunk` for many merge bases at once.
+/// A walk per merge base took about 20 ms on a monorepo, where most branches
+/// fork far down trunk. One walk from trunk down to a common ancestor of all
+/// the merge bases lists every commit that those counts include. Any failure
+/// leaves the counts to `cached_rev_list_count`.
+fn prefetch_trunk_counts(
+    cache: &mut SyncHistoryCache,
+    repo: &GitRepo,
+    workdir: &Path,
+    trunk: &str,
+    merge_bases: &[&str],
+) {
+    let mut keys: Vec<(String, String)> = merge_bases
+        .iter()
+        .map(|merge_base| range_key(repo, merge_base, trunk))
+        .filter(|key| !cache.counts.contains_key(key))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    if keys.len() < 2 {
+        return;
+    }
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(workdir)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    let mut octopus = vec!["merge-base", "--octopus"];
+    octopus.extend(keys.iter().map(|(base, _)| base.as_str()));
+    let Some(bound) = git(&octopus) else {
+        return;
+    };
+    let bound = bound.trim();
+    let Some(walk) = git(&["rev-list", "--parents", &keys[0].1, "--not", bound]) else {
+        return;
+    };
+    let parents = parent_graph(&walk);
+    for key in keys {
+        // Every merge base descends from the bound. So a merge base that is
+        // neither the bound nor in the graph is not an ancestor of trunk.
+        if key.0 == bound || parents.contains_key(key.0.as_str()) {
+            let count = parents.len() - reachable(&parents, &key.0).len();
+            cache.counts.insert(key, count);
+        }
+    }
+}
+
 /// The patch-id part of `GitRepo::is_branch_merged_equivalent_to_trunk`, through
 /// the sync-wide history cache. Callers have already tried the cheap ancestry
 /// and tree checks.
@@ -4103,6 +4154,8 @@ fn find_merged_branches_with_prs_after_enumeration(
         }
     }
 
+    let merge_bases: Vec<&str> = need_patch_id.iter().map(|(_, mb)| mb.as_str()).collect();
+    prefetch_trunk_counts(history_cache, repo, workdir, trunk, &merge_bases);
     for (branch, merge_base) in need_patch_id {
         if cached_patch_equivalent(history_cache, repo, workdir, &merge_base, trunk, &branch)
             .unwrap_or(false)
@@ -4281,13 +4334,7 @@ fn count_extra_commits(
         return Ok(zeros);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let parents: HashMap<&str, Vec<&str>> = stdout
-        .lines()
-        .filter_map(|line| {
-            let mut commits = line.split(' ');
-            Some((commits.next()?, commits.collect()))
-        })
-        .collect();
+    let parents = parent_graph(&stdout);
     Ok(tips
         .iter()
         .map(|tip| {
@@ -4301,6 +4348,17 @@ fn count_extra_commits(
             reachable(&parents, tip).difference(&on_remote).count()
         })
         .collect())
+}
+
+/// Each commit that `git rev-list --parents` listed, with its parents.
+fn parent_graph(rev_list: &str) -> HashMap<&str, Vec<&str>> {
+    rev_list
+        .lines()
+        .filter_map(|line| {
+            let mut commits = line.split(' ');
+            Some((commits.next()?, commits.collect()))
+        })
+        .collect()
 }
 
 /// The commits of `parents` that `tip` reaches without leaving the graph.
@@ -5907,6 +5965,58 @@ mod tests {
             count_extra_commits(&repo, path, "main", "origin", &remote_branches, &branches)
                 .unwrap();
         assert_eq!(counts, [2, 1, 0, 0, 4]);
+    }
+
+    #[test]
+    fn prefetched_trunk_counts_match_rev_list_across_a_merged_side_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let commit = |file: &str| {
+            std::fs::write(path.join(file), format!("{file}\n")).unwrap();
+            run(&["add", file]);
+            run(&["commit", "-m", file]);
+            run(&["rev-parse", "HEAD"])
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        let base = commit("base.txt");
+        commit("m1.txt");
+        run(&["switch", "-c", "unmerged"]);
+        let unmerged = commit("o1.txt");
+        run(&["switch", "-c", "side", "main"]);
+        let side = commit("s1.txt");
+        commit("s2.txt");
+        run(&["switch", "main"]);
+        let before_merge = commit("m2.txt");
+        run(&["merge", "--no-ff", "-m", "merge side", "side"]);
+        let tip = commit("m3.txt");
+
+        let repo = GitRepo::open_from_path(path).unwrap();
+        let mut cache = SyncHistoryCache::default();
+        let merge_bases = [&base, &side, &before_merge, &tip, &unmerged].map(String::as_str);
+        prefetch_trunk_counts(&mut cache, &repo, path, "main", &merge_bases);
+        let counts = merge_bases.map(|merge_base| {
+            cache
+                .counts
+                .get(&range_key(&repo, merge_base, "main"))
+                .copied()
+        });
+        assert_eq!(counts, [Some(6), Some(4), Some(4), Some(0), None]);
     }
 
     fn linked_worktree_cleanup(blockers: &[&'static str]) -> BlockingWorktreeCleanup {

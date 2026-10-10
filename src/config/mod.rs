@@ -670,18 +670,19 @@ impl Config {
     /// `STAX_CONFIG_DIR` intentionally keeps its existing test-isolation
     /// behavior and disables repository overlays.
     pub(crate) fn load_for_repo(root: &Path) -> Result<Self> {
-        let path = Self::path()?;
-        let config = Self::load_path_or_default(&path)?;
-        if config_dir_override().is_some() {
-            return Ok(config);
+        let config = Self::load_global()?;
+        match Self::repo_overlay_path(root) {
+            Some(repo_path) => Self::load_with_overlay(config, &repo_path),
+            None => Ok(config),
         }
+    }
 
-        let repo_path = root.join("stax.toml");
-        if repo_path.exists() {
-            Self::load_with_overlay(config, &repo_path)
-        } else {
-            Ok(config)
+    /// The repository's `stax.toml`, unless missing or `STAX_CONFIG_DIR` disables overlays.
+    fn repo_overlay_path(root: &Path) -> Option<PathBuf> {
+        if config_dir_override().is_some() {
+            return None;
         }
+        Some(root.join("stax.toml")).filter(|path| path.exists())
     }
 
     /// Load config for noninteractive credential-bearing repository network access.
@@ -690,12 +691,10 @@ impl Config {
     /// network destinations, provider selection, and auth settings are loaded
     /// only from the trusted global config.
     pub(crate) fn load_for_trusted_network(root: &Path) -> Result<Self> {
-        let path = Self::path()?;
-        let mut config = Self::load_path_or_default(&path)?;
-        let repo_path = root.join("stax.toml");
-        if !repo_path.exists() {
+        let mut config = Self::load_global()?;
+        let Some(repo_path) = Self::repo_overlay_path(root) else {
             return Ok(config);
-        }
+        };
 
         let repo_content = fs::read_to_string(&repo_path)
             .with_context(|| format!("Failed to read repo config {}", repo_path.display()))?;
@@ -719,12 +718,10 @@ impl Config {
     /// cannot redirect trusted network endpoints.
     #[allow(dead_code)]
     pub(crate) fn load_repository_submit_preferences(root: &Path) -> Result<Self> {
-        let path = Self::path()?;
-        let mut config = Self::load_path_or_default(&path)?;
-        let repo_path = root.join("stax.toml");
-        if !repo_path.exists() {
+        let mut config = Self::load_global()?;
+        let Some(repo_path) = Self::repo_overlay_path(root) else {
             return Ok(config);
-        }
+        };
 
         let repo_content = fs::read_to_string(&repo_path)
             .with_context(|| format!("Failed to read repo config {}", repo_path.display()))?;

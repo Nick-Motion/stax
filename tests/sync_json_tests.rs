@@ -311,6 +311,9 @@ fn dry_run_json_includes_merged_candidate_with_disposition() {
     repo.run_stax(&["t"]);
     repo.merge_branch_on_remote(&feature);
     repo.git(&["pull", "origin", "main"]);
+    repo.run_stax(&["bc", "feature-dry-open"]);
+    repo.create_file("feature-dry-open.txt", "content");
+    repo.commit("Unmerged commit for dry-run JSON plan test");
 
     // feature is still a local branch but its remote has been merged into trunk.
     let out = repo.run_stax(&["sync", "--dry-run", "--json"]);
@@ -327,13 +330,18 @@ fn dry_run_json_includes_merged_candidate_with_disposition() {
     assert_eq!(parsed["kind"], "sync_plan");
     assert_eq!(parsed["dry_run"], true);
 
-    // merged_candidates must be non-empty and contain the feature branch.
+    // merged_candidates must hold the feature branch and not the unmerged one.
     let candidates = parsed["merged_candidates"]
         .as_array()
         .unwrap_or_else(|| panic!("merged_candidates missing or not an array; got:\n{parsed}"));
-    assert!(
-        !candidates.is_empty(),
-        "merged_candidates should be non-empty; got:\n{parsed}"
+    let names: Vec<&str> = candidates
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [feature.as_str()],
+        "merged_candidates should be only '{feature}'; got:\n{parsed}"
     );
 
     let entry = candidates

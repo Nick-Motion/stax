@@ -425,9 +425,9 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
     };
     let current = repo.current_branch()?;
     let mut history_cache = crate::commands::sync::SyncHistoryCache::default();
-    if delete_merged {
+    let stack_listing = if delete_merged {
         let store_trunk_window = crate::commands::sync::spawn_trunk_window(&repo, &workdir, &trunk);
-        crate::commands::sync::walk_stack(
+        let listing = crate::commands::sync::walk_stack(
             &mut history_cache,
             &repo,
             &workdir,
@@ -435,7 +435,10 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
             &remote_name,
         );
         store_trunk_window(&mut history_cache);
-    }
+        listing
+    } else {
+        None
+    };
 
     // --- Probe remote (ls-remote; read-only, no FETCH_HEAD writes) ---
     let mut use_cached_remote = false;
@@ -497,6 +500,7 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
             false,
             &HashMap::new(),
             &mut history_cache,
+            stack_listing,
         )
     });
 

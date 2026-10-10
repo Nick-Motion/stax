@@ -1594,6 +1594,7 @@ impl SyncContext {
                 false,
                 &self.live_pr_observations,
                 &mut self.history_cache,
+                None,
             )?;
             let partially_merged_notes = find_partially_merged_notes(
                 repo,
@@ -1915,6 +1916,7 @@ impl SyncContext {
                         true,
                         &self.live_pr_observations,
                         &mut self.history_cache,
+                        None,
                     )?;
                     let merged = merge_planned_merged_detection(planned.merged, fresh);
                     let partially_merged_notes: Vec<PartiallyMergedNote> = planned
@@ -1933,6 +1935,7 @@ impl SyncContext {
                         false,
                         &self.live_pr_observations,
                         &mut self.history_cache,
+                        None,
                     )?;
                     let partially_merged_notes = find_partially_merged_notes(
                         &repo,
@@ -4319,6 +4322,8 @@ pub(super) fn print_retained_closed_prs(stack: &Stack, closed: &[String]) {
     }
 }
 
+/// `stack_listing` is the listing that `walk_stack` returned for `stack` with
+/// `history_cache`, when the caller already walked it. `None` walks it here.
 pub(super) fn find_merged_branches_with_prs(
     repo: &GitRepo,
     workdir: &std::path::Path,
@@ -4328,6 +4333,7 @@ pub(super) fn find_merged_branches_with_prs(
     skip_patch_id_provenance: bool,
     live_prs: &HashMap<String, crate::forge::PrInfoWithHead>,
     history_cache: &mut SyncHistoryCache,
+    stack_listing: Option<String>,
 ) -> Result<Vec<MergedBranchInfo>> {
     find_merged_branches_with_prs_after_enumeration(
         repo,
@@ -4338,6 +4344,7 @@ pub(super) fn find_merged_branches_with_prs(
         skip_patch_id_provenance,
         live_prs,
         history_cache,
+        stack_listing,
         |_, _| {},
     )
 }
@@ -4351,6 +4358,7 @@ fn find_merged_branches_with_prs_after_enumeration(
     skip_patch_id_provenance: bool,
     live_prs: &HashMap<String, crate::forge::PrInfoWithHead>,
     history_cache: &mut SyncHistoryCache,
+    stack_listing: Option<String>,
     mut after_enumeration: impl FnMut(&str, &str),
 ) -> Result<Vec<MergedBranchInfo>> {
     let mut merged = Vec::new();
@@ -4358,7 +4366,9 @@ fn find_merged_branches_with_prs_after_enumeration(
 
     // Method 1: Git ancestry is merge proof only for branches without a PR
     // linkage. Linked branches need a fresh forge merge state and exact head.
-    let merged_output = match walk_stack(history_cache, repo, workdir, stack, remote_name) {
+    let merged_output = match stack_listing
+        .or_else(|| walk_stack(history_cache, repo, workdir, stack, remote_name))
+    {
         Some(listing) => listing,
         None => {
             let output = Command::new("git")
@@ -6189,6 +6199,7 @@ mod tests {
                     true,
                     &HashMap::new(),
                     &mut history_cache,
+                    None,
                     |enumerated_trunk, enumerated| {
                         enumerated_trunks.push(enumerated_trunk.to_string());
                         let expected = if remote_trunk { "origin/main" } else { "main" };
@@ -6362,6 +6373,7 @@ mod tests {
             false,
             &HashMap::new(),
             &mut SyncHistoryCache::default(),
+            None,
         )
         .unwrap();
         let found: Vec<_> = merged

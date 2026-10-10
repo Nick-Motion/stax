@@ -3,7 +3,7 @@
 //! These tests create real temporary git repositories and run actual stax commands
 //! to verify end-to-end functionality.
 
-use crate::common::{commit_all, init_test_repo};
+use crate::common::{commit_all, empty_test_home, init_test_repo};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,11 +35,13 @@ fn sanitized_stax_command() -> Command {
     cmd.env_remove("GITHUB_TOKEN")
         .env_remove("STAX_GITHUB_TOKEN")
         .env_remove("STAX_SHELL_INTEGRATION")
+        .env_remove("STAX_CONFIG_DIR")
         .env_remove("GH_TOKEN")
         .env_remove("GIT_AUTHOR_NAME")
         .env_remove("GIT_AUTHOR_EMAIL")
         .env_remove("GIT_COMMITTER_NAME")
         .env_remove("GIT_COMMITTER_EMAIL")
+        .env("HOME", empty_test_home())
         .env("GIT_CONFIG_GLOBAL", null_path)
         .env("GIT_CONFIG_SYSTEM", null_path)
         .env("STAX_DISABLE_UPDATE_CHECK", "1")

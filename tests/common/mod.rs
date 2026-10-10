@@ -14,6 +14,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 use tempfile::TempDir;
 
 /// Get path to compiled binary (built by cargo test)
@@ -121,6 +122,13 @@ fn sanitized_stax_command() -> Command {
     cmd
 }
 
+/// An empty HOME shared by sanitized commands, so a developer's `~/.config/stax`
+/// never shapes test results. Tests that need their own HOME set it afterwards.
+pub(crate) fn empty_test_home() -> &'static Path {
+    static HOME: OnceLock<TempDir> = OnceLock::new();
+    HOME.get_or_init(test_tempdir).path()
+}
+
 fn apply_sanitized_test_env(cmd: &mut Command) {
     let null_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
     for (key, _) in std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("BB_"))
@@ -138,6 +146,7 @@ fn apply_sanitized_test_env(cmd: &mut Command) {
         .env_remove("STAX_SHELL_INTEGRATION")
         .env_remove("STAX_CONFIG_DIR")
         .env_remove("GH_TOKEN")
+        .env("HOME", empty_test_home())
         .env("GIT_CONFIG_GLOBAL", null_path)
         .env("GIT_CONFIG_SYSTEM", null_path)
         .env("STAX_DISABLE_UPDATE_CHECK", "1")

@@ -34,6 +34,18 @@ pub(super) struct SyncHistoryCache {
     counts: HashMap<(String, String), usize>,
     /// Patch-id by trunk commit. `None` marks a commit with an empty diff.
     commit_patch_ids: HashMap<String, Option<String>>,
+    /// `cached_trunk_patch_ids` by merge base, branch tip and trunk tip.
+    trunk_patch_ids: HashMap<(String, String, String), HashSet<String>>,
+    /// The last walk of `prefetch_trunk_counts`, kept for later counts.
+    trunk_walk: Option<TrunkWalk>,
+}
+
+/// The output of `git rev-list --parents <tip> --not <bound>`.
+#[derive(Debug)]
+struct TrunkWalk {
+    tip: String,
+    bound: String,
+    rev_list: String,
 }
 
 /// Resolve a `base..head` range to object ids, so cache entries stay valid
@@ -68,7 +80,8 @@ fn cached_patch_ids(
 /// each at most once per sync. Diffing all of trunk takes seconds on a monorepo.
 /// Git's patch-id drops whitespace, and some names after a binary diff, so it
 /// can match changes to different files. Such a match is missed here, which
-/// keeps that branch.
+/// keeps that branch. The merged scan and the partial-merge notes both ask for
+/// a branch, so the result is kept.
 fn cached_trunk_patch_ids(
     cache: &mut SyncHistoryCache,
     repo: &GitRepo,
@@ -77,15 +90,20 @@ fn cached_trunk_patch_ids(
     trunk: &str,
     branch: &str,
 ) -> Result<HashSet<String>> {
-    let (base, tip) = range_key(repo, merge_base, branch);
+    let (base, branch_tip) = range_key(repo, merge_base, branch);
+    let key = (base, branch_tip, range_key(repo, merge_base, trunk).1);
+    if let Some(ids) = cache.trunk_patch_ids.get(&key) {
+        return Ok(ids.clone());
+    }
+    let (base, branch_tip, trunk_tip) = &key;
     // No paths selects every trunk commit, so a path list too long for one
     // command line still gives the exact answer.
-    let paths = match repo.files_changed_in_range(workdir, &format!("{base}..{tip}")) {
+    let paths = match repo.files_changed_in_range(workdir, &format!("{base}..{branch_tip}")) {
         Ok(files) if files.len() <= GitRepo::SQUASH_PREFIX_PATHSPEC_CAP => files,
         _ => Vec::new(),
     };
-    let (base, tip) = range_key(repo, merge_base, trunk);
-    let candidates = repo.commits_changing_only(workdir, &format!("{base}..{tip}"), &paths)?;
+    let candidates =
+        repo.commits_changing_only(workdir, &format!("{base}..{trunk_tip}"), &paths)?;
     let unseen: Vec<&str> = candidates
         .iter()
         .map(String::as_str)
@@ -103,13 +121,16 @@ fn cached_trunk_patch_ids(
                 .insert(commit.to_string(), found.remove(commit));
         }
     }
-    Ok(candidates
+    let ids: HashSet<String> = candidates
         .iter()
         .filter_map(|commit| cache.commit_patch_ids.get(commit).cloned().flatten())
-        .collect())
+        .collect();
+    cache.trunk_patch_ids.insert(key, ids.clone());
+    Ok(ids)
 }
 
 /// Many branches share a merge-base with trunk, so `merge_base..trunk` counts repeat.
+/// A count that the last trunk walk holds needs no git process.
 fn cached_rev_list_count(
     cache: &mut SyncHistoryCache,
     repo: &GitRepo,
@@ -121,16 +142,41 @@ fn cached_rev_list_count(
     if let Some(count) = cache.counts.get(&key) {
         return Ok(*count);
     }
-    let count = repo.rev_list_count(workdir, &format!("{}..{}", key.0, key.1))?;
+    let walked = cache
+        .trunk_walk
+        .as_ref()
+        .filter(|walk| walk.tip == key.1)
+        .and_then(|walk| walk_count(&parent_graph(&walk.rev_list), &walk.bound, &key.0));
+    let count = match walked {
+        Some(count) => count,
+        None => repo.rev_list_count(workdir, &format!("{}..{}", key.0, key.1))?,
+    };
     cache.counts.insert(key, count);
     Ok(count)
+}
+
+/// `merge_base..tip`, from the commits of `tip --not bound` with their parents.
+/// The walk holds that range when `merge_base` descends from `bound`. A path
+/// from `merge_base` down to `bound` stays in the walk until it reaches `bound`,
+/// so `merge_base` descends from `bound` when a commit that it reaches in the
+/// walk has `bound` as a parent.
+fn walk_count(parents: &HashMap<&str, Vec<&str>>, bound: &str, merge_base: &str) -> Option<usize> {
+    if merge_base == bound {
+        return Some(parents.len());
+    }
+    let reached = reachable(parents, merge_base);
+    reached
+        .iter()
+        .any(|commit| parents[commit].contains(&bound))
+        .then(|| parents.len() - reached.len())
 }
 
 /// Fill the count cache with `merge_base..trunk` for many merge bases at once.
 /// A walk per merge base took about 20 ms on a monorepo, where most branches
 /// fork far down trunk. One walk from trunk down to a common ancestor of all
-/// the merge bases lists every commit that those counts include. Any failure
-/// leaves the counts to `cached_rev_list_count`.
+/// the merge bases lists every commit that those counts include. The walk is
+/// kept for later counts. Any failure leaves the counts to
+/// `cached_rev_list_count`.
 fn prefetch_trunk_counts(
     cache: &mut SyncHistoryCache,
     repo: &GitRepo,
@@ -163,18 +209,21 @@ fn prefetch_trunk_counts(
         return;
     };
     let bound = bound.trim();
-    let Some(walk) = git(&["rev-list", "--parents", &keys[0].1, "--not", bound]) else {
+    let tip = keys[0].1.clone();
+    let Some(rev_list) = git(&["rev-list", "--parents", &tip, "--not", bound]) else {
         return;
     };
-    let parents = parent_graph(&walk);
+    let parents = parent_graph(&rev_list);
     for key in keys {
-        // Every merge base descends from the bound. So a merge base that is
-        // neither the bound nor in the graph is not an ancestor of trunk.
-        if key.0 == bound || parents.contains_key(key.0.as_str()) {
-            let count = parents.len() - reachable(&parents, &key.0).len();
+        if let Some(count) = walk_count(&parents, bound, &key.0) {
             cache.counts.insert(key, count);
         }
     }
+    cache.trunk_walk = Some(TrunkWalk {
+        tip,
+        bound: bound.to_string(),
+        rev_list,
+    });
 }
 
 /// The patch-id part of `GitRepo::is_branch_merged_equivalent_to_trunk`, through
@@ -5907,11 +5956,14 @@ mod tests {
         let picks = [commit("a.txt"), commit("b.txt")];
         run(&["switch", "-c", "partial"]);
         commit("c.txt");
+        run(&["switch", "-c", "other", "main"]);
+        let other = commit("d.txt");
         run(&["switch", "main"]);
         commit("unrelated-1.txt");
         run(&["cherry-pick", &picks[0]]);
         commit("unrelated-2.txt");
         run(&["cherry-pick", &picks[1]]);
+        run(&["cherry-pick", &other]);
 
         let repo = GitRepo::open_from_path(path).unwrap();
         let mut cache = SyncHistoryCache::default();
@@ -5921,6 +5973,7 @@ mod tests {
         };
         assert!(equivalent("picked"));
         assert!(!equivalent("partial"));
+        assert!(equivalent("other"));
     }
 
     #[test]
@@ -6026,6 +6079,19 @@ mod tests {
                 .copied()
         });
         assert_eq!(counts, [Some(6), Some(4), Some(4), Some(0), None]);
+
+        // The walk down to `before_merge` holds the range of the merge commit,
+        // and not the range of `side`, which forks below `before_merge`.
+        let mut cache = SyncHistoryCache::default();
+        prefetch_trunk_counts(&mut cache, &repo, path, "main", &[&before_merge, &tip]);
+        let merge = run(&["rev-parse", "main~1"]);
+        let no_repo = tempfile::tempdir().unwrap();
+        let mut count = |merge_base: &str, head: &str, workdir: &Path| {
+            cached_rev_list_count(&mut cache, &repo, workdir, merge_base, head).ok()
+        };
+        assert_eq!(count(&merge, "main", no_repo.path()), Some(1));
+        assert_eq!(count(&side, "main", path), Some(4));
+        assert_eq!(count(&merge, "side", path), Some(0));
     }
 
     #[test]

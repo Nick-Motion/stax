@@ -25,6 +25,8 @@ pub struct GitRepo {
     repo: Repository,
     /// Merge-bases by commit pair. Commits never change, so entries never go stale.
     merge_bases: RefCell<HashMap<(git2::Oid, git2::Oid), git2::Oid>>,
+    /// `graph_descendant_of` answers by (descendant, ancestor), taken from a walk.
+    descendants: RefCell<HashMap<(git2::Oid, git2::Oid), bool>>,
 }
 
 /// Immutable object IDs for one merge-base branch diff.
@@ -306,6 +308,7 @@ impl GitRepo {
         Self {
             repo,
             merge_bases: RefCell::default(),
+            descendants: RefCell::default(),
         }
     }
 
@@ -2105,6 +2108,46 @@ Use --auto-stash-pop or stash/commit changes first.",
         }
     }
 
+    /// Whether `descendant` descends from `ancestor`, as libgit2's
+    /// `graph_descendant_of` answers, unless `remember_descendants` knows.
+    pub fn graph_descendant_of(
+        &self,
+        descendant: git2::Oid,
+        ancestor: git2::Oid,
+    ) -> Result<bool, git2::Error> {
+        let known = self
+            .descendants
+            .borrow()
+            .get(&(descendant, ancestor))
+            .copied();
+        match known {
+            Some(known) => Ok(known),
+            None => self.repo.graph_descendant_of(descendant, ancestor),
+        }
+    }
+
+    /// Fill the descendant memo for each `(descendant, ancestor)` pair from the
+    /// walk that `remember_merge_bases` reads, whose positives must reach both
+    /// commits of every pair. The walk lists the commits that trunk does not
+    /// reach. An unlisted commit reaches only trunk commits, so it descends
+    /// from no listed commit, and a listed commit reaches a listed ancestor
+    /// only through listed commits. Pairs with an unlisted ancestor are left
+    /// to libgit2.
+    pub fn remember_descendants(&self, rev_list: &str, pairs: &[(git2::Oid, git2::Oid)]) {
+        let parents = parent_graph(rev_list);
+        for &(descendant, ancestor) in pairs {
+            let ancestor_hex = ancestor.to_string();
+            if !parents.contains_key(ancestor_hex.as_str()) {
+                continue;
+            }
+            let descends = descendant != ancestor
+                && reachable(&parents, &descendant.to_string()).contains(ancestor_hex.as_str());
+            self.descendants
+                .borrow_mut()
+                .insert((descendant, ancestor), descends);
+        }
+    }
+
     /// Find merge-base commit between any two refs (branch names, remote refs, or SHAs).
     pub fn merge_base_refs(&self, left: &str, right: &str) -> Result<String> {
         let left_oid = self.resolve_to_oid(left)?;
@@ -3497,7 +3540,7 @@ mod tests {
     }
 
     #[test]
-    fn remember_merge_bases_keeps_only_unique_trunk_merge_bases() {
+    fn walk_memos_keep_only_what_the_walk_proves() {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path();
         run_git(path, &["init", "-b", "main"]);
@@ -3530,7 +3573,8 @@ mod tests {
             git2::Oid::from_str(run_git_capture(path, &["rev-parse", rev]).trim()).expect("oid")
         };
         let main = oid("main");
-        repo.remember_merge_bases(main, &run_git_capture(path, &walk), &branches.map(oid));
+        let walk = run_git_capture(path, &walk);
+        repo.remember_merge_bases(main, &walk, &branches.map(oid));
 
         let expected: HashMap<_, _> = ["behind", "forked", "later"]
             .map(|branch| {
@@ -3540,6 +3584,26 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(*repo.merge_bases.borrow(), expected);
+
+        let pairs = [
+            ("forked", "forked~1"),
+            ("forked~1", "forked"),
+            ("forked", "forked"),
+            ("later", "forked"),
+            ("behind", "forked"),
+            ("forked", "behind"),
+        ]
+        .map(|(descendant, ancestor)| (oid(descendant), oid(ancestor)));
+        repo.remember_descendants(&walk, &pairs);
+        // The walk cannot tell which trunk commits a branch reaches.
+        let expected: HashMap<_, _> = pairs[..5]
+            .iter()
+            .map(|&(descendant, ancestor)| {
+                let descends = repo.repo.graph_descendant_of(descendant, ancestor).unwrap();
+                ((descendant, ancestor), descends)
+            })
+            .collect();
+        assert_eq!(*repo.descendants.borrow(), expected);
     }
 
     #[test]

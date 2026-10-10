@@ -59,11 +59,11 @@ struct BranchWalk {
 }
 
 /// The commit `name` resolves to.
-fn commit_oid(repo: &GitRepo, name: &str) -> Option<String> {
+fn commit_oid(repo: &GitRepo, name: &str) -> Option<git2::Oid> {
     repo.inner()
         .revparse_single(&format!("{name}^{{commit}}"))
         .ok()
-        .map(|commit| commit.id().to_string())
+        .map(|commit| commit.id())
 }
 
 /// The commits that `positives` reach but `trunk` does not, with their parents.
@@ -104,8 +104,9 @@ fn cached_branch_walk<'c>(
         .map(|walk| walk.rev_list.as_str()))
 }
 
-/// Walk every tracked branch, its remote-tracking branch and the remote trunk
-/// once. Each branch's trunk merge base comes from this walk, and
+/// Walk every tracked branch, its recorded parent, its remote-tracking branch
+/// and the remote trunk once. Each branch's trunk merge base, and whether its
+/// recorded parent descends from it, come from this walk, and
 /// `count_extra_commits` reuses it.
 fn prefetch_stack_walk(
     cache: &mut SyncHistoryCache,
@@ -119,26 +120,36 @@ fn prefetch_stack_walk(
     };
     let branches = stack
         .branches
-        .keys()
-        .filter(|branch| **branch != stack.trunk);
-    let tips: Vec<String> = branches
+        .iter()
+        .filter(|(branch, _)| **branch != stack.trunk);
+    let tips: Vec<(git2::Oid, Option<git2::Oid>)> = branches
         .clone()
-        .filter_map(|branch| commit_oid(repo, branch))
+        .filter_map(|(branch, info)| {
+            let parent = commit_oid(repo, recorded_parent(stack, info));
+            Some((commit_oid(repo, branch)?, parent))
+        })
         .collect();
-    let remotes: Vec<String> = branches
-        .map(|branch| format!("{remote_name}/{branch}"))
+    let remotes = branches
+        .map(|(branch, _)| format!("{remote_name}/{branch}"))
         .chain([format!("{remote_name}/{}", stack.trunk)])
-        .filter_map(|remote| commit_oid(repo, &remote))
+        .filter_map(|remote| commit_oid(repo, &remote));
+    let positives: Vec<String> = tips
+        .iter()
+        .flat_map(|&(tip, parent)| std::iter::once(tip).chain(parent))
+        .chain(remotes)
+        .map(|oid| oid.to_string())
         .collect();
-    let positives: Vec<&str> = tips.iter().chain(&remotes).map(String::as_str).collect();
-    let Ok(Some(walk)) = cached_branch_walk(cache, workdir, &trunk, &positives) else {
+    let positives: Vec<&str> = positives.iter().map(String::as_str).collect();
+    let Ok(Some(walk)) = cached_branch_walk(cache, workdir, &trunk.to_string(), &positives) else {
         return;
     };
-    let oid = |hex: &String| git2::Oid::from_str(hex).ok();
-    let tips: Vec<git2::Oid> = tips.iter().filter_map(oid).collect();
-    if let Some(trunk) = oid(&trunk) {
-        repo.remember_merge_bases(trunk, walk, &tips);
-    }
+    let branch_tips: Vec<git2::Oid> = tips.iter().map(|&(tip, _)| tip).collect();
+    repo.remember_merge_bases(trunk, walk, &branch_tips);
+    let pairs: Vec<(git2::Oid, git2::Oid)> = tips
+        .iter()
+        .filter_map(|&(tip, parent)| Some((parent?, tip)))
+        .collect();
+    repo.remember_descendants(walk, &pairs);
 }
 
 /// Resolve a `base..head` range to object ids, so cache entries stay valid
@@ -4006,29 +4017,25 @@ pub(super) fn should_spare_empty_never_submitted_branch(
         return false;
     }
 
-    // Use the recorded parent revision so branches with real commits that were
-    // later merged into trunk are not mistaken for never-started branches.
-    let parent = info
-        .parent_revision
-        .as_deref()
-        .or(info.parent.as_deref())
-        .unwrap_or(&stack.trunk);
     // Empty means `parent..branch` lists no commits, so the branch is the
     // parent or one of its ancestors. A name that does not resolve spares
     // nothing.
-    let commit = |name: &str| {
-        repo.inner()
-            .revparse_single(&format!("{name}^{{commit}}"))
-            .map(|commit| commit.id())
-    };
-    let (Ok(parent), Ok(tip)) = (commit(parent), commit(branch)) else {
+    let parent = commit_oid(repo, recorded_parent(stack, info));
+    let (Some(parent), Some(tip)) = (parent, commit_oid(repo, branch)) else {
         return false;
     };
-    tip == parent
-        || repo
-            .inner()
-            .graph_descendant_of(parent, tip)
-            .unwrap_or(false)
+    tip == parent || repo.graph_descendant_of(parent, tip).unwrap_or(false)
+}
+
+/// The commit `should_spare_empty_never_submitted_branch` compares a branch
+/// with. The recorded parent revision comes first, so branches with real
+/// commits that were later merged into trunk are not mistaken for
+/// never-started branches.
+fn recorded_parent<'s>(stack: &'s Stack, info: &'s crate::engine::stack::StackBranch) -> &'s str {
+    info.parent_revision
+        .as_deref()
+        .or(info.parent.as_deref())
+        .unwrap_or(&stack.trunk)
 }
 
 /// Union planned merged branches with a post-trunk fast re-scan. Planned entries
@@ -4272,6 +4279,7 @@ fn find_merged_branches_with_prs_after_enumeration(
     let trunk = stack.trunk.as_str();
     let mut need_patch_id: Vec<(String, String)> = Vec::new();
 
+    prefetch_stack_walk(history_cache, repo, workdir, stack, remote_name);
     let mut candidates: Vec<&str> = Vec::new();
     for branch in stack.branches.keys() {
         if branch == &stack.trunk
@@ -4292,7 +4300,6 @@ fn find_merged_branches_with_prs_after_enumeration(
         }
         candidates.push(branch);
     }
-    prefetch_stack_walk(history_cache, repo, workdir, stack, remote_name);
     for branch in candidates {
         match repo.is_branch_merged_cheap(branch) {
             Ok(Some(())) => {
@@ -4460,7 +4467,7 @@ fn count_extra_commits(
     remote_branches: &HashSet<String>,
     branches: &[&str],
 ) -> Result<Vec<usize>> {
-    let resolve = |name: &str| commit_oid(repo, name);
+    let resolve = |name: &str| commit_oid(repo, name).map(|oid| oid.to_string());
     let tips: Vec<Option<(String, Option<String>)>> = branches
         .iter()
         .map(|branch| {
@@ -6232,6 +6239,12 @@ mod tests {
         run(&["branch", "named-parent"]);
         run(&["switch", "-c", "ahead", &base]);
         commit("a1.txt");
+        run(&["switch", "-c", "stacked-empty", &base]);
+        let s1 = commit("s1.txt");
+        // No branch reaches this recorded parent, so only a walk from it lists it.
+        let s2 = run(&["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "s2"]);
+        run(&["switch", "-c", "stacked-ahead"]);
+        commit("s3.txt");
 
         let entry = |name: &str, parent_revision: Option<&str>, pr_number: Option<u64>| {
             let info = crate::engine::stack::StackBranch {
@@ -6258,21 +6271,32 @@ mod tests {
                     None,
                 ),
                 entry("submitted", Some(&base), Some(7)),
+                entry("stacked-empty", Some(&s2), None),
+                entry("stacked-ahead", Some(&s1), None),
             ]),
             trunk: "main".to_string(),
         };
         let repo = GitRepo::open_from_path(path).unwrap();
-        let spared = [
-            "empty",
-            "ahead",
-            "behind",
-            "named-parent",
-            "lost-parent",
-            "submitted",
-            "untracked",
-        ]
-        .map(|branch| should_spare_empty_never_submitted_branch(&repo, &stack, branch));
-        assert_eq!(spared, [true, false, true, true, false, false, false]);
+        let spared = || {
+            [
+                "empty",
+                "ahead",
+                "behind",
+                "named-parent",
+                "lost-parent",
+                "submitted",
+                "untracked",
+                "stacked-empty",
+                "stacked-ahead",
+            ]
+            .map(|branch| should_spare_empty_never_submitted_branch(&repo, &stack, branch))
+        };
+        let expected = [true, false, true, true, false, false, false, true, false];
+        assert_eq!(spared(), expected);
+        // The stack walk answers the same.
+        let mut cache = SyncHistoryCache::default();
+        prefetch_stack_walk(&mut cache, &repo, path, &stack, "origin");
+        assert_eq!(spared(), expected);
     }
 
     fn linked_worktree_cleanup(blockers: &[&'static str]) -> BlockingWorktreeCleanup {

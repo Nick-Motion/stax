@@ -188,6 +188,19 @@ fn run_git_in(cwd: &Path, args: &[&str]) -> Result<Output> {
     command::output(cwd, args).with_context(|| format!("Failed to run git {}", args.join(" ")))
 }
 
+/// The `(patch_id, commit_id)` pairs that `git patch-id` printed.
+fn parse_patch_id_pairs(stdout: &[u8]) -> Vec<(String, String)> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.split_whitespace();
+            let patch_id = columns.next()?;
+            let commit_id = columns.next().unwrap_or_default();
+            Some((patch_id.to_string(), commit_id.to_string()))
+        })
+        .collect()
+}
+
 /// Each commit that `git rev-list --parents` listed, with its parents.
 pub(crate) fn parent_graph(rev_list: &str) -> HashMap<&str, Vec<&str>> {
     rev_list
@@ -1400,13 +1413,6 @@ impl GitRepo {
         Ok(merged_tree == base_tree)
     }
 
-    fn run_patch_id_from_input(cwd: &Path, input: &[u8]) -> Result<Vec<String>> {
-        Ok(Self::run_patch_id_pairs_from_input(cwd, input)?
-            .into_iter()
-            .map(|(patch_id, _)| patch_id)
-            .collect())
-    }
-
     /// Run `git patch-id --stable` and return `(patch_id, commit_id)` pairs.
     fn run_patch_id_pairs_from_input(cwd: &Path, input: &[u8]) -> Result<Vec<(String, String)>> {
         let mut patch_id = Command::new("git")
@@ -1445,15 +1451,7 @@ impl GitRepo {
             anyhow::bail!("git patch-id --stable failed: {}", stderr);
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| {
-                let mut columns = line.split_whitespace();
-                let patch_id = columns.next()?;
-                let commit_id = columns.next().unwrap_or_default();
-                Some((patch_id.to_string(), commit_id.to_string()))
-            })
-            .collect())
+        Ok(parse_patch_id_pairs(&output.stdout))
     }
 
     /// Max commits in `merge_base..trunk` for patch-id merged-branch detection; beyond this we
@@ -1480,19 +1478,12 @@ impl GitRepo {
     }
 
     pub(crate) fn patch_ids_for_range(cwd: &Path, range: &str) -> Result<HashSet<String>> {
-        let output = run_git_in(cwd, &["log", "--format=%H", "-p", "--no-merges", range])?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            anyhow::bail!(
-                "git log --format=%H -p --no-merges {} failed: {}",
-                range,
-                stderr
-            );
-        }
-
-        Ok(Self::run_patch_id_from_input(cwd, &output.stdout)?
-            .into_iter()
-            .collect())
+        Ok(
+            Self::patch_id_pairs_of(cwd, &["log", "--format=%H", "-p", "--no-merges", range])?
+                .into_iter()
+                .map(|(patch_id, _)| patch_id)
+                .collect(),
+        )
     }
 
     /// `(patch_id, commit)` for each of `commits`. A commit with an empty diff has none.
@@ -1503,12 +1494,30 @@ impl GitRepo {
     ) -> Result<Vec<(String, String)>> {
         let mut args = vec!["log", "--format=%H", "-p", "--no-walk=unsorted"];
         args.extend_from_slice(commits);
-        let output = self.run_git(cwd, &args)?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            anyhow::bail!("git log -p --no-walk failed: {}", stderr);
+        Self::patch_id_pairs_of(cwd, &args)
+    }
+
+    /// `(patch_id, commit_id)` pairs of the diffs that `git <args>` prints. The
+    /// diffs stream into `git patch-id --stable`, which hashes the first ones
+    /// while git writes the rest.
+    fn patch_id_pairs_of(cwd: &Path, args: &[&str]) -> Result<Vec<(String, String)>> {
+        let (source, patch_id) = command::piped_output(cwd, args, &["patch-id", "--stable"])
+            .with_context(|| {
+                format!(
+                    "Failed to run git {} | git patch-id --stable",
+                    args.join(" ")
+                )
+            })?;
+        // A failed patch-id closes its input, which also fails the source.
+        if !patch_id.status.success() {
+            let stderr = String::from_utf8_lossy(&patch_id.stderr).trim().to_string();
+            anyhow::bail!("git patch-id --stable failed: {}", stderr);
         }
-        Self::run_patch_id_pairs_from_input(cwd, &output.stdout)
+        if !source.status.success() {
+            let stderr = String::from_utf8_lossy(&source.stderr).trim().to_string();
+            anyhow::bail!("git {} failed: {}", args.join(" "), stderr);
+        }
+        Ok(parse_patch_id_pairs(&patch_id.stdout))
     }
 
     /// Paths changed by the non-merge commits in `range`, rename sources included.
@@ -3654,6 +3663,17 @@ mod tests {
             })
             .collect();
         assert_eq!(*repo.descendants.borrow(), expected);
+    }
+
+    #[test]
+    fn patch_ids_for_range_reports_a_failed_log() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path();
+        run_git(path, &["init", "-b", "main"]);
+
+        let error = GitRepo::patch_ids_for_range(path, "missing..main").unwrap_err();
+
+        assert!(error.to_string().contains("missing..main"), "{error:#}");
     }
 
     #[test]

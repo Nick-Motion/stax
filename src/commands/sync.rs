@@ -20,6 +20,7 @@ use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use futures_util::stream::{self, StreamExt};
+use std::cell::LazyCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -55,7 +56,14 @@ struct TrunkWalk {
     rev_list: String,
     /// `trunk_count_within` by merge base.
     counts: HashMap<String, Option<usize>>,
+    /// The walk's non-merge commits with the files each changes, when
+    /// `walk_and_list_trunk` listed them.
+    files: LazyCell<Option<CommitFiles>, Box<dyn FnOnce() -> Option<CommitFiles> + Send>>,
 }
+
+/// Commits with the files each changes, as `GitRepo::files_changed_by_commits`
+/// lists them.
+type CommitFiles = Vec<(String, Vec<String>)>;
 
 /// The output of `git --no-replace-objects rev-list --parents <positives> --not <trunk>`.
 #[derive(Debug)]
@@ -201,10 +209,11 @@ struct PatchMatches {
 /// diffed, each at most once per sync. Diffing all of trunk takes seconds on a
 /// monorepo, and diffing all of a branch took 24 ms.
 /// Git's patch-id drops whitespace, and some names after a binary diff, so it
-/// can match changes to different files. Such a match is missed here. So is a
-/// match on a file whose name is not UTF-8, because its lossy name does not
-/// select it on trunk. A missed match keeps the branch. The merged scan and the
-/// partial-merge notes both ask for a branch, so the result is kept.
+/// can match changes to different files. Such a match is missed here. When the
+/// trunk window does not hold the range, so is a match on a file whose name is
+/// not UTF-8, because its lossy name does not select it on trunk. A missed
+/// match keeps the branch. The merged scan and the partial-merge notes both
+/// ask for a branch, so the result is kept.
 fn cached_patch_matches(
     cache: &mut SyncHistoryCache,
     repo: &GitRepo,
@@ -234,8 +243,12 @@ fn cached_patch_matches(
     if paths.len() > GitRepo::SQUASH_PREFIX_PATHSPEC_CAP {
         paths.clear();
     }
+    // A trunk commit that changes none of `paths` changes other files than
+    // each branch commit, so the window's other commits pair with none.
     let trunk_commits = if branch_commits.is_empty() {
         Vec::new()
+    } else if let Some(commits) = window_commits(cache.trunk_walk.as_ref(), base, trunk_tip) {
+        commits
     } else {
         let splits = trunk_splits(cache.trunk_walk.as_ref(), base, trunk_tip);
         GitRepo::files_changed_by_commits(workdir, base, trunk_tip, &splits, &paths)?
@@ -284,10 +297,10 @@ fn cached_patch_matches(
     Ok(matches)
 }
 
-/// First-parent commits of trunk per git process that `cached_patch_matches`
-/// starts to list the trunk commits that change a branch's files. On a
-/// monorepo one process took 29 ms for 142 commits and four took 16 ms.
-/// Starting a process takes about 2 ms.
+/// First-parent commits of trunk per git process that lists trunk commits
+/// with their files. On a monorepo one process took 29 ms to find which of 142
+/// commits change a branch's files, and four took 16 ms. Starting a process
+/// takes about 2 ms.
 const TRUNK_PART_COMMITS: usize = 36;
 
 /// Commits on `tip`'s first-parent chain in the trunk window that cut
@@ -357,9 +370,10 @@ fn trunk_window<'w>(
 }
 
 /// Starts the walk that `trunk_window` makes for `trunk` at the depth of the
-/// merged scan and the notes pass, on a thread. The returned closure waits
-/// for it and stores it in the cache. A failed walk stores nothing, so the
-/// first reader walks again and reports the error.
+/// merged scan and the notes pass, with the listing of its files, on a
+/// thread. The returned closure waits for the walk and stores it in the
+/// cache. A failed walk stores nothing, so the first reader walks again and
+/// reports the error.
 pub(super) fn spawn_trunk_window(
     repo: &GitRepo,
     workdir: &Path,
@@ -368,7 +382,7 @@ pub(super) fn spawn_trunk_window(
     let thread = commit_oid(repo, trunk).map(|tip| {
         let workdir = workdir.to_path_buf();
         std::thread::spawn(move || {
-            walk_trunk(
+            walk_and_list_trunk(
                 &workdir,
                 &tip.to_string(),
                 GitRepo::PATCH_ID_TRUNK_COMMIT_CAP,
@@ -479,7 +493,49 @@ fn walk_trunk(workdir: &Path, tip: &str, depth: usize) -> Result<TrunkWalk> {
         bound,
         rev_list,
         counts: HashMap::new(),
+        files: LazyCell::new(Box::new(|| None)),
     })
+}
+
+/// `walk_trunk` with its non-merge commits listed with their files on a
+/// thread, for `cached_patch_matches`. On a monorepo the listing of 200
+/// commits took 30 ms in six processes, during a stack walk of 55 ms. When the
+/// listing fails, `cached_patch_matches` lists the range itself and reports
+/// any error.
+fn walk_and_list_trunk(workdir: &Path, tip: &str, depth: usize) -> Result<TrunkWalk> {
+    let mut walk = walk_trunk(workdir, tip, depth)?;
+    if let Some(bound) = walk.bound.clone() {
+        let splits = trunk_splits(Some(&walk), &bound, tip);
+        let (workdir, tip) = (workdir.to_path_buf(), tip.to_string());
+        let thread = std::thread::spawn(move || {
+            GitRepo::files_changed_by_commits(&workdir, &bound, &tip, &splits, &[]).ok()
+        });
+        walk.files = LazyCell::new(Box::new(move || {
+            thread
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        }));
+    }
+    Ok(walk)
+}
+
+/// The non-merge commits of `base..tip` with the files each changes, from the
+/// listing of a trunk window that holds that range. `walk_count` tells when it
+/// does, and the range is then the window less the commits that `base`
+/// reaches in it.
+fn window_commits(walk: Option<&TrunkWalk>, base: &str, tip: &str) -> Option<CommitFiles> {
+    let walk = walk.filter(|walk| walk.tip == tip)?;
+    let parents = parent_graph(&walk.rev_list);
+    walk_count(&parents, walk.bound.as_deref()?, base)?;
+    let below = reachable(&parents, base);
+    let files = LazyCell::force(&walk.files).as_ref()?;
+    Some(
+        files
+            .iter()
+            .filter(|(commit, _)| !below.contains(commit.as_str()))
+            .cloned()
+            .collect(),
+    )
 }
 
 /// `merge_base..tip`, from the commits of `tip --not bound` with their parents.
@@ -6258,6 +6314,26 @@ mod tests {
         assert!(!cache.commit_patch_ids.contains_key(&both));
         // The same files with other content.
         assert!(!equivalent(&mut cache, "edits"));
+        // The listing of a trunk window that holds each range pairs the same
+        // commits, though it also lists the unrelated ones.
+        let walk = walk_and_list_trunk(path, &run(&["rev-parse", "main"]), 6).unwrap();
+        let mut window = SyncHistoryCache {
+            trunk_walk: Some(walk),
+            ..SyncHistoryCache::default()
+        };
+        for branch in ["picked", "partial", "other", "edits"] {
+            let merge_base = repo.merge_base("main", branch).unwrap();
+            let matches = |cache: &mut SyncHistoryCache| {
+                let matches =
+                    cached_patch_matches(cache, &repo, path, &merge_base, "main", branch).unwrap();
+                (matches.matched, matches.commits)
+            };
+            assert_eq!(
+                matches(&mut window),
+                matches(&mut SyncHistoryCache::default()),
+                "{branch}"
+            );
+        }
 
         let tracked = ["picked", "partial", "other"].map(|name| {
             let info = crate::engine::stack::StackBranch {
@@ -6325,6 +6401,76 @@ mod tests {
                 ("picked", 2, true)
             ]
         );
+    }
+
+    #[test]
+    fn trunk_window_lists_each_range_that_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let commit = |file: &str| {
+            std::fs::write(path.join(file), format!("{file}\n")).unwrap();
+            run(&["add", file]);
+            run(&["commit", "-m", file]);
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        commit("base.txt");
+        commit("one.txt");
+        run(&["switch", "-c", "side"]);
+        commit("side-1.txt");
+        commit("side-2.txt");
+        run(&["switch", "main"]);
+        commit("two.txt");
+        run(&["merge", "--no-ff", "side", "-m", "merge side"]);
+        commit("three.txt");
+        run(&["commit", "--allow-empty", "-m", "empty"]);
+        let tip = run(&["rev-parse", "main"]);
+        let trunk = run(&["rev-list", "main"]);
+        let other_tip = run(&["rev-parse", "main~1"]);
+
+        // Depth 6 has no bound, so nothing is listed.
+        for depth in 1..=6 {
+            let walk = walk_and_list_trunk(path, &tip, depth).unwrap();
+            assert_eq!(walk.bound.is_some(), depth < 6);
+            for base in trunk.lines() {
+                let held = walk.bound.as_ref().is_some_and(|bound| {
+                    Command::new("git")
+                        .args(["merge-base", "--is-ancestor", bound, base])
+                        .current_dir(path)
+                        .status()
+                        .unwrap()
+                        .success()
+                });
+                let sorted = |mut commits: CommitFiles| {
+                    commits.sort();
+                    commits
+                };
+                let expected = held.then(|| {
+                    sorted(GitRepo::files_changed_by_commits(path, base, &tip, &[], &[]).unwrap())
+                });
+                assert_eq!(
+                    window_commits(Some(&walk), base, &tip).map(sorted),
+                    expected,
+                    "depth {depth}, base {base}"
+                );
+                assert_eq!(window_commits(Some(&walk), base, &other_tip), None);
+            }
+        }
     }
 
     #[test]

@@ -393,7 +393,10 @@ pub(super) fn spawn_trunk_window(
 /// walk, about 8 ms on a monorepo, when none of its boundary commits is in
 /// the trunk window or is its bound. Each merge base is a boundary commit, so
 /// it is then below the bound, and its range holds the bound and the window's
-/// `cap` or more commits.
+/// `cap` or more commits. It also skips that walk when one boundary commit
+/// reaches the others in the window. Each common ancestor is a boundary commit
+/// or below one, and the window holds every path between two of its commits,
+/// so that commit is the only merge base.
 fn trunk_merge_base_within(
     cache: &mut SyncHistoryCache,
     repo: &GitRepo,
@@ -403,6 +406,7 @@ fn trunk_merge_base_within(
     cap: usize,
 ) -> Result<Option<(String, usize)>> {
     let key = commit_oid(repo, trunk).zip(commit_oid(repo, &format!("refs/heads/{branch}")));
+    let mut window_merge_base = None;
     if let Some((trunk_oid, tip)) = key
         && let Some(boundary) = cache.boundaries.get(&(trunk_oid, tip))
     {
@@ -414,8 +418,23 @@ fn trunk_merge_base_within(
         if !boundary.iter().any(in_window) {
             return Ok(None);
         }
+        let tops: Vec<&String> = boundary
+            .iter()
+            .filter(|candidate| {
+                let below = reachable(&parents, candidate);
+                boundary
+                    .iter()
+                    .all(|commit| below.contains(commit.as_str()))
+            })
+            .collect();
+        if let [top] = tops.as_slice() {
+            window_merge_base = Some(top.to_string());
+        }
     }
-    let merge_base = repo.merge_base(trunk, branch)?;
+    let merge_base = match window_merge_base {
+        Some(merge_base) => merge_base,
+        None => repo.merge_base(trunk, branch)?,
+    };
     let count = trunk_count_within(cache, repo, workdir, &merge_base, trunk, cap)?;
     Ok(count.map(|count| (merge_base, count)))
 }

@@ -154,16 +154,29 @@ pub fn run(
         })
         .collect();
 
+    let ahead_behind_pairs = ordered_branches
+        .iter()
+        .filter_map(|name| {
+            stack
+                .branches
+                .get(name)
+                .and_then(|b| b.parent.clone())
+                .map(|parent| (parent, name.clone()))
+        })
+        .collect::<Vec<_>>();
+    let ahead_behind: HashMap<_, _> = ahead_behind_pairs
+        .iter()
+        .zip(repo.commits_ahead_behind_many(&ahead_behind_pairs))
+        .map(|((_, name), result)| (name.as_str(), result.unwrap_or((0, 0))))
+        .collect();
+
     let mut branch_logs: Vec<BranchLogJson> = Vec::new();
     let mut branch_log_map: HashMap<String, BranchLogJson> = HashMap::new();
 
     for name in &ordered_branches {
         let info = stack.branches.get(name);
         let parent = info.and_then(|b| b.parent.clone());
-        let (ahead, behind) = parent
-            .as_deref()
-            .and_then(|p| repo.commits_ahead_behind(p, name).ok())
-            .unwrap_or((0, 0));
+        let (ahead, behind) = ahead_behind.get(name.as_str()).copied().unwrap_or((0, 0));
 
         let pr_state = info
             .and_then(|b| b.pr_state.clone())

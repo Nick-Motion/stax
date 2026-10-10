@@ -416,7 +416,8 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
     // The load and the merged scan's stack walk print nothing and read only
     // local refs, so they run before the probe output, while ls-remote, the
     // status check and the forge client run. Live PR states do not change
-    // the walk. Only the restack preview reads `needs_restack`.
+    // the walk. Only the restack preview reads `needs_restack`. The merged
+    // scan's walk of trunk needs only trunk, so it runs during the stack walk.
     let mut stack = if restack {
         Stack::load(&repo)?
     } else {
@@ -425,6 +426,7 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
     let current = repo.current_branch()?;
     let mut history_cache = crate::commands::sync::SyncHistoryCache::default();
     if delete_merged {
+        let store_trunk_window = crate::commands::sync::spawn_trunk_window(&repo, &workdir, &trunk);
         crate::commands::sync::walk_stack(
             &mut history_cache,
             &repo,
@@ -432,6 +434,7 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
             &stack,
             &remote_name,
         );
+        store_trunk_window(&mut history_cache);
     }
 
     // --- Probe remote (ls-remote; read-only, no FETCH_HEAD writes) ---

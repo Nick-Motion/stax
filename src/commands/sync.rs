@@ -331,6 +331,37 @@ fn trunk_window<'w>(
     Ok(slot.as_mut().expect("trunk walk was just stored"))
 }
 
+/// Starts the walk that `trunk_window` makes for `trunk` at the depth of the
+/// merged scan and the notes pass, on a thread. The returned closure waits
+/// for it and stores it in the cache. A failed walk stores nothing, so the
+/// first reader walks again and reports the error.
+pub(super) fn spawn_trunk_window(
+    repo: &GitRepo,
+    workdir: &Path,
+    trunk: &str,
+) -> impl FnOnce(&mut SyncHistoryCache) {
+    let thread = commit_oid(repo, trunk).map(|tip| {
+        let workdir = workdir.to_path_buf();
+        std::thread::spawn(move || {
+            walk_trunk(
+                &workdir,
+                &tip.to_string(),
+                GitRepo::PATCH_ID_TRUNK_COMMIT_CAP,
+            )
+        })
+    });
+    move |cache| {
+        let walk = thread.map(|thread| {
+            thread
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
+        if let Some(Ok(walk)) = walk {
+            cache.trunk_walk = Some(walk);
+        }
+    }
+}
+
 /// The merge base of `trunk` and `branch`, with the count of
 /// `merge_base..trunk` when that range holds at most `cap` commits, else
 /// `None`. A branch whose merge base `walk_stack` left to libgit2 skips that

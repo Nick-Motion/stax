@@ -484,12 +484,28 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
         );
     }
 
+    // Live PR states only add linked branches, which the other merge passes
+    // skip. So the unlinked scan and its patch-id walks run while the forge
+    // thread resolves its token.
+    let unlinked_merged = delete_merged.then(|| {
+        crate::commands::sync::find_merged_branches_with_prs(
+            &repo,
+            &workdir,
+            &stack,
+            &remote_name,
+            &remote_branch_set,
+            false,
+            &HashMap::new(),
+            &mut history_cache,
+        )
+    });
+
     let dirty = dirty
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         .unwrap_or(false);
 
-    // Patch PR states in memory BEFORE any &Stack borrows for detection
+    // Patch PR states in memory before the passes that read them
     let forge = forge.and_then(|thread| {
         thread
             .join()
@@ -613,28 +629,14 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
         println!("{}", "Merged branches".bold());
     }
 
-    if !delete_merged {
-        plan_data.closed_prs = retained_closed_prs(&stack, &[]);
-        if !quiet {
-            print_retained_closed_prs(&stack, &plan_data.closed_prs);
-        }
-        if !quiet {
-            println!(
-                "  {}",
-                "--no-delete: merged-branch cleanup is disabled".dimmed()
-            );
-        }
-    } else {
-        let merged = crate::commands::sync::find_merged_branches_with_prs(
-            &repo,
+    if let Some(unlinked_merged) = unlinked_merged {
+        let mut merged = unlinked_merged?;
+        crate::commands::sync::add_live_pr_merges(
             &workdir,
-            &stack,
-            &remote_name,
-            &remote_branch_set,
-            false,
+            &stack.trunk,
             &live_pr_observations,
-            &mut history_cache,
-        )?;
+            &mut merged,
+        );
         let merged_names: Vec<String> = merged.iter().map(|info| info.branch.clone()).collect();
         plan_data.closed_prs = retained_closed_prs(&stack, &merged_names);
         if !quiet {
@@ -753,6 +755,17 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
                     );
                 }
             }
+        }
+    } else {
+        plan_data.closed_prs = retained_closed_prs(&stack, &[]);
+        if !quiet {
+            print_retained_closed_prs(&stack, &plan_data.closed_prs);
+        }
+        if !quiet {
+            println!(
+                "  {}",
+                "--no-delete: merged-branch cleanup is disabled".dimmed()
+            );
         }
     }
 

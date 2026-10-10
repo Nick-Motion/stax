@@ -970,6 +970,63 @@ async fn dry_run_and_execution_retain_open_pr_with_missing_remote_and_ancestor_t
     }
 }
 
+#[tokio::test]
+async fn dry_run_lists_a_linked_branch_whose_live_pr_merged() {
+    use crate::common::{OutputAssertions, github_mock::write_stax_config};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+    let server = MockServer::start().await;
+    let repo = TestRepo::new_with_remote();
+    let branch = repo.create_stack(&["live-merged"]).remove(0);
+    repo.git(&["push", "-u", "origin", &branch])
+        .assert_success();
+    repo.run_stax(&["checkout", "main"]).assert_success();
+    let metadata = serde_json::json!({
+        "parentBranchName": "main", "parentBranchRevision": repo.get_commit_sha("main"),
+        "prInfo": { "number": 992, "state": "OPEN", "isDraft": false }
+    });
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), metadata.to_string()).unwrap();
+    let hash = repo.git(&["hash-object", "-w", file.path().to_str().unwrap()]);
+    hash.assert_success();
+    repo.git(&[
+        "update-ref",
+        &format!("refs/branch-metadata/{branch}"),
+        TestRepo::stdout(&hash).trim(),
+    ])
+    .assert_success();
+    repo.configure_github_like_submit_remote();
+    write_stax_config(std::path::Path::new(&repo.clean_home()), &server.uri(), "");
+    let head = repo.get_commit_sha(&branch);
+    Mock::given(method("GET")).and(path("/repos/test-owner/test-repo/pulls/992"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "url":"https://api.github.com/repos/test-owner/test-repo/pulls/992", "id":992, "number":992,
+            "state":"closed", "merged":true, "merged_at":"2026-10-01T00:00:00Z", "draft":false,
+            "title":"Merged", "body":"",
+            "head":{"ref":branch,"sha":head,"label":format!("test-owner:{branch}")},
+            "base":{"ref":"main","sha":repo.get_commit_sha("main")},
+            "html_url":"https://github.com/test-owner/test-repo/pull/992"
+        }))).expect(1).mount(&server).await;
+
+    let out = repo.run_stax_with_env(
+        &["sync", "--dry-run", "--json"],
+        &[("STAX_GITHUB_TOKEN", "isolated-fixture-token")],
+    );
+
+    out.assert_success();
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        json["merged_candidates"]
+            .as_array()
+            .is_some_and(|xs| xs.iter().any(|x| x["name"] == branch)),
+        "{json}"
+    );
+    assert_eq!(repo.get_commit_sha(&branch), head);
+    server.verify().await;
+}
+
 #[cfg(unix)]
 #[test]
 fn cycle3_bb_subdirectory_success_removes_exact_environment() {

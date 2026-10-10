@@ -4404,36 +4404,12 @@ fn find_merged_branches_with_prs_after_enumeration(
         }
     }
 
-    // A linked branch needs a fresh forge state and the exact PR head must be
-    // contained by its current local tip. A stale state or a missing remote
-    // head is never merge evidence.
-    for (branch, pr) in live_prs {
-        if branch == &stack.trunk
-            || !pr.info.state.eq_ignore_ascii_case("merged")
-            || pr.head_sha.is_empty()
-            || merged.iter().any(|item| &item.branch == branch)
-        {
-            continue;
-        }
-        let Some(local_head) = resolve_ref_oid(workdir, &format!("refs/heads/{branch}")) else {
-            continue;
-        };
-        if is_ancestor(workdir, &pr.head_sha, &local_head) {
-            merged.push(MergedBranchInfo {
-                branch: branch.clone(),
-                merge_type: MergeType::SquashMerge,
-                observed_branch_oid: local_head,
-                merged_pr_head_oid: Some(pr.head_sha.clone()),
-            });
-        }
-    }
-
     // Method 3: Patch-id provenance check — detects squash/rebase merges even
     // when trunk has advanced past the merge point (where a simple tree diff
     // would show false negatives). Run this last so cheaper signals resolve
     // most cases before the provenance path touches more refs.
     if skip_patch_id_provenance {
-        merged.sort_by(|a, b| a.branch.cmp(&b.branch));
+        add_live_pr_merges(workdir, &stack.trunk, live_prs, &mut merged);
         return Ok(merged);
     }
 
@@ -4510,9 +4486,42 @@ fn find_merged_branches_with_prs_after_enumeration(
         }
     }
 
-    // The passes above iterate `HashMap`s; sort so prompts and output are stable.
-    merged.sort_by(|a, b| a.branch.cmp(&b.branch));
+    add_live_pr_merges(workdir, &stack.trunk, live_prs, &mut merged);
     Ok(merged)
+}
+
+/// A linked branch needs a fresh forge state and the exact PR head must be
+/// contained by its current local tip. A stale state or a missing remote head
+/// is never merge evidence. The other passes skip linked branches, so this
+/// pass can run after them, once the forge answers.
+pub(super) fn add_live_pr_merges(
+    workdir: &std::path::Path,
+    trunk: &str,
+    live_prs: &HashMap<String, crate::forge::PrInfoWithHead>,
+    merged: &mut Vec<MergedBranchInfo>,
+) {
+    for (branch, pr) in live_prs {
+        if branch == trunk
+            || !pr.info.state.eq_ignore_ascii_case("merged")
+            || pr.head_sha.is_empty()
+            || merged.iter().any(|item| &item.branch == branch)
+        {
+            continue;
+        }
+        let Some(local_head) = resolve_ref_oid(workdir, &format!("refs/heads/{branch}")) else {
+            continue;
+        };
+        if is_ancestor(workdir, &pr.head_sha, &local_head) {
+            merged.push(MergedBranchInfo {
+                branch: branch.clone(),
+                merge_type: MergeType::SquashMerge,
+                observed_branch_oid: local_head,
+                merged_pr_head_oid: Some(pr.head_sha.clone()),
+            });
+        }
+    }
+    // The merge passes iterate `HashMap`s; sort so prompts and output are stable.
+    merged.sort_by(|a, b| a.branch.cmp(&b.branch));
 }
 
 fn exact_enumerated_oid(enumerated_oid: &str, current_oid: Option<String>) -> Option<String> {

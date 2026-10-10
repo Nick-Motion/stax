@@ -1541,24 +1541,57 @@ impl GitRepo {
         Ok(files)
     }
 
-    /// Non-merge commits in `range` that change any of `paths`, relative to the
-    /// repository root. No paths selects every commit.
-    pub(crate) fn commits_changing(
+    /// Non-merge commits in `range` that change some of `paths` and no other
+    /// path, relative to the repository root. No paths selects every commit.
+    pub(crate) fn commits_changing_only(
         &self,
         cwd: &Path,
         range: &str,
         paths: &[String],
     ) -> Result<Vec<String>> {
+        // With log.follow set, git refuses a pathspec log. A shown signature
+        // would mix gpg output into the paths.
         let mut args = vec![
+            "-c",
+            "log.follow=false",
             "--literal-pathspecs",
-            "rev-list",
+            "log",
+            "--no-show-signature",
+            "--format=%x00%H",
+            "--name-only",
+            "--full-diff",
+            "--no-renames",
             "--no-merges",
             "--full-history",
+            "-z",
             range,
             "--",
         ];
         args.extend(paths.iter().map(String::as_str));
-        self.git_stdout_lines(cwd, &args)
+        let output = self.run_git(cwd, &args)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!("git log --name-only {} failed: {}", range, stderr);
+        }
+        let allowed: HashSet<&[u8]> = paths.iter().map(|path| path.as_bytes()).collect();
+        let tokens: Vec<&[u8]> = output.stdout.split(|byte| *byte == 0).collect();
+        // Each commit prints as an empty token, its id, a newline and then the
+        // paths it changes.
+        Ok(tokens
+            .split(|token| token.is_empty())
+            .filter_map(|record| {
+                let (commit, changed) = record.split_first()?;
+                let only = changed.iter().enumerate().all(|(index, path)| {
+                    let path = if index == 0 {
+                        path.strip_prefix(b"\n").unwrap_or(path)
+                    } else {
+                        path
+                    };
+                    allowed.contains(path)
+                });
+                (paths.is_empty() || only).then(|| String::from_utf8_lossy(commit).into_owned())
+            })
+            .collect())
     }
 
     /// Find the longest prefix of `branch`'s own commits that already landed on
@@ -3540,5 +3573,40 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(*repo.merge_bases.borrow(), expected);
+    }
+
+    #[test]
+    fn commits_changing_only_skips_commits_that_change_other_paths() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path();
+        run_git(path, &["init", "-b", "main"]);
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test User"]);
+        run_git(path, &["config", "log.follow", "true"]);
+        let commit = |files: &[&str], message: &str| {
+            for file in files {
+                fs::write(path.join(file), message).expect("write file");
+            }
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", message]);
+            run_git_capture(path, &["rev-parse", "HEAD"])
+                .trim()
+                .to_string()
+        };
+        commit(&["a.txt", "b.txt", "c.txt"], "base");
+        let a = commit(&["a.txt"], "a");
+        let a_and_c = commit(&["a.txt", "c.txt"], "a and c");
+        let c = commit(&["c.txt"], "c");
+        let a_and_b = commit(&["a.txt", "b.txt"], "a and b");
+
+        let repo = GitRepo::open_from_path(path).expect("open repo");
+        let only = |paths: &[&str]| {
+            let paths: Vec<String> = paths.iter().map(|path| path.to_string()).collect();
+            repo.commits_changing_only(path, "main~4..main", &paths)
+                .expect("commits")
+        };
+        assert_eq!(only(&["a.txt", "b.txt"]), [a_and_b.as_str(), a.as_str()]);
+        assert_eq!(only(&["a.txt"]), [a.as_str()]);
+        assert_eq!(only(&[]), [a_and_b, c, a_and_c, a]);
     }
 }

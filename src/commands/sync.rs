@@ -63,9 +63,12 @@ fn cached_patch_ids(
 }
 
 /// Patch-ids of the commits in `merge_base..trunk` that can equal a patch-id of
-/// `branch`. A patch-id hashes file names, so a matching trunk commit changes a
-/// file that some branch commit changes. Only those trunk commits are diffed,
+/// `branch`. A patch-id hashes file names, so a matching trunk commit changes
+/// only files that the branch changes. Only those trunk commits are diffed,
 /// each at most once per sync. Diffing all of trunk takes seconds on a monorepo.
+/// Git's patch-id drops whitespace, and some names after a binary diff, so it
+/// can match changes to different files. Such a match is missed here, which
+/// keeps that branch.
 fn cached_trunk_patch_ids(
     cache: &mut SyncHistoryCache,
     repo: &GitRepo,
@@ -82,7 +85,7 @@ fn cached_trunk_patch_ids(
         _ => Vec::new(),
     };
     let (base, tip) = range_key(repo, merge_base, trunk);
-    let candidates = repo.commits_changing(workdir, &format!("{base}..{tip}"), &paths)?;
+    let candidates = repo.commits_changing_only(workdir, &format!("{base}..{tip}"), &paths)?;
     let unseen: Vec<&str> = candidates
         .iter()
         .map(String::as_str)

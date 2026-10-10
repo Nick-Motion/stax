@@ -1538,45 +1538,80 @@ impl GitRepo {
         Ok(files)
     }
 
-    /// Non-merge commits in `range` that change some of `paths` and no other
+    /// Non-merge commits in `base..tip` that change some of `paths` and no other
     /// path, relative to the repository root. No paths selects every commit.
+    /// `splits`, first-parent ancestors of `tip` from newest to oldest, cut the
+    /// range into parts that separate git processes walk at the same time.
     pub(crate) fn commits_changing_only(
-        &self,
         cwd: &Path,
-        range: &str,
+        base: &str,
+        tip: &str,
+        splits: &[String],
         paths: &[String],
     ) -> Result<Vec<String>> {
-        // With log.follow set, git refuses a pathspec log. A shown signature
-        // would mix gpg output into the paths.
-        let mut args = vec![
-            "-c",
-            "log.follow=false",
-            "--literal-pathspecs",
-            "log",
-            "--no-show-signature",
-            "--format=%x00%H",
-            "--name-only",
-            "--full-diff",
-            "--no-renames",
-            "--no-merges",
-            "--full-history",
-            "-z",
-            range,
-            "--",
-        ];
-        args.extend(paths.iter().map(String::as_str));
-        let output = self.run_git(cwd, &args)?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            anyhow::bail!("git log --name-only {} failed: {}", range, stderr);
-        }
+        // A part holds what its top reaches and the next top and `base` do
+        // not. A first parent reaches only commits that its child reaches, so
+        // the parts share no commit and together hold `base..tip`.
+        let tops: Vec<&str> = std::iter::once(tip)
+            .chain(splits.iter().map(String::as_str))
+            .collect();
+        let ranges: Vec<Vec<String>> = tops
+            .iter()
+            .enumerate()
+            .map(|(index, top)| {
+                let mut range = vec![top.to_string(), format!("^{base}")];
+                range.extend(tops.get(index + 1).map(|next| format!("^{next}")));
+                range
+            })
+            .collect();
+        let outputs = std::thread::scope(|scope| {
+            let parts: Vec<_> = ranges
+                .iter()
+                .map(|range| {
+                    scope.spawn(move || {
+                        // With log.follow set, git refuses a pathspec log. A
+                        // shown signature would mix gpg output into the paths.
+                        let mut args = vec![
+                            "-c",
+                            "log.follow=false",
+                            "--literal-pathspecs",
+                            "log",
+                            "--no-show-signature",
+                            "--format=%x00%H",
+                            "--name-only",
+                            "--full-diff",
+                            "--no-renames",
+                            "--no-merges",
+                            "--full-history",
+                            "-z",
+                        ];
+                        args.extend(range.iter().map(String::as_str));
+                        args.push("--");
+                        args.extend(paths.iter().map(String::as_str));
+                        run_git_in(cwd, &args)
+                    })
+                })
+                .collect();
+            parts
+                .into_iter()
+                .map(|part| {
+                    part.join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect::<Vec<_>>()
+        });
         let allowed: HashSet<&[u8]> = paths.iter().map(|path| path.as_bytes()).collect();
-        let tokens: Vec<&[u8]> = output.stdout.split(|byte| *byte == 0).collect();
-        // Each commit prints as an empty token, its id, a newline and then the
-        // paths it changes.
-        Ok(tokens
-            .split(|token| token.is_empty())
-            .filter_map(|record| {
+        let mut commits = Vec::new();
+        for output in outputs {
+            let output = output?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                anyhow::bail!("git log --name-only {base}..{tip} failed: {stderr}");
+            }
+            let tokens: Vec<&[u8]> = output.stdout.split(|byte| *byte == 0).collect();
+            // Each commit prints as an empty token, its id, a newline and then
+            // the paths it changes.
+            commits.extend(tokens.split(|token| token.is_empty()).filter_map(|record| {
                 let (commit, changed) = record.split_first()?;
                 let only = changed.iter().enumerate().all(|(index, path)| {
                     let path = if index == 0 {
@@ -1587,8 +1622,9 @@ impl GitRepo {
                     allowed.contains(path)
                 });
                 (paths.is_empty() || only).then(|| String::from_utf8_lossy(commit).into_owned())
-            })
-            .collect())
+            }));
+        }
+        Ok(commits)
     }
 
     /// Find the longest prefix of `branch`'s own commits that already landed on
@@ -3644,14 +3680,25 @@ mod tests {
         let c = commit(&["c.txt"], "c");
         let a_and_b = commit(&["a.txt", "b.txt"], "a and b");
 
-        let repo = GitRepo::open_from_path(path).expect("open repo");
-        let only = |paths: &[&str]| {
-            let paths: Vec<String> = paths.iter().map(|path| path.to_string()).collect();
-            repo.commits_changing_only(path, "main~4..main", &paths)
+        let to_strings =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|name| name.to_string()).collect() };
+        for splits in [&[][..], &["main~2"], &["main~1", "main~3"]] {
+            let only = |paths: &[&str]| {
+                GitRepo::commits_changing_only(
+                    path,
+                    "main~4",
+                    "main",
+                    &to_strings(splits),
+                    &to_strings(paths),
+                )
                 .expect("commits")
-        };
-        assert_eq!(only(&["a.txt", "b.txt"]), [a_and_b.as_str(), a.as_str()]);
-        assert_eq!(only(&["a.txt"]), [a.as_str()]);
-        assert_eq!(only(&[]), [a_and_b, c, a_and_c, a]);
+            };
+            assert_eq!(only(&["a.txt", "b.txt"]), [a_and_b.as_str(), a.as_str()]);
+            assert_eq!(only(&["a.txt"]), [a.as_str()]);
+            assert_eq!(
+                only(&[]),
+                [a_and_b.as_str(), c.as_str(), a_and_c.as_str(), a.as_str()]
+            );
+        }
     }
 }

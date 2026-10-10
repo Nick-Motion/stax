@@ -257,8 +257,8 @@ fn cached_trunk_patch_ids(
         Ok(files) if files.len() <= GitRepo::SQUASH_PREFIX_PATHSPEC_CAP => files,
         _ => Vec::new(),
     };
-    let candidates =
-        repo.commits_changing_only(workdir, &format!("{base}..{trunk_tip}"), &paths)?;
+    let splits = trunk_splits(cache.trunk_walk.as_ref(), base, trunk_tip);
+    let candidates = GitRepo::commits_changing_only(workdir, base, trunk_tip, &splits, &paths)?;
     let unseen: Vec<&str> = candidates
         .iter()
         .map(String::as_str)
@@ -282,6 +282,30 @@ fn cached_trunk_patch_ids(
         .collect();
     cache.trunk_patch_ids.insert(key, ids.clone());
     Ok(ids)
+}
+
+/// First-parent commits of trunk per git process that `cached_trunk_patch_ids`
+/// starts to select trunk commits. On a monorepo one process took 29 ms for
+/// 142 commits and four took 16 ms. Starting a process takes about 2 ms.
+const TRUNK_PART_COMMITS: usize = 36;
+
+/// Commits on `tip`'s first-parent chain in the trunk window that cut
+/// `base..tip` into parts of at most `TRUNK_PART_COMMITS` first-parent
+/// commits, newest first. None for a window of another tip.
+fn trunk_splits(walk: Option<&TrunkWalk>, base: &str, tip: &str) -> Vec<String> {
+    let Some(walk) = walk.filter(|walk| walk.tip == tip) else {
+        return Vec::new();
+    };
+    let parents = parent_graph(&walk.rev_list);
+    let below = reachable(&parents, base);
+    let chain: Vec<&str> =
+        std::iter::successors(Some(tip), |commit| parents.get(commit)?.first().copied())
+            .take_while(|commit| parents.contains_key(commit) && !below.contains(commit))
+            .collect();
+    let parts = chain.len().div_ceil(TRUNK_PART_COMMITS);
+    (1..parts)
+        .map(|part| chain[chain.len() * part / parts].to_string())
+        .collect()
 }
 
 /// `merge_base..trunk` counted when it holds at most `cap` commits, else

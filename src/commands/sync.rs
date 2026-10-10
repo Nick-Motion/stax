@@ -30,11 +30,10 @@ pub(super) const PR_METADATA_REFRESH_CONCURRENCY: usize = 8;
 /// Expensive immutable history facts shared for one sync operation.
 #[derive(Debug, Default)]
 pub(super) struct SyncHistoryCache {
-    patch_ids: HashMap<(String, String), HashSet<String>>,
-    /// Patch-id by trunk commit. `None` marks a commit with an empty diff.
+    /// Patch-id by commit. `None` marks a commit with an empty diff.
     commit_patch_ids: HashMap<String, Option<String>>,
-    /// `cached_trunk_patch_ids` by merge base, branch tip and trunk tip.
-    trunk_patch_ids: HashMap<(String, String, String), HashSet<String>>,
+    /// `cached_patch_matches` by merge base, branch tip and trunk tip.
+    patch_matches: HashMap<(String, String, String), PatchMatches>,
     /// The last walk of `trunk_count_within`, kept for later counts.
     trunk_walk: Option<TrunkWalk>,
     /// The last walk of `cached_branch_walk`.
@@ -188,82 +187,78 @@ fn range_key(repo: &GitRepo, base: &str, head: &str) -> (String, String) {
     (base_oid, head_oid)
 }
 
-/// The patch-ids of `merge_base..branch` and `cached_trunk_patch_ids`, or
-/// `None` when the branch has no patch-ids. Each side spawns its own git
-/// processes, so the branch's `git log -p` runs on a thread while the trunk
-/// side runs. One after the other, they took about 80 ms on a monorepo.
-fn cached_branch_and_trunk_patch_ids(
-    cache: &mut SyncHistoryCache,
-    repo: &GitRepo,
-    workdir: &Path,
-    merge_base: &str,
-    trunk: &str,
-    branch: &str,
-) -> Result<Option<(HashSet<String>, HashSet<String>)>> {
-    let key = range_key(repo, merge_base, branch);
-    let (branch_ids, trunk_ids) = match cache.patch_ids.get(&key) {
-        Some(ids) if ids.is_empty() => return Ok(None),
-        Some(ids) => (
-            ids.clone(),
-            cached_trunk_patch_ids(cache, repo, workdir, merge_base, trunk, branch),
-        ),
-        None => {
-            let range = format!("{}..{}", key.0, key.1);
-            let (branch_ids, trunk_ids) = std::thread::scope(|scope| {
-                let branch_ids = scope.spawn(|| GitRepo::patch_ids_for_range(workdir, &range));
-                let trunk_ids =
-                    cached_trunk_patch_ids(cache, repo, workdir, merge_base, trunk, branch);
-                let branch_ids = branch_ids
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                (branch_ids, trunk_ids)
-            });
-            let branch_ids = branch_ids?;
-            cache.patch_ids.insert(key, branch_ids.clone());
-            (branch_ids, trunk_ids)
-        }
-    };
-    if branch_ids.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some((branch_ids, trunk_ids?)))
+/// Of the commits of `merge_base..branch` with a diff, how many have the
+/// patch-id of a commit in `merge_base..trunk`.
+#[derive(Debug, Clone, Copy)]
+struct PatchMatches {
+    matched: usize,
+    commits: usize,
 }
 
-/// Patch-ids of the commits in `merge_base..trunk` that can equal a patch-id of
-/// `branch`. A patch-id hashes file names, so a matching trunk commit changes
-/// only files that the branch changes. Only those trunk commits are diffed,
-/// each at most once per sync. Diffing all of trunk takes seconds on a monorepo.
+/// `PatchMatches` for `branch`. A patch-id hashes the names of the files that a
+/// commit changes, so commits with equal patch-ids change the same files. Only
+/// commits that change the same files as a commit on the other side are
+/// diffed, each at most once per sync. Diffing all of trunk takes seconds on a
+/// monorepo, and diffing all of a branch took 24 ms.
 /// Git's patch-id drops whitespace, and some names after a binary diff, so it
-/// can match changes to different files. Such a match is missed here, which
-/// keeps that branch. The merged scan and the partial-merge notes both ask for
-/// a branch, so the result is kept.
-fn cached_trunk_patch_ids(
+/// can match changes to different files. Such a match is missed here. So is a
+/// match on a file whose name is not UTF-8, because its lossy name does not
+/// select it on trunk. A missed match keeps the branch. The merged scan and the
+/// partial-merge notes both ask for a branch, so the result is kept.
+fn cached_patch_matches(
     cache: &mut SyncHistoryCache,
     repo: &GitRepo,
     workdir: &Path,
     merge_base: &str,
     trunk: &str,
     branch: &str,
-) -> Result<HashSet<String>> {
+) -> Result<PatchMatches> {
     let (base, branch_tip) = range_key(repo, merge_base, branch);
     let key = (base, branch_tip, range_key(repo, merge_base, trunk).1);
-    if let Some(ids) = cache.trunk_patch_ids.get(&key) {
-        return Ok(ids.clone());
+    if let Some(matches) = cache.patch_matches.get(&key) {
+        return Ok(*matches);
     }
     let (base, branch_tip, trunk_tip) = &key;
+    let mut branch_commits =
+        GitRepo::files_changed_by_commits(workdir, base, branch_tip, &[], &[])?;
+    // A commit with an empty diff has no patch-id.
+    branch_commits.retain(|(_, files)| !files.is_empty());
+    let mut paths: Vec<String> = branch_commits
+        .iter()
+        .flat_map(|(_, files)| files.iter().cloned())
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
     // No paths selects every trunk commit, so a path list too long for one
     // command line still gives the exact answer.
-    let paths = match repo.files_changed_in_range(workdir, &format!("{base}..{branch_tip}")) {
-        Ok(files) if files.len() <= GitRepo::SQUASH_PREFIX_PATHSPEC_CAP => files,
-        _ => Vec::new(),
+    if paths.len() > GitRepo::SQUASH_PREFIX_PATHSPEC_CAP {
+        paths.clear();
+    }
+    let trunk_commits = if branch_commits.is_empty() {
+        Vec::new()
+    } else {
+        let splits = trunk_splits(cache.trunk_walk.as_ref(), base, trunk_tip);
+        GitRepo::files_changed_by_commits(workdir, base, trunk_tip, &splits, &paths)?
     };
-    let splits = trunk_splits(cache.trunk_walk.as_ref(), base, trunk_tip);
-    let candidates = GitRepo::commits_changing_only(workdir, base, trunk_tip, &splits, &paths)?;
-    let unseen: Vec<&str> = candidates
+    let paired = |commits: &[(String, Vec<String>)], others: &[(String, Vec<String>)]| {
+        let files: HashSet<&[String]> = others.iter().map(|(_, files)| files.as_slice()).collect();
+        commits
+            .iter()
+            .filter(|(_, changed)| files.contains(changed.as_slice()))
+            .map(|(commit, _)| commit.clone())
+            .collect::<Vec<String>>()
+    };
+    let branch_paired = paired(&branch_commits, &trunk_commits);
+    let trunk_paired = paired(&trunk_commits, &branch_commits);
+    let mut unseen: Vec<&str> = branch_paired
         .iter()
+        .chain(&trunk_paired)
         .map(String::as_str)
         .filter(|commit| !cache.commit_patch_ids.contains_key(*commit))
         .collect();
+    // With more than one merge base, a commit can be on both sides.
+    unseen.sort_unstable();
+    unseen.dedup();
     if !unseen.is_empty() {
         let mut found: HashMap<String, String> = repo
             .patch_ids_for_commits(workdir, &unseen)?
@@ -276,17 +271,23 @@ fn cached_trunk_patch_ids(
                 .insert(commit.to_string(), found.remove(commit));
         }
     }
-    let ids: HashSet<String> = candidates
-        .iter()
-        .filter_map(|commit| cache.commit_patch_ids.get(commit).cloned().flatten())
-        .collect();
-    cache.trunk_patch_ids.insert(key, ids.clone());
-    Ok(ids)
+    let patch_id = |commit: &String| cache.commit_patch_ids.get(commit).cloned().flatten();
+    let trunk_ids: HashSet<String> = trunk_paired.iter().filter_map(patch_id).collect();
+    let matches = PatchMatches {
+        matched: branch_paired
+            .iter()
+            .filter(|commit| patch_id(commit).is_some_and(|id| trunk_ids.contains(&id)))
+            .count(),
+        commits: branch_commits.len(),
+    };
+    cache.patch_matches.insert(key, matches);
+    Ok(matches)
 }
 
-/// First-parent commits of trunk per git process that `cached_trunk_patch_ids`
-/// starts to select trunk commits. On a monorepo one process took 29 ms for
-/// 142 commits and four took 16 ms. Starting a process takes about 2 ms.
+/// First-parent commits of trunk per git process that `cached_patch_matches`
+/// starts to list the trunk commits that change a branch's files. On a
+/// monorepo one process took 29 ms for 142 commits and four took 16 ms.
+/// Starting a process takes about 2 ms.
 const TRUNK_PART_COMMITS: usize = 36;
 
 /// Commits on `tip`'s first-parent chain in the trunk window that cut
@@ -501,14 +502,8 @@ fn cached_patch_equivalent(
     {
         return Ok(false);
     }
-    Ok(
-        match cached_branch_and_trunk_patch_ids(cache, repo, workdir, merge_base, trunk, branch)? {
-            None => true,
-            Some((branch_ids, trunk_ids)) => {
-                !trunk_ids.is_empty() && branch_ids.is_subset(&trunk_ids)
-            }
-        },
-    )
+    let matches = cached_patch_matches(cache, repo, workdir, merge_base, trunk, branch)?;
+    Ok(matches.matched == matches.commits)
 }
 
 #[derive(Debug, Default)]
@@ -4592,17 +4587,12 @@ pub(super) fn find_partially_merged_notes(
             if trunk_count == 0 {
                 continue;
             }
-            let Ok(Some((branch_patch_ids, trunk_patch_ids))) = cached_branch_and_trunk_patch_ids(
-                history_cache,
-                repo,
-                workdir,
-                &merge_base,
-                &trunk,
-                &branch,
-            ) else {
+            let Ok(matches) =
+                cached_patch_matches(history_cache, repo, workdir, &merge_base, &trunk, &branch)
+            else {
                 continue;
             };
-            if branch_patch_ids.is_disjoint(&trunk_patch_ids) {
+            if matches.matched == 0 {
                 continue;
             }
             PartialMergeReason::HistoryMerged
@@ -6218,22 +6208,37 @@ mod tests {
         commit("c.txt");
         run(&["switch", "-c", "other", "main"]);
         let other = commit("d.txt");
+        // A commit with an empty diff has no patch-id and changes nothing.
+        run(&["commit", "--allow-empty", "-m", "empty"]);
         run(&["switch", "main"]);
         commit("unrelated-1.txt");
         run(&["cherry-pick", &picks[0]]);
         commit("unrelated-2.txt");
         run(&["cherry-pick", &picks[1]]);
         run(&["cherry-pick", &other]);
+        run(&["switch", "-c", "edits"]);
+        std::fs::write(path.join("a.txt"), "edited\n").unwrap();
+        std::fs::write(path.join("b.txt"), "edited\n").unwrap();
+        run(&["commit", "-am", "edit a.txt and b.txt"]);
+        run(&["switch", "main"]);
+        std::fs::write(path.join("a.txt"), "a.txt\nb.txt\n").unwrap();
+        std::fs::write(path.join("b.txt"), "a.txt\nb.txt\n").unwrap();
+        run(&["commit", "-am", "a.txt and b.txt"]);
+        let both = run(&["rev-parse", "HEAD"]);
 
         let repo = GitRepo::open_from_path(path).unwrap();
         let mut cache = SyncHistoryCache::default();
-        let mut equivalent = |branch: &str| {
+        let equivalent = |cache: &mut SyncHistoryCache, branch: &str| {
             let merge_base = repo.merge_base("main", branch).unwrap();
-            cached_patch_equivalent(&mut cache, &repo, path, &merge_base, "main", branch).unwrap()
+            cached_patch_equivalent(cache, &repo, path, &merge_base, "main", branch).unwrap()
         };
-        assert!(equivalent("picked"));
-        assert!(!equivalent("partial"));
-        assert!(equivalent("other"));
+        assert!(equivalent(&mut cache, "picked"));
+        assert!(!equivalent(&mut cache, "partial"));
+        assert!(equivalent(&mut cache, "other"));
+        // None of these branches changes both files, so no patch-id can match it.
+        assert!(!cache.commit_patch_ids.contains_key(&both));
+        // The same files with other content.
+        assert!(!equivalent(&mut cache, "edits"));
 
         let tracked = ["picked", "partial", "other"].map(|name| {
             let info = crate::engine::stack::StackBranch {
@@ -6296,7 +6301,7 @@ mod tests {
         assert_eq!(
             found,
             [
-                ("other", 1, true),
+                ("other", 2, true),
                 ("partial", 3, true),
                 ("picked", 2, true)
             ]

@@ -1520,44 +1520,18 @@ impl GitRepo {
         Ok(parse_patch_id_pairs(&patch_id.stdout))
     }
 
-    /// Paths changed by the non-merge commits in `range`, rename sources included.
-    pub(crate) fn files_changed_in_range(&self, cwd: &Path, range: &str) -> Result<Vec<String>> {
-        let args = [
-            "log",
-            "--format=",
-            "--name-only",
-            "--no-renames",
-            "--no-merges",
-            "-z",
-            range,
-        ];
-        let output = self.run_git(cwd, &args)?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            anyhow::bail!("git {} failed: {}", args.join(" "), stderr);
-        }
-        let mut files = output
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-            .map(|path| String::from_utf8(path.to_vec()))
-            .collect::<Result<Vec<_>, _>>()?;
-        files.sort_unstable();
-        files.dedup();
-        Ok(files)
-    }
-
-    /// Non-merge commits in `base..tip` that change some of `paths` and no other
-    /// path, relative to the repository root. No paths selects every commit.
-    /// `splits`, first-parent ancestors of `tip` from newest to oldest, cut the
-    /// range into parts that separate git processes walk at the same time.
-    pub(crate) fn commits_changing_only(
+    /// Each non-merge commit in `base..tip` that changes some of `paths`, with
+    /// every path it changes, rename sources included, sorted and relative to
+    /// the repository root. No paths selects every commit. `splits`,
+    /// first-parent ancestors of `tip` from newest to oldest, cut the range
+    /// into parts that separate git processes walk at the same time.
+    pub(crate) fn files_changed_by_commits(
         cwd: &Path,
         base: &str,
         tip: &str,
         splits: &[String],
         paths: &[String],
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<(String, Vec<String>)>> {
         // A part holds what its top reaches and the next top and `base` do
         // not. A first parent reaches only commits that its child reaches, so
         // the parts share no commit and together hold `base..tip`.
@@ -1609,7 +1583,6 @@ impl GitRepo {
                 })
                 .collect::<Vec<_>>()
         });
-        let allowed: HashSet<&[u8]> = paths.iter().map(|path| path.as_bytes()).collect();
         let mut commits = Vec::new();
         for output in outputs {
             let output = output?;
@@ -1622,15 +1595,20 @@ impl GitRepo {
             // the paths it changes.
             commits.extend(tokens.split(|token| token.is_empty()).filter_map(|record| {
                 let (commit, changed) = record.split_first()?;
-                let only = changed.iter().enumerate().all(|(index, path)| {
-                    let path = if index == 0 {
-                        path.strip_prefix(b"\n").unwrap_or(path)
-                    } else {
-                        path
-                    };
-                    allowed.contains(path)
-                });
-                (paths.is_empty() || only).then(|| String::from_utf8_lossy(commit).into_owned())
+                let mut files: Vec<String> = changed
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| {
+                        let path = if index == 0 {
+                            path.strip_prefix(b"\n").unwrap_or(path)
+                        } else {
+                            path
+                        };
+                        String::from_utf8_lossy(path).into_owned()
+                    })
+                    .collect();
+                files.sort_unstable();
+                Some((String::from_utf8_lossy(commit).into_owned(), files))
             }));
         }
         Ok(commits)
@@ -3677,7 +3655,7 @@ mod tests {
     }
 
     #[test]
-    fn commits_changing_only_skips_commits_that_change_other_paths() {
+    fn files_changed_by_commits_lists_every_file_of_commits_that_change_the_paths() {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path();
         run_git(path, &["init", "-b", "main"]);
@@ -3689,35 +3667,49 @@ mod tests {
                 fs::write(path.join(file), message).expect("write file");
             }
             run_git(path, &["add", "."]);
-            run_git(path, &["commit", "-m", message]);
+            run_git(path, &["commit", "--allow-empty", "-m", message]);
             run_git_capture(path, &["rev-parse", "HEAD"])
                 .trim()
                 .to_string()
         };
         commit(&["a.txt", "b.txt", "c.txt"], "base");
         let a = commit(&["a.txt"], "a");
-        let a_and_c = commit(&["a.txt", "c.txt"], "a and c");
+        let c_and_a = commit(&["c.txt", "a.txt"], "c and a");
+        let empty = commit(&[], "empty");
         let c = commit(&["c.txt"], "c");
-        let a_and_b = commit(&["a.txt", "b.txt"], "a and b");
+        let b_and_a = commit(&["b.txt", "a.txt"], "b and a");
 
         let to_strings =
             |names: &[&str]| -> Vec<String> { names.iter().map(|name| name.to_string()).collect() };
+        let files = |commit: &str, names: &[&str]| (commit.to_string(), to_strings(names));
         for splits in [&[][..], &["main~2"], &["main~1", "main~3"]] {
-            let only = |paths: &[&str]| {
-                GitRepo::commits_changing_only(
+            let changed = |paths: &[&str]| {
+                GitRepo::files_changed_by_commits(
                     path,
-                    "main~4",
+                    "main~5",
                     "main",
                     &to_strings(splits),
                     &to_strings(paths),
                 )
                 .expect("commits")
             };
-            assert_eq!(only(&["a.txt", "b.txt"]), [a_and_b.as_str(), a.as_str()]);
-            assert_eq!(only(&["a.txt"]), [a.as_str()]);
             assert_eq!(
-                only(&[]),
-                [a_and_b.as_str(), c.as_str(), a_and_c.as_str(), a.as_str()]
+                changed(&["b.txt", "c.txt"]),
+                [
+                    files(&b_and_a, &["a.txt", "b.txt"]),
+                    files(&c, &["c.txt"]),
+                    files(&c_and_a, &["a.txt", "c.txt"]),
+                ]
+            );
+            assert_eq!(
+                changed(&[]),
+                [
+                    files(&b_and_a, &["a.txt", "b.txt"]),
+                    files(&c, &["c.txt"]),
+                    files(&empty, &[]),
+                    files(&c_and_a, &["a.txt", "c.txt"]),
+                    files(&a, &["a.txt"]),
+                ]
             );
         }
     }

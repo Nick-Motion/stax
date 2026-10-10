@@ -2365,3 +2365,108 @@ exit 1
         "auth-token-unsupported outcome must not cache the native stack feature as disabled"
     );
 }
+
+async fn check_sync_token_scope(host: &str, repo_trust: bool, dry_run: bool) {
+    let server = MockServer::start().await;
+    let repo = TestRepo::new_with_remote();
+    let home = repo.clean_home();
+    write_config(&home, &server.uri());
+    let config_path = Path::new(&home).join(".config/stax/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            "{}\n[auth]\nuse_gh_cli = true\n",
+            config.replace("[remote]", "[remote]\nbase_url = \"https://github.com\"")
+        ),
+    )
+    .unwrap();
+    let url = format!("https://{host}/test-owner/test-repo.git");
+    let file_url = format!("file://{}", repo.remote_path().unwrap().display());
+    repo.git(&["remote", "set-url", "origin", &url])
+        .assert_success();
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("url.{file_url}.insteadOf"),
+        &url,
+    ])
+    .assert_success();
+    let branches = repo.create_stack(&["token-scope"]);
+    repo.git(&["push", "-u", "origin", &branches[0]])
+        .assert_success();
+    write_branch_pr_metadata(&repo, &branches[0], "main", 10);
+    if repo_trust {
+        repo.create_file(
+            "stax.toml",
+            &format!("[remote]\nbase_url = \"https://{host}\"\nforge = \"github\"\n"),
+        );
+        repo.commit("Configure repository forge");
+    }
+    let fake = fake_gh_dir(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_CALL_LOG\"\nprintf 'fake-token\\n'\n",
+    );
+    let log = fake.path().join("calls");
+    fs::write(&log, "").unwrap();
+    let path = path_with_fake_gh(fake.path());
+    let args = if dry_run {
+        vec!["sync", "--dry-run"]
+    } else {
+        vec!["sync", "--force"]
+    };
+    let output = repo.run_stax_with_env(
+        &args,
+        &[
+            ("HOME", &home),
+            ("XDG_CONFIG_HOME", &format!("{home}/.config")),
+            ("PATH", &path),
+            ("GH_CALL_LOG", log.to_str().unwrap()),
+        ],
+    );
+    output.assert_success();
+    let calls = fs::read_to_string(log).unwrap();
+    if host == "github.com" {
+        assert!(!calls.is_empty(), "sync must construct a forge client");
+        assert!(
+            calls
+                .lines()
+                .all(|call| call == "auth token --hostname github.com"),
+            "every gh lookup must be host-scoped; calls: {calls:?}"
+        );
+    } else {
+        assert!(
+            calls.is_empty(),
+            "untrusted host must not run gh; calls: {calls:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_untrusted_dry_run() {
+    check_sync_token_scope("git.example.test", false, true).await;
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_untrusted_sync() {
+    check_sync_token_scope("git.example.test", false, false).await;
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_repo_cannot_trust_dry_run() {
+    check_sync_token_scope("git.example.test", true, true).await;
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_repo_cannot_trust_sync() {
+    check_sync_token_scope("git.example.test", true, false).await;
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_github_dry_run() {
+    check_sync_token_scope("github.com", false, true).await;
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_github_sync() {
+    check_sync_token_scope("github.com", false, false).await;
+}

@@ -198,6 +198,16 @@ async fn sync_preserves_frozen_child_when_squash_merged_parent_is_cleaned_up() {
         &format!("{}/api/v1", server.uri()),
         "",
     );
+    let config_path = std::path::Path::new(&repo.clean_home()).join(".config/stax/config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        config_path,
+        config.replace(
+            "[remote]",
+            "[remote]\nbase_url = \"https://gitea.example.test\"",
+        ),
+    )
+    .unwrap();
     Mock::given(method("GET"))
         .and(path("/api/v1/repos/test-owner/test-repo/pulls/991"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

@@ -15,7 +15,7 @@ use crate::github::pr::PrInfo as ForgePrInfo;
 use crate::ops::receipt::{OpKind, PlanSummary};
 use crate::ops::tx::{self, Transaction};
 use crate::progress::LiveTimer;
-use crate::remote::{self, RemoteInfo};
+use crate::remote::{self, TrustedRemoteInfo};
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
@@ -1543,13 +1543,12 @@ impl SyncContext {
         self.live_pr_observations.clear();
         let refreshed = {
             let Self {
-                config,
                 quiet,
                 tx,
                 live_pr_observations,
                 ..
             } = self;
-            refresh_pr_draft_states(repo, config, *quiet, tx.as_mut(), live_pr_observations)?
+            refresh_pr_draft_states(repo, *quiet, tx.as_mut(), live_pr_observations)?
         };
         if let Some(pr_refresh_elapsed) = refreshed {
             self.step_timings
@@ -1985,7 +1984,7 @@ impl SyncContext {
             let repo = repo.refresh()?;
 
             // Initialize forge client once up-front for any PR base updates below.
-            let forge_client = init_forge_client(&repo, &self.config);
+            let forge_client = init_forge_client(&repo);
 
             if !merged.is_empty() {
                 if !self.quiet {
@@ -2663,7 +2662,7 @@ impl SyncContext {
                 };
 
                 // Initialize forge client once up-front for any PR base updates below.
-                let forge_client = init_forge_client(repo, &self.config);
+                let forge_client = init_forge_client(repo);
 
                 let gone_deletions: HashSet<String> = gone.iter().cloned().collect();
                 for branch in &gone {
@@ -3858,7 +3857,6 @@ fn run_sync_phases(ctx: &mut SyncContext, repo: GitRepo) -> Result<()> {
 /// `gh pr edit --base` are reflected in time for cleanup.
 fn refresh_pr_draft_states(
     repo: &GitRepo,
-    config: &Config,
     quiet: bool,
     mut tx: Option<&mut Transaction>,
     observations: &mut HashMap<String, crate::forge::PrInfoWithHead>,
@@ -3891,27 +3889,9 @@ fn refresh_pr_draft_states(
 
     let timer = LiveTimer::maybe_new(!quiet, "Refresh PR metadata");
 
-    let remote_info = match RemoteInfo::from_repo(repo, config) {
-        Ok(info) => info,
-        Err(_) => {
-            LiveTimer::maybe_finish_skipped(timer, "skipped");
-            return Ok(Some(started_at.elapsed()));
-        }
-    };
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => {
-            LiveTimer::maybe_finish_skipped(timer, "skipped");
-            return Ok(Some(started_at.elapsed()));
-        }
-    };
-    let _enter = rt.enter();
-    let client = match ForgeClient::new(&remote_info) {
-        Ok(c) => c,
-        Err(_) => {
-            LiveTimer::maybe_finish_skipped(timer, "skipped");
-            return Ok(Some(started_at.elapsed()));
-        }
+    let Some((rt, client)) = init_forge_client(repo) else {
+        LiveTimer::maybe_finish_skipped(timer, "skipped");
+        return Ok(Some(started_at.elapsed()));
     };
     let cache_dir = match repo.common_git_dir() {
         Ok(p) => p,
@@ -4826,17 +4806,26 @@ pub(super) fn local_branch_exists(workdir: &std::path::Path, branch: &str) -> bo
         .unwrap_or(false)
 }
 
-pub(super) fn init_forge_client(
-    repo: &GitRepo,
-    config: &Config,
-) -> Option<(tokio::runtime::Runtime, ForgeClient)> {
-    forge_client(&RemoteInfo::from_repo(repo, config).ok()?)
+pub(super) fn trusted_forge_remote(repo: &GitRepo) -> Option<(TrustedRemoteInfo, Config)> {
+    let config = Config::load_for_trusted_network(repo.workdir().ok()?).ok()?;
+    let remote = TrustedRemoteInfo::from_repo(repo, &config).ok()?;
+    Some((remote, config))
 }
 
-pub(super) fn forge_client(remote: &RemoteInfo) -> Option<(tokio::runtime::Runtime, ForgeClient)> {
+pub(super) fn init_forge_client(repo: &GitRepo) -> Option<(tokio::runtime::Runtime, ForgeClient)> {
+    let (remote, config) = trusted_forge_remote(repo)?;
+    forge_client(&remote, &config)
+}
+
+pub(super) fn forge_client(
+    remote: &TrustedRemoteInfo,
+    config: &Config,
+) -> Option<(tokio::runtime::Runtime, ForgeClient)> {
     let rt = tokio::runtime::Runtime::new().ok()?;
     let _enter = rt.enter();
-    ForgeClient::new(remote).ok().map(|client| (rt, client))
+    ForgeClient::new_for_trusted_remote(remote, config)
+        .ok()
+        .map(|client| (rt, client))
 }
 
 fn print_blocked_or_skipped(

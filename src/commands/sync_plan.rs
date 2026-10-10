@@ -4,7 +4,7 @@ use crate::commands::sync::{
     find_partially_merged_notes, find_upstream_gone_branches, forge_client,
     imported_branches_for_cleanup, is_ancestor, local_branch_exists, plan_merged_worktree_cleanup,
     print_cleanup_candidates, print_retained_closed_prs, resolve_fallback_parent_skipping_doomed,
-    resolve_ref_oid, retained_closed_prs,
+    resolve_ref_oid, retained_closed_prs, trusted_forge_remote,
 };
 use crate::config::Config;
 use crate::engine::{BranchMetadata, Stack};
@@ -351,9 +351,8 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
     // The forge client resolves a token, often with a `gh auth token` process,
     // and loads TLS roots. Build it while ls-remote, the stack load and the
     // status check run.
-    let forge = remote::RemoteInfo::from_repo(&repo, &config)
-        .ok()
-        .map(|remote| std::thread::spawn(move || forge_client(&remote)));
+    let forge = trusted_forge_remote(&repo)
+        .map(|(remote, config)| std::thread::spawn(move || forge_client(&remote, &config)));
     // ls-remote and the status check are git processes that need nothing from
     // each other or from the stack load, so all three run at once.
     let ls_remote = {

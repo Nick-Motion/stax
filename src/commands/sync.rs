@@ -31,23 +31,27 @@ pub(super) const PR_METADATA_REFRESH_CONCURRENCY: usize = 8;
 #[derive(Debug, Default)]
 pub(super) struct SyncHistoryCache {
     patch_ids: HashMap<(String, String), HashSet<String>>,
-    counts: HashMap<(String, String), usize>,
     /// Patch-id by trunk commit. `None` marks a commit with an empty diff.
     commit_patch_ids: HashMap<String, Option<String>>,
     /// `cached_trunk_patch_ids` by merge base, branch tip and trunk tip.
     trunk_patch_ids: HashMap<(String, String, String), HashSet<String>>,
-    /// The last walk of `prefetch_trunk_counts`, kept for later counts.
+    /// The last walk of `trunk_count_within`, kept for later counts.
     trunk_walk: Option<TrunkWalk>,
     /// The last walk of `cached_branch_walk`.
     branch_walk: Option<BranchWalk>,
 }
 
-/// The output of `git rev-list --parents <tip> --not <bound>`.
+/// The output of `git rev-list --parents <tip> --not <tip>~<depth>`, with
+/// `<tip>~<depth>` as the bound, or of `git rev-list --parents <tip>` with no
+/// bound when trunk has no such ancestor.
 #[derive(Debug)]
 struct TrunkWalk {
     tip: String,
-    bound: String,
+    depth: usize,
+    bound: Option<String>,
     rev_list: String,
+    /// `trunk_count_within` by merge base.
+    counts: HashMap<String, Option<usize>>,
 }
 
 /// The output of `git --no-replace-objects rev-list --parents <positives> --not <trunk>`.
@@ -244,30 +248,88 @@ fn cached_trunk_patch_ids(
     Ok(ids)
 }
 
-/// Many branches share a merge-base with trunk, so `merge_base..trunk` counts repeat.
-/// A count that the last trunk walk holds needs no git process.
-fn cached_rev_list_count(
+/// `merge_base..trunk` counted when it holds at most `cap` commits, else
+/// `None`. One walk of trunk's last `cap` first-parent commits answers every
+/// merge base and is kept for later counts. A merge base that does not descend
+/// from `trunk~cap` reaches none of `trunk`, `trunk~1` .. `trunk~cap`, so its
+/// range holds more. A walk down to each merge base took about 20 ms on a
+/// monorepo, where most branches fork far down trunk.
+fn trunk_count_within(
     cache: &mut SyncHistoryCache,
     repo: &GitRepo,
     workdir: &Path,
-    base: &str,
-    head: &str,
-) -> Result<usize> {
-    let key = range_key(repo, base, head);
-    if let Some(count) = cache.counts.get(&key) {
-        return Ok(*count);
-    }
-    let walked = cache
+    merge_base: &str,
+    trunk: &str,
+    cap: usize,
+) -> Result<Option<usize>> {
+    let (merge_base, trunk) = range_key(repo, merge_base, trunk);
+    let reusable = cache
         .trunk_walk
         .as_ref()
-        .filter(|walk| walk.tip == key.1)
-        .and_then(|walk| walk_count(&parent_graph(&walk.rev_list), &walk.bound, &key.0));
-    let count = match walked {
-        Some(count) => count,
-        None => repo.rev_list_count(workdir, &format!("{}..{}", key.0, key.1))?,
-    };
-    cache.counts.insert(key, count);
+        .is_some_and(|walk| walk.tip == trunk && walk.depth == cap);
+    if !reusable {
+        cache.trunk_walk = Some(walk_trunk(workdir, &trunk, cap)?);
+    }
+    let walk = cache
+        .trunk_walk
+        .as_mut()
+        .expect("trunk walk was just stored");
+    if let Some(count) = walk.counts.get(&merge_base) {
+        return Ok(*count);
+    }
+    let parents = parent_graph(&walk.rev_list);
+    let count = match &walk.bound {
+        Some(bound) => walk_count(&parents, bound, &merge_base),
+        None => parents
+            .contains_key(merge_base.as_str())
+            .then(|| parents.len() - reachable(&parents, &merge_base).len()),
+    }
+    .filter(|count| *count <= cap);
+    walk.counts.insert(merge_base, count);
     Ok(count)
+}
+
+/// Trunk's last `depth` first-parent commits with the commits they merged, or
+/// all of trunk when it has no `depth`-th first parent.
+fn walk_trunk(workdir: &Path, tip: &str, depth: usize) -> Result<TrunkWalk> {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(workdir)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    let (bound, rev_list) = match git(&[
+        "rev-list",
+        "--parents",
+        tip,
+        "--not",
+        &format!("{tip}~{depth}"),
+    ]) {
+        Some(rev_list) => {
+            let bound = {
+                let parents = parent_graph(&rev_list);
+                (0..depth)
+                    .try_fold(tip, |commit, _| parents.get(commit)?.first().copied())
+                    .context("Trunk walk lost its first-parent chain")?
+                    .to_string()
+            };
+            (Some(bound), rev_list)
+        }
+        None => (
+            None,
+            git(&["rev-list", "--parents", tip]).context("Failed to walk trunk")?,
+        ),
+    };
+    Ok(TrunkWalk {
+        tip: tip.to_string(),
+        depth,
+        bound,
+        rev_list,
+        counts: HashMap::new(),
+    })
 }
 
 /// `merge_base..tip`, from the commits of `tip --not bound` with their parents.
@@ -286,61 +348,6 @@ fn walk_count(parents: &HashMap<&str, Vec<&str>>, bound: &str, merge_base: &str)
         .then(|| parents.len() - reached.len())
 }
 
-/// Fill the count cache with `merge_base..trunk` for many merge bases at once.
-/// A walk per merge base took about 20 ms on a monorepo, where most branches
-/// fork far down trunk. One walk from trunk down to a common ancestor of all
-/// the merge bases lists every commit that those counts include. The walk is
-/// kept for later counts. Any failure leaves the counts to
-/// `cached_rev_list_count`.
-fn prefetch_trunk_counts(
-    cache: &mut SyncHistoryCache,
-    repo: &GitRepo,
-    workdir: &Path,
-    trunk: &str,
-    merge_bases: &[&str],
-) {
-    let mut keys: Vec<(String, String)> = merge_bases
-        .iter()
-        .map(|merge_base| range_key(repo, merge_base, trunk))
-        .filter(|key| !cache.counts.contains_key(key))
-        .collect();
-    keys.sort();
-    keys.dedup();
-    if keys.len() < 2 {
-        return;
-    }
-    let git = |args: &[&str]| {
-        Command::new("git")
-            .args(args)
-            .current_dir(workdir)
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-    };
-    let mut octopus = vec!["merge-base", "--octopus"];
-    octopus.extend(keys.iter().map(|(base, _)| base.as_str()));
-    let Some(bound) = git(&octopus) else {
-        return;
-    };
-    let bound = bound.trim();
-    let tip = keys[0].1.clone();
-    let Some(rev_list) = git(&["rev-list", "--parents", &tip, "--not", bound]) else {
-        return;
-    };
-    let parents = parent_graph(&rev_list);
-    for key in keys {
-        if let Some(count) = walk_count(&parents, bound, &key.0) {
-            cache.counts.insert(key, count);
-        }
-    }
-    cache.trunk_walk = Some(TrunkWalk {
-        tip,
-        bound: bound.to_string(),
-        rev_list,
-    });
-}
-
 /// The patch-id part of `GitRepo::is_branch_merged_equivalent_to_trunk`, through
 /// the sync-wide history cache. Callers have already tried the cheap ancestry
 /// and tree checks.
@@ -352,8 +359,15 @@ fn cached_patch_equivalent(
     trunk: &str,
     branch: &str,
 ) -> Result<bool> {
-    if cached_rev_list_count(cache, repo, workdir, merge_base, trunk)?
-        > GitRepo::PATCH_ID_TRUNK_COMMIT_CAP
+    if trunk_count_within(
+        cache,
+        repo,
+        workdir,
+        merge_base,
+        trunk,
+        GitRepo::PATCH_ID_TRUNK_COMMIT_CAP,
+    )?
+    .is_none()
     {
         return Ok(false);
     }
@@ -4343,8 +4357,6 @@ fn find_merged_branches_with_prs_after_enumeration(
         }
     }
 
-    let merge_bases: Vec<&str> = need_patch_id.iter().map(|(_, mb)| mb.as_str()).collect();
-    prefetch_trunk_counts(history_cache, repo, workdir, trunk, &merge_bases);
     for (branch, merge_base) in need_patch_id {
         if cached_patch_equivalent(history_cache, repo, workdir, &merge_base, trunk, &branch)
             .unwrap_or(false)
@@ -4422,12 +4434,17 @@ pub(super) fn find_partially_merged_notes(
             let Ok(merge_base) = repo.merge_base(&trunk, &branch) else {
                 continue;
             };
-            let trunk_count =
-                match cached_rev_list_count(history_cache, repo, workdir, &merge_base, &trunk) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-            if trunk_count == 0 || trunk_count > GitRepo::PATCH_ID_TRUNK_COMMIT_CAP {
+            let Ok(Some(trunk_count)) = trunk_count_within(
+                history_cache,
+                repo,
+                workdir,
+                &merge_base,
+                &trunk,
+                GitRepo::PATCH_ID_TRUNK_COMMIT_CAP,
+            ) else {
+                continue;
+            };
+            if trunk_count == 0 {
                 continue;
             }
             let branch_patch_ids =
@@ -6154,7 +6171,7 @@ mod tests {
     }
 
     #[test]
-    fn prefetched_trunk_counts_match_rev_list_across_a_merged_side_branch() {
+    fn trunk_counts_within_the_cap_match_rev_list_across_a_merged_side_branch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         let run = |args: &[&str]| {
@@ -6190,32 +6207,32 @@ mod tests {
         run(&["switch", "main"]);
         let before_merge = commit("m2.txt");
         run(&["merge", "--no-ff", "-m", "merge side", "side"]);
+        let merge = run(&["rev-parse", "HEAD"]);
         let tip = commit("m3.txt");
 
         let repo = GitRepo::open_from_path(path).unwrap();
-        let mut cache = SyncHistoryCache::default();
-        let merge_bases = [&base, &side, &before_merge, &tip, &unmerged].map(String::as_str);
-        prefetch_trunk_counts(&mut cache, &repo, path, "main", &merge_bases);
-        let counts = merge_bases.map(|merge_base| {
-            cache
-                .counts
-                .get(&range_key(&repo, merge_base, "main"))
-                .copied()
-        });
-        assert_eq!(counts, [Some(6), Some(4), Some(4), Some(0), None]);
-
-        // The walk down to `before_merge` holds the range of the merge commit,
-        // and not the range of `side`, which forks below `before_merge`.
-        let mut cache = SyncHistoryCache::default();
-        prefetch_trunk_counts(&mut cache, &repo, path, "main", &[&before_merge, &tip]);
-        let merge = run(&["rev-parse", "main~1"]);
         let no_repo = tempfile::tempdir().unwrap();
-        let mut count = |merge_base: &str, head: &str, workdir: &Path| {
-            cached_rev_list_count(&mut cache, &repo, workdir, merge_base, head).ok()
-        };
-        assert_eq!(count(&merge, "main", no_repo.path()), Some(1));
-        assert_eq!(count(&side, "main", path), Some(4));
-        assert_eq!(count(&merge, "side", path), Some(0));
+        let merge_bases = [&base, &side, &before_merge, &merge, &tip, &unmerged];
+        let mut cache = SyncHistoryCache::default();
+        // `git rev-list --count <merge base>..main` gives 6, 4, 4, 1 and 0. Trunk
+        // has no 200th first parent, so that cap walks all of trunk.
+        for (cap, expected) in [
+            (1, [None, None, None, Some(1), Some(0), None]),
+            (2, [None, None, None, Some(1), Some(0), None]),
+            (4, [None, Some(4), Some(4), Some(1), Some(0), None]),
+            (200, [Some(6), Some(4), Some(4), Some(1), Some(0), None]),
+        ] {
+            // Only the first count of each cap walks trunk.
+            let counts: Vec<_> = merge_bases
+                .iter()
+                .enumerate()
+                .map(|(i, merge_base)| {
+                    let workdir = if i == 0 { path } else { no_repo.path() };
+                    trunk_count_within(&mut cache, &repo, workdir, merge_base, "main", cap).unwrap()
+                })
+                .collect();
+            assert_eq!(counts, expected, "cap {cap}");
+        }
     }
 
     #[test]

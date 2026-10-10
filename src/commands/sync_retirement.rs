@@ -22,6 +22,29 @@ pub(crate) struct BbEnvironmentIdentity {
 /// Version 2 adds `bundle_prerequisites`; version 1 artifacts are full bundles.
 const RECOVERY_MANIFEST_VERSION: u32 = 2;
 
+// Patches are compared byte-for-byte and replayed with `git apply`, so user diff
+// config (mnemonicPrefix, noprefix, color, external diff, textconv) must not shape them.
+const UNSTAGED_PATCH_ARGS: [&str; 7] = [
+    "diff",
+    "--binary",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+];
+const STAGED_PATCH_ARGS: [&str; 9] = [
+    "diff",
+    "--binary",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "--cached",
+    "HEAD",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RecoveryManifest {
     version: u32,
@@ -444,13 +467,13 @@ fn save_recovery_with_sync(
     let unstaged_patch = "unstaged.patch".to_string();
     write_git_output(
         &worktree,
-        &["diff", "--cached", "--binary", "HEAD"],
+        &STAGED_PATCH_ARGS,
         &directory.join(&staged_patch),
     )?;
     sync_file(&directory.join(&staged_patch))?;
     write_git_output(
         &worktree,
-        &["diff", "--binary"],
+        &UNSTAGED_PATCH_ARGS,
         &directory.join(&unstaged_patch),
     )?;
     sync_file(&directory.join(&unstaged_patch))?;
@@ -538,9 +561,9 @@ pub(crate) fn verify_recovery(recovery: &RecoveryReady, worktree_path: &Path) ->
         bail!("branch head or checkout changed after recovery; retry sync");
     }
 
-    let staged = git_output(&worktree, &["diff", "--cached", "--binary", "HEAD"])?;
+    let staged = git_output(&worktree, &STAGED_PATCH_ARGS)?;
     let archived_staged = std::fs::read(recovery.directory.join(&manifest.staged_patch))?;
-    let unstaged = git_output(&worktree, &["diff", "--binary"])?;
+    let unstaged = git_output(&worktree, &UNSTAGED_PATCH_ARGS)?;
     let archived_unstaged = std::fs::read(recovery.directory.join(&manifest.unstaged_patch))?;
     if staged != archived_staged || unstaged != archived_unstaged {
         bail!("tracked work changed after recovery; target retained for retry");
@@ -1091,6 +1114,27 @@ else: fail()
         .unwrap();
         assert!(cli.run_until(&[], Instant::now()).is_err());
         assert!(!marker.exists(), "expired deadline still spawned a process");
+    }
+
+    #[test]
+    fn recovery_patches_ignore_user_diff_prefix_config() {
+        let dir = fixture();
+        let repo = dir.path();
+        fs::write(repo.join("tracked.txt"), "staged\n").unwrap();
+        git(repo, &["add", "tracked.txt"]);
+        fs::write(repo.join("tracked.txt"), "unstaged\n").unwrap();
+        let head = String::from_utf8(git_output(repo, &["rev-parse", "HEAD"]).unwrap())
+            .unwrap()
+            .trim()
+            .to_string();
+        git(repo, &["config", "diff.noprefix", "true"]);
+        let ready =
+            save_recovery(&repo.join(".git"), repo, "op-test-1", "topic", &head, &[]).unwrap();
+
+        git(repo, &["config", "--unset", "diff.noprefix"]);
+        git(repo, &["config", "diff.mnemonicPrefix", "true"]);
+
+        verify_recovery(&ready, repo).unwrap();
     }
 
     #[test]

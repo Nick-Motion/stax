@@ -28,6 +28,17 @@ pub struct Stack {
 impl Stack {
     /// Load the stack from git metadata
     pub fn load(repo: &GitRepo) -> Result<Self> {
+        Self::load_inner(repo, true)
+    }
+
+    /// Like [`Stack::load`], but `needs_restack` stays false except on
+    /// orphaned branches. The check walks each branch's history, which costs
+    /// milliseconds per branch when libgit2 cannot read the commit-graph.
+    pub fn load_without_restack_check(repo: &GitRepo) -> Result<Self> {
+        Self::load_inner(repo, false)
+    }
+
+    fn load_inner(repo: &GitRepo, check_restack: bool) -> Result<Self> {
         let trunk = repo.trunk_branch()?;
         let tracked_branches = refs::list_metadata_branches(repo.inner())?;
 
@@ -46,9 +57,10 @@ impl Stack {
             }
 
             if let Some(meta) = BranchMetadata::read(repo.inner(), branch_name)? {
-                let needs_restack = meta
-                    .needs_restack(repo.inner(), branch_name)
-                    .unwrap_or(false);
+                let needs_restack = check_restack
+                    && meta
+                        .needs_restack(repo.inner(), branch_name)
+                        .unwrap_or(false);
                 branches.insert(
                     branch_name.clone(),
                     StackBranch {

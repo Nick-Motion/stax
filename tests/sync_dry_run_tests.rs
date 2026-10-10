@@ -211,12 +211,15 @@ fn dry_run_remote_probe_does_not_update_fetch_head_or_tracking_refs() {
 fn dry_run_restack_lists_stale_branches_without_rewriting_refs() {
     let repo = TestRepo::new_with_remote();
 
-    // Build stack: main → feat-c; push main to remote so trunk can be probed.
+    // Build stack: main → feat-b → feat-c; push main to remote so trunk can be
+    // probed. A new commit on feat-b leaves feat-c stale.
     repo.git(&["push", "-u", "origin", "main"]);
-    repo.run_stax(&["bc", "feat-c"]);
-    let feature = repo.current_branch();
-    repo.create_file("c.txt", "c");
-    repo.commit("C commit");
+    let branches = repo.create_stack(&["feat-b", "feat-c"]);
+    let feature = &branches[1];
+    repo.git(&["checkout", &branches[0]]);
+    repo.create_file("b2.txt", "b2");
+    repo.commit("B2 commit");
+    repo.git(&["checkout", feature]);
 
     let sha_before =
         resolve_ref(&repo, &format!("refs/heads/{feature}")).expect("feat-c should exist");
@@ -228,6 +231,11 @@ fn dry_run_restack_lists_stale_branches_without_rewriting_refs() {
         out.status.success(),
         "--dry-run --restack should exit 0; stderr: {}",
         TestRepo::stderr(&out)
+    );
+    let stdout = TestRepo::stdout(&out);
+    assert!(
+        stdout.contains(&format!("1 branch(es) would restack:\n    ▸ {feature}\n")),
+        "--dry-run --restack should list only feat-c; stdout: {stdout}"
     );
 
     // SHAs must be byte-identical after the command.

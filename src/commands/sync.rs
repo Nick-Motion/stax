@@ -38,6 +38,8 @@ pub(super) struct SyncHistoryCache {
     trunk_patch_ids: HashMap<(String, String, String), HashSet<String>>,
     /// The last walk of `prefetch_trunk_counts`, kept for later counts.
     trunk_walk: Option<TrunkWalk>,
+    /// The last walk of `cached_branch_walk`.
+    branch_walk: Option<BranchWalk>,
 }
 
 /// The output of `git rev-list --parents <tip> --not <bound>`.
@@ -46,6 +48,97 @@ struct TrunkWalk {
     tip: String,
     bound: String,
     rev_list: String,
+}
+
+/// The output of `git --no-replace-objects rev-list --parents <positives> --not <trunk>`.
+#[derive(Debug)]
+struct BranchWalk {
+    trunk: String,
+    positives: HashSet<String>,
+    rev_list: String,
+}
+
+/// The commit `name` resolves to.
+fn commit_oid(repo: &GitRepo, name: &str) -> Option<String> {
+    repo.inner()
+        .revparse_single(&format!("{name}^{{commit}}"))
+        .ok()
+        .map(|commit| commit.id().to_string())
+}
+
+/// The commits that `positives` reach but `trunk` does not, with their parents.
+/// A walk with the same trunk and a superset of the positives answers too, so
+/// the merged scan and the notes pass share one walk of the whole stack.
+fn cached_branch_walk<'c>(
+    cache: &'c mut SyncHistoryCache,
+    workdir: &Path,
+    trunk: &str,
+    positives: &[&str],
+) -> Result<Option<&'c str>> {
+    let reusable = cache.branch_walk.as_ref().is_some_and(|walk| {
+        walk.trunk == trunk && positives.iter().all(|oid| walk.positives.contains(*oid))
+    });
+    if !reusable {
+        // libgit2 ignores replace refs, and merge bases taken from this walk
+        // must agree with its walks.
+        let mut args = vec!["--no-replace-objects", "rev-list", "--parents"];
+        args.extend(positives);
+        args.extend(["--not", trunk]);
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(workdir)
+            .output()
+            .context("Failed to walk branch history")?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        cache.branch_walk = Some(BranchWalk {
+            trunk: trunk.to_string(),
+            positives: positives.iter().map(|oid| oid.to_string()).collect(),
+            rev_list: String::from_utf8_lossy(&output.stdout).into_owned(),
+        });
+    }
+    Ok(cache
+        .branch_walk
+        .as_ref()
+        .map(|walk| walk.rev_list.as_str()))
+}
+
+/// Walk every tracked branch, its remote-tracking branch and the remote trunk
+/// once. Each branch's trunk merge base comes from this walk, and
+/// `count_extra_commits` reuses it.
+fn prefetch_stack_walk(
+    cache: &mut SyncHistoryCache,
+    repo: &GitRepo,
+    workdir: &Path,
+    stack: &Stack,
+    remote_name: &str,
+) {
+    let Some(trunk) = commit_oid(repo, &stack.trunk) else {
+        return;
+    };
+    let branches = stack
+        .branches
+        .keys()
+        .filter(|branch| **branch != stack.trunk);
+    let tips: Vec<String> = branches
+        .clone()
+        .filter_map(|branch| commit_oid(repo, branch))
+        .collect();
+    let remotes: Vec<String> = branches
+        .map(|branch| format!("{remote_name}/{branch}"))
+        .chain([format!("{remote_name}/{}", stack.trunk)])
+        .filter_map(|remote| commit_oid(repo, &remote))
+        .collect();
+    let positives: Vec<&str> = tips.iter().chain(&remotes).map(String::as_str).collect();
+    let Ok(Some(walk)) = cached_branch_walk(cache, workdir, &trunk, &positives) else {
+        return;
+    };
+    let oid = |hex: &String| git2::Oid::from_str(hex).ok();
+    let tips: Vec<git2::Oid> = tips.iter().filter_map(oid).collect();
+    if let Some(trunk) = oid(&trunk) {
+        repo.remember_merge_bases(trunk, walk, &tips);
+    }
 }
 
 /// Resolve a `base..head` range to object ids, so cache entries stay valid
@@ -4199,7 +4292,7 @@ fn find_merged_branches_with_prs_after_enumeration(
         }
         candidates.push(branch);
     }
-    repo.prefetch_merge_bases(trunk, &candidates);
+    prefetch_stack_walk(history_cache, repo, workdir, stack, remote_name);
     for branch in candidates {
         match repo.is_branch_merged_cheap(branch) {
             Ok(Some(())) => {
@@ -4276,6 +4369,7 @@ pub(super) fn find_partially_merged_notes(
         .filter(|branch| *branch != trunk && !merged.iter().any(|m| m.branch == *branch))
         .collect();
     let extra_counts = count_extra_commits(
+        history_cache,
         repo,
         workdir,
         &trunk,
@@ -4358,6 +4452,7 @@ pub(super) fn find_partially_merged_notes(
 /// gets 0 where its own `git rev-list` would fail: its ref does not resolve, or
 /// `remote_branches` lists it but its remote ref does not resolve.
 fn count_extra_commits(
+    cache: &mut SyncHistoryCache,
     repo: &GitRepo,
     workdir: &Path,
     trunk: &str,
@@ -4365,12 +4460,7 @@ fn count_extra_commits(
     remote_branches: &HashSet<String>,
     branches: &[&str],
 ) -> Result<Vec<usize>> {
-    let resolve = |name: &str| {
-        repo.inner()
-            .revparse_single(&format!("{name}^{{commit}}"))
-            .ok()
-            .map(|commit| commit.id().to_string())
-    };
+    let resolve = |name: &str| commit_oid(repo, name);
     let tips: Vec<Option<(String, Option<String>)>> = branches
         .iter()
         .map(|branch| {
@@ -4381,7 +4471,7 @@ fn count_extra_commits(
             Some((resolve(branch)?, remote))
         })
         .collect();
-    let positives: Vec<&str> = tips
+    let mut positives: Vec<&str> = tips
         .iter()
         .flatten()
         .flat_map(|(tip, remote)| std::iter::once(tip.as_str()).chain(remote.as_deref()))
@@ -4393,23 +4483,18 @@ fn count_extra_commits(
     if positives.is_empty() {
         return Ok(zeros);
     }
+    // The shared walk excludes only trunk, so the remote trunk's commits are
+    // listed and subtracted here.
     let remote_trunk_oid = resolve(&format!("{remote_name}/{trunk}"));
-    let mut args = vec!["rev-list", "--parents"];
-    args.extend(positives);
-    args.push("--not");
-    args.push(&trunk_oid);
-    args.extend(remote_trunk_oid.as_deref());
-
-    let output = Command::new("git")
-        .args(&args)
-        .current_dir(workdir)
-        .output()
-        .context("Failed to count extra commits")?;
-    if !output.status.success() {
+    positives.extend(remote_trunk_oid.as_deref());
+    let Some(walk) = cached_branch_walk(cache, workdir, &trunk_oid, &positives)? else {
         return Ok(zeros);
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parents = parent_graph(&stdout);
+    };
+    let parents = parent_graph(walk);
+    let on_remote_trunk = remote_trunk_oid
+        .as_deref()
+        .map(|remote_trunk| reachable(&parents, remote_trunk))
+        .unwrap_or_default();
     Ok(tips
         .iter()
         .map(|tip| {
@@ -4420,7 +4505,10 @@ fn count_extra_commits(
                 .as_deref()
                 .map(|remote| reachable(&parents, remote))
                 .unwrap_or_default();
-            reachable(&parents, tip).difference(&on_remote).count()
+            reachable(&parents, tip)
+                .into_iter()
+                .filter(|commit| !on_remote.contains(commit) && !on_remote_trunk.contains(commit))
+                .count()
         })
         .collect())
 }
@@ -6003,7 +6091,9 @@ mod tests {
         run(&["config", "user.name", "Test"]);
         commit("base.txt");
         run(&["switch", "-c", "on-remote-trunk"]);
-        let remote_trunk = commit("remote-trunk.txt");
+        commit("remote-trunk.txt");
+        // No branch reaches the remote trunk, so only a walk from it lists it.
+        let remote_trunk = run(&["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "later"]);
         run(&["update-ref", "refs/remotes/origin/main", &remote_trunk]);
         run(&["switch", "-c", "ahead", "main"]);
         commit("a1.txt");
@@ -6021,10 +6111,25 @@ mod tests {
         let repo = GitRepo::open_from_path(path).unwrap();
         let branches = ["ahead", "pushed", "on-remote-trunk", "unfetched", "merging"];
         let remote_branches = HashSet::from(["unfetched".to_string()]);
-        let counts =
-            count_extra_commits(&repo, path, "main", "origin", &remote_branches, &branches)
-                .unwrap();
-        assert_eq!(counts, [2, 1, 0, 0, 4]);
+        let mut cache = SyncHistoryCache::default();
+        let mut counts = |branches: &[&str]| {
+            count_extra_commits(
+                &mut cache,
+                &repo,
+                path,
+                "main",
+                "origin",
+                &remote_branches,
+                branches,
+            )
+            .unwrap()
+        };
+        assert_eq!(counts(&["ahead"]), [2]);
+        // The cached walk lists none of the other branches' commits.
+        assert_eq!(counts(&branches), [2, 1, 0, 0, 4]);
+        // Nor does it know that trunk now has ahead's commits.
+        run(&["update-ref", "refs/heads/main", "ahead"]);
+        assert_eq!(counts(&["ahead", "merging"]), [0, 2]);
     }
 
     #[test]

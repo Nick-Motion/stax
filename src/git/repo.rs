@@ -546,11 +546,16 @@ impl GitRepo {
                         })
                 })
                 .and_then(|repo| {
-                    repo.find_reference(&format!("worktrees/{name}/HEAD"))
-                        .ok()
-                        .and_then(|head| head.resolve().ok())
-                        .filter(|head| head.is_branch())
-                        .and_then(|head| head.shorthand().ok().map(str::to_string))
+                    let head = repo
+                        .find_reference(&format!("worktrees/{name}/HEAD"))
+                        .ok()?;
+                    let target = head
+                        .symbolic_target()
+                        .ok()?
+                        .filter(|target| target.starts_with("refs/heads/"))?;
+                    let branch = repo.find_reference(target).ok()?;
+                    branch.target()?;
+                    branch.shorthand().ok().map(str::to_string)
                 })
                 .or_else(|| {
                     Repository::open(worktree.path()).ok().and_then(|repo| {
@@ -3196,6 +3201,55 @@ mod tests {
         );
         run_git(&linked, &["switch", "--detach"]);
         assert!(repo.linked_worktree_names_by_branch().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_linked_worktree_names_resolve_private_symbolic_refs_in_worktree() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+        run_git(path, &["init", "-b", "main"]);
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test"]);
+        run_git(path, &["commit", "--allow-empty", "-m", "initial"]);
+        let linked = path.join("linked");
+        run_git(
+            path,
+            &["worktree", "add", "-b", "feature", linked.to_str().unwrap()],
+        );
+        run_git(path, &["branch", "wrong"]);
+        run_git(
+            path,
+            &["symbolic-ref", "refs/worktree/current", "refs/heads/wrong"],
+        );
+        run_git(
+            &linked,
+            &[
+                "symbolic-ref",
+                "refs/worktree/current",
+                "refs/heads/feature",
+            ],
+        );
+        run_git(
+            path,
+            &["symbolic-ref", "refs/heads/alias", "refs/worktree/current"],
+        );
+
+        for target in ["refs/worktree/current", "refs/heads/alias"] {
+            run_git(&linked, &["symbolic-ref", "HEAD", target]);
+            let slow = Repository::open(&linked).unwrap();
+            let head = slow.head().unwrap();
+            let branch = head.shorthand().unwrap();
+            assert_eq!(branch, "feature");
+            assert_eq!(
+                run_git_capture(&linked, &["symbolic-ref", "HEAD"]).trim(),
+                format!("refs/heads/{branch}")
+            );
+            let repo = GitRepo::open_from_path(path).unwrap();
+            assert_eq!(
+                repo.linked_worktree_names_by_branch().unwrap(),
+                HashMap::from([(branch.to_string(), "linked".to_string())])
+            );
+        }
     }
 
     #[test]

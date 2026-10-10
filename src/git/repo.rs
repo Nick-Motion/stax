@@ -1400,20 +1400,15 @@ impl GitRepo {
         Ok(merged_tree == base_tree)
     }
 
-    fn run_patch_id_from_input(&self, cwd: &Path, input: &[u8]) -> Result<Vec<String>> {
-        Ok(self
-            .run_patch_id_pairs_from_input(cwd, input)?
+    fn run_patch_id_from_input(cwd: &Path, input: &[u8]) -> Result<Vec<String>> {
+        Ok(Self::run_patch_id_pairs_from_input(cwd, input)?
             .into_iter()
             .map(|(patch_id, _)| patch_id)
             .collect())
     }
 
     /// Run `git patch-id --stable` and return `(patch_id, commit_id)` pairs.
-    fn run_patch_id_pairs_from_input(
-        &self,
-        cwd: &Path,
-        input: &[u8],
-    ) -> Result<Vec<(String, String)>> {
+    fn run_patch_id_pairs_from_input(cwd: &Path, input: &[u8]) -> Result<Vec<(String, String)>> {
         let mut patch_id = Command::new("git")
             .args(["patch-id", "--stable"])
             .current_dir(cwd)
@@ -1484,8 +1479,8 @@ impl GitRepo {
             .unwrap_or(0))
     }
 
-    pub(crate) fn patch_ids_for_range(&self, cwd: &Path, range: &str) -> Result<HashSet<String>> {
-        let output = self.run_git(cwd, &["log", "--format=%H", "-p", "--no-merges", range])?;
+    pub(crate) fn patch_ids_for_range(cwd: &Path, range: &str) -> Result<HashSet<String>> {
+        let output = run_git_in(cwd, &["log", "--format=%H", "-p", "--no-merges", range])?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             anyhow::bail!(
@@ -1495,8 +1490,7 @@ impl GitRepo {
             );
         }
 
-        Ok(self
-            .run_patch_id_from_input(cwd, &output.stdout)?
+        Ok(Self::run_patch_id_from_input(cwd, &output.stdout)?
             .into_iter()
             .collect())
     }
@@ -1514,7 +1508,7 @@ impl GitRepo {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             anyhow::bail!("git log -p --no-walk failed: {}", stderr);
         }
-        self.run_patch_id_pairs_from_input(cwd, &output.stdout)
+        Self::run_patch_id_pairs_from_input(cwd, &output.stdout)
     }
 
     /// Paths changed by the non-merge commits in `range`, rename sources included.
@@ -1666,10 +1660,10 @@ impl GitRepo {
         if !log.status.success() {
             return Ok(None);
         }
-        let trunk_patch_ids: HashMap<String, String> = self
-            .run_patch_id_pairs_from_input(cwd, &log.stdout)?
-            .into_iter()
-            .collect();
+        let trunk_patch_ids: HashMap<String, String> =
+            Self::run_patch_id_pairs_from_input(cwd, &log.stdout)?
+                .into_iter()
+                .collect();
         if trunk_patch_ids.is_empty() {
             return Ok(None);
         }
@@ -1691,7 +1685,7 @@ impl GitRepo {
             if !diff.status.success() {
                 continue;
             }
-            let patch_ids = self.run_patch_id_pairs_from_input(cwd, &diff.stdout)?;
+            let patch_ids = Self::run_patch_id_pairs_from_input(cwd, &diff.stdout)?;
             let Some((patch_id, _)) = patch_ids.first() else {
                 continue;
             };
@@ -2476,7 +2470,7 @@ Use --auto-stash-pop or stash/commit changes first.",
 
         let cwd = self.workdir()?;
         let branch_range = format!("{}..{}", merge_base, branch);
-        let branch_patch_ids = self.patch_ids_for_range(cwd, &branch_range)?;
+        let branch_patch_ids = Self::patch_ids_for_range(cwd, &branch_range)?;
         if branch_patch_ids.is_empty() {
             return Ok(true);
         }
@@ -2487,7 +2481,7 @@ Use --auto-stash-pop or stash/commit changes first.",
             return Ok(false);
         }
 
-        let trunk_patch_ids = self.patch_ids_for_range(cwd, &trunk_range)?;
+        let trunk_patch_ids = Self::patch_ids_for_range(cwd, &trunk_range)?;
         if trunk_patch_ids.is_empty() {
             return Ok(false);
         }

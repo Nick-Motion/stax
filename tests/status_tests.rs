@@ -86,3 +86,70 @@ fn status_labels_missing_parent_instead_of_needs_restack() {
         "missing-parent-only status should not suggest restack, got: {stdout}"
     );
 }
+
+#[test]
+fn status_json_reuses_line_diff_cache_and_invalidates_moved_tips() {
+    let repo = TestRepo::new();
+    repo.run_stax(&["bc", "cached-lines"]).assert_success();
+    let branch = repo.current_branch();
+    repo.create_file("lines.txt", "one\ntwo\n");
+    repo.commit("Add two lines");
+    let cold = repo.run_stax(&["status", "--json"]);
+    cold.assert_success();
+    let cold_json: Value = serde_json::from_slice(&cold.stdout).unwrap();
+    let entry = cold_json["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == branch)
+        .unwrap();
+    assert_eq!(entry["lines_added"], 2);
+    assert_eq!(entry["lines_deleted"], 0);
+    let cache_path = repo.path().join(".git/stax/line-diff-cache.json");
+    let cached = std::fs::read(&cache_path).unwrap();
+    let cache: Value = serde_json::from_slice(&cached).unwrap();
+    assert_eq!(cache["entries"].as_object().unwrap().len(), 1);
+    let timestamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+    std::fs::File::options()
+        .write(true)
+        .open(&cache_path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(timestamp))
+        .unwrap();
+    let warm = repo.run_stax(&["status", "--json"]);
+    warm.assert_success();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&warm.stdout).unwrap(),
+        cold_json
+    );
+    assert_eq!(std::fs::read(&cache_path).unwrap(), cached);
+    assert_eq!(
+        std::fs::metadata(&cache_path).unwrap().modified().unwrap(),
+        timestamp
+    );
+
+    repo.create_file("lines.txt", "one\ntwo\nthree\n");
+    repo.commit("Add another line");
+    let moved = repo.run_stax(&["status", "--json"]);
+    moved.assert_success();
+    let moved_json: Value = serde_json::from_slice(&moved.stdout).unwrap();
+    let entry = moved_json["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == branch)
+        .unwrap();
+    assert_eq!(entry["lines_added"], 3);
+    let moved_cache: Value = serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+    assert_eq!(moved_cache["entries"].as_object().unwrap().len(), 1);
+    assert_ne!(moved_cache, cache);
+
+    std::fs::remove_file(&cache_path).unwrap();
+    std::fs::create_dir(&cache_path).unwrap();
+    let failed_save = repo.run_stax(&["status", "--json"]);
+    failed_save.assert_success();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&failed_save.stdout).unwrap(),
+        moved_json
+    );
+}

@@ -1,4 +1,4 @@
-use crate::cache::CiCache;
+use crate::cache::{CiCache, LineDiffCache};
 use crate::commands::stack_palette;
 use crate::config::Config;
 use crate::engine::{Stack, StackSnapshot};
@@ -205,7 +205,7 @@ pub fn run(
         })
         .collect::<Vec<_>>();
     let line_diff_stats = if json {
-        get_line_diff_stats_many(workdir, &line_diff_pairs)
+        get_line_diff_stats_many(&repo, workdir, &cache_dir, &line_diff_pairs)
     } else {
         vec![(0, 0); ordered_branches.len()]
     };
@@ -652,14 +652,57 @@ fn collect_missing_parent_branches(repo: &GitRepo, stack: &Stack) -> HashMap<Str
 
 /// Get line additions and deletions between parent and branch
 fn get_line_diff_stats_many(
+    repo: &GitRepo,
     workdir: &Path,
+    git_dir: &Path,
     branch_pairs: &[Option<(String, String)>],
 ) -> Vec<(usize, usize)> {
-    crate::parallel::map_ordered(branch_pairs, |pair| {
-        pair.as_ref()
-            .and_then(|(parent, branch)| get_line_diff_stats(workdir, parent, branch))
-            .unwrap_or((0, 0))
-    })
+    let shas: Vec<_> = branch_pairs
+        .iter()
+        .map(|pair| {
+            let (parent, branch) = pair.as_ref()?;
+            repo.resolve_ref(parent)
+                .ok()
+                .zip(repo.resolve_ref(branch).ok())
+        })
+        .collect();
+    let keys: Vec<_> = shas
+        .iter()
+        .map(|pair| {
+            pair.as_ref()
+                .map(|(parent, branch)| format!("{parent}:{branch}"))
+        })
+        .collect();
+    // shortcut: later Git diff config changes are not detected, delete the cache to recompute.
+    let mut cache = LineDiffCache::load(git_dir);
+    let old_len = cache.entries.len();
+    cache.prune(&keys.iter().flatten().cloned().collect());
+    let mut dirty = cache.entries.len() != old_len;
+    let mut results = vec![(0, 0); branch_pairs.len()];
+    let mut misses = Vec::new();
+    for (idx, pair) in branch_pairs.iter().enumerate() {
+        if let Some(cached) = keys[idx].as_ref().and_then(|key| cache.entries.get(key)) {
+            results[idx] = *cached;
+        } else if let Some((parent, branch)) = shas[idx].as_ref().or(pair.as_ref()) {
+            misses.push((idx, parent, branch));
+        }
+    }
+    let computed = crate::parallel::map_ordered(&misses, |(_, parent, branch)| {
+        get_line_diff_stats(workdir, parent, branch)
+    });
+    for ((idx, _, _), stats) in misses.iter().zip(computed) {
+        if let Some(stats) = stats {
+            results[*idx] = stats;
+            if let Some(key) = &keys[*idx] {
+                cache.entries.insert(key.clone(), stats);
+                dirty = true;
+            }
+        }
+    }
+    if dirty {
+        let _ = cache.save(git_dir);
+    }
+    results
 }
 
 fn get_line_diff_stats(workdir: &Path, parent: &str, branch: &str) -> Option<(usize, usize)> {

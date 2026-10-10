@@ -107,26 +107,30 @@ fn cached_branch_walk<'c>(
 /// Walk every tracked branch, its recorded parent, its remote-tracking branch
 /// and the remote trunk once. Each branch's trunk merge base, and whether its
 /// recorded parent descends from it, come from this walk, and
-/// `count_extra_commits` reuses it.
-fn prefetch_stack_walk(
+/// `count_extra_commits` reuses it. Returns the tracked branches whose tips
+/// trunk reaches, one `<branch> <tip>` line each, as `git for-each-ref
+/// --merged <trunk> --format='%(refname:short) %(objectname)'` lists them.
+fn walk_stack(
     cache: &mut SyncHistoryCache,
     repo: &GitRepo,
     workdir: &Path,
     stack: &Stack,
     remote_name: &str,
-) {
-    let Some(trunk) = commit_oid(repo, &stack.trunk) else {
-        return;
-    };
+) -> Option<String> {
+    let trunk = commit_oid(repo, &stack.trunk)?;
     let branches = stack
         .branches
         .iter()
         .filter(|(branch, _)| **branch != stack.trunk);
-    let tips: Vec<(git2::Oid, Option<git2::Oid>)> = branches
+    let tips: Vec<(&str, git2::Oid, Option<git2::Oid>)> = branches
         .clone()
         .filter_map(|(branch, info)| {
-            let parent = commit_oid(repo, recorded_parent(stack, info));
-            Some((commit_oid(repo, branch)?, parent))
+            let tip = commit_oid(repo, &format!("refs/heads/{branch}"))?;
+            Some((
+                branch.as_str(),
+                tip,
+                commit_oid(repo, recorded_parent(stack, info)),
+            ))
         })
         .collect();
     let remotes = branches
@@ -135,21 +139,28 @@ fn prefetch_stack_walk(
         .filter_map(|remote| commit_oid(repo, &remote));
     let positives: Vec<String> = tips
         .iter()
-        .flat_map(|&(tip, parent)| std::iter::once(tip).chain(parent))
+        .flat_map(|&(_, tip, parent)| std::iter::once(tip).chain(parent))
         .chain(remotes)
         .map(|oid| oid.to_string())
         .collect();
     let positives: Vec<&str> = positives.iter().map(String::as_str).collect();
-    let Ok(Some(walk)) = cached_branch_walk(cache, workdir, &trunk.to_string(), &positives) else {
-        return;
-    };
-    let branch_tips: Vec<git2::Oid> = tips.iter().map(|&(tip, _)| tip).collect();
+    let walk = cached_branch_walk(cache, workdir, &trunk.to_string(), &positives)
+        .ok()
+        .flatten()?;
+    let branch_tips: Vec<git2::Oid> = tips.iter().map(|&(_, tip, _)| tip).collect();
     repo.remember_merge_bases(trunk, walk, &branch_tips);
     let pairs: Vec<(git2::Oid, git2::Oid)> = tips
         .iter()
-        .filter_map(|&(tip, parent)| Some((parent?, tip)))
+        .filter_map(|&(_, tip, parent)| Some((parent?, tip)))
         .collect();
     repo.remember_descendants(walk, &pairs);
+    let unmerged = parent_graph(walk);
+    Some(
+        tips.iter()
+            .filter(|(_, tip, _)| !unmerged.contains_key(tip.to_string().as_str()))
+            .map(|(branch, tip, _)| format!("{branch} {tip}\n"))
+            .collect(),
+    )
 }
 
 /// Resolve a `base..head` range to object ids, so cache entries stay valid
@@ -4131,19 +4142,23 @@ fn find_merged_branches_with_prs_after_enumeration(
 
     // Method 1: Git ancestry is merge proof only for branches without a PR
     // linkage. Linked branches need a fresh forge merge state and exact head.
-    let output = Command::new("git")
-        .args([
-            "for-each-ref",
-            "--merged",
-            &stack.trunk,
-            "--format=%(refname:short) %(objectname)",
-            "refs/heads",
-        ])
-        .current_dir(workdir)
-        .output()
-        .context("Failed to list merged branches")?;
-
-    let merged_output = String::from_utf8_lossy(&output.stdout);
+    let merged_output = match walk_stack(history_cache, repo, workdir, stack, remote_name) {
+        Some(listing) => listing,
+        None => {
+            let output = Command::new("git")
+                .args([
+                    "for-each-ref",
+                    "--merged",
+                    &stack.trunk,
+                    "--format=%(refname:short) %(objectname)",
+                    "refs/heads",
+                ])
+                .current_dir(workdir)
+                .output()
+                .context("Failed to list merged branches")?;
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+    };
     after_enumeration(&stack.trunk, &merged_output);
 
     for line in merged_output.lines() {
@@ -4279,7 +4294,6 @@ fn find_merged_branches_with_prs_after_enumeration(
     let trunk = stack.trunk.as_str();
     let mut need_patch_id: Vec<(String, String)> = Vec::new();
 
-    prefetch_stack_walk(history_cache, repo, workdir, stack, remote_name);
     let mut candidates: Vec<&str> = Vec::new();
     for branch in stack.branches.keys() {
         if branch == &stack.trunk
@@ -6293,9 +6307,23 @@ mod tests {
         };
         let expected = [true, false, true, true, false, false, false, true, false];
         assert_eq!(spared(), expected);
-        // The stack walk answers the same.
+        // The stack walk answers the same, and lists the tracked branches trunk reaches.
         let mut cache = SyncHistoryCache::default();
-        prefetch_stack_walk(&mut cache, &repo, path, &stack, "origin");
+        let listing = walk_stack(&mut cache, &repo, path, &stack, "origin").unwrap();
+        let mut merged: Vec<&str> = listing.lines().collect();
+        merged.sort();
+        let tip = |branch: &str| format!("{branch} {}", run(&["rev-parse", branch]));
+        assert_eq!(
+            merged,
+            [
+                "behind",
+                "empty",
+                "lost-parent",
+                "named-parent",
+                "submitted"
+            ]
+            .map(tip)
+        );
         assert_eq!(spared(), expected);
     }
 

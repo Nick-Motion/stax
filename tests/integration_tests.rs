@@ -953,6 +953,68 @@ fn test_log_json_output() {
     assert!(json["branches"].is_array());
 }
 
+#[test]
+fn test_log_json_ahead_behind_cache_tracks_each_parent_and_ref_moves() {
+    let repo = TestRepo::new();
+    assert!(repo.run_stax(&["bc", "feature-1"]).status.success());
+    let first = repo.current_branch();
+    repo.create_file("first.txt", "first");
+    repo.commit("First feature");
+
+    assert!(repo.run_stax(&["bc", "feature-2"]).status.success());
+    let second = repo.current_branch();
+    repo.create_file("second.txt", "second");
+    repo.commit("Second feature");
+
+    assert!(repo.run_stax(&["bc", "empty-feature"]).status.success());
+    let empty = repo.current_branch();
+    assert!(repo.git(&["checkout", "main"]).status.success());
+    repo.create_file("trunk.txt", "trunk");
+    repo.commit("Trunk update");
+
+    for _ in 0..2 {
+        let output = repo.run_stax(&["log", "--json"]);
+        assert!(output.status.success(), "{}", TestRepo::stderr(&output));
+        let json: Value = serde_json::from_slice(&output.stdout).expect("log JSON");
+        let branches = json["branches"].as_array().expect("branches");
+        assert_eq!(branches.len(), 4);
+        for (name, ahead, behind) in [
+            (first.as_str(), 1, 1),
+            (second.as_str(), 1, 0),
+            (empty.as_str(), 0, 0),
+            ("main", 0, 0),
+        ] {
+            let entry = branches
+                .iter()
+                .find(|b| b["name"] == name)
+                .expect("tracked branch");
+            assert_eq!(entry["ahead"], ahead, "{name}");
+            assert_eq!(entry["behind"], behind, "{name}");
+        }
+    }
+
+    assert!(repo.git(&["checkout", &first]).status.success());
+    repo.create_file("first-more.txt", "more");
+    repo.commit("First feature update");
+    let output = repo.run_stax(&["log", "--json"]);
+    assert!(output.status.success(), "{}", TestRepo::stderr(&output));
+    let json: Value = serde_json::from_slice(&output.stdout).expect("log JSON");
+    let branches = json["branches"].as_array().expect("branches");
+    for (name, ahead, behind) in [
+        (first.as_str(), 2, 1),
+        (second.as_str(), 1, 1),
+        (empty.as_str(), 0, 0),
+        ("main", 0, 0),
+    ] {
+        let entry = branches
+            .iter()
+            .find(|b| b["name"] == name)
+            .expect("tracked branch");
+        assert_eq!(entry["ahead"], ahead, "{name}");
+        assert_eq!(entry["behind"], behind, "{name}");
+    }
+}
+
 // =============================================================================
 // Navigation Tests (bu, bd, trunk, checkout)
 // =============================================================================

@@ -554,8 +554,8 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
             match &remote_heads_by_branch {
                 Some(remote_heads) => {
                     for branch in &scope_order {
-                        let local_oid = resolve_ref_oid(&workdir, branch);
                         let remote_oid = remote_heads.get(branch);
+                        let local_oid = remote_oid.and_then(|_| repo.branch_commit(branch).ok());
                         match (local_oid.as_deref(), remote_oid.map(String::as_str)) {
                             (_, None) => {
                                 println!(

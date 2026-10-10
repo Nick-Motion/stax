@@ -197,7 +197,19 @@ impl CiCache {
         branch: &str,
         pr_state: Option<String>,
     ) -> Result<()> {
-        Self::transaction(git_dir, |stored| stored.update_pr(branch, pr_state))
+        Self::update_branch_prs(git_dir, [(branch, pr_state)])
+    }
+
+    /// Atomically update several branches' pull-request states in one transaction.
+    pub(crate) fn update_branch_prs<'a>(
+        git_dir: &std::path::Path,
+        updates: impl IntoIterator<Item = (&'a str, Option<String>)>,
+    ) -> Result<()> {
+        Self::transaction(git_dir, |stored| {
+            for (branch, pr_state) in updates {
+                stored.update_pr(branch, pr_state);
+            }
+        })
     }
 
     /// Atomically refresh both live fields and the cache timestamp for one branch.
@@ -1277,6 +1289,24 @@ mod tests {
         assert_eq!(entry.ci_revision.as_deref(), Some("revision-a"));
         assert_eq!(entry.ci_state.as_deref(), Some("success"));
         assert_eq!(entry.pr_state.as_deref(), Some("DRAFT"));
+    }
+
+    #[test]
+    fn batched_pull_request_update_sets_every_branch_and_preserves_ci() {
+        let temp = TempDir::new().unwrap();
+        CiCache::update_branch_ci(temp.path(), "a", "revision-a", Some("success".into())).unwrap();
+
+        CiCache::update_branch_prs(
+            temp.path(),
+            [("a", Some("OPEN".into())), ("b", Some("MERGED".into()))],
+        )
+        .unwrap();
+
+        let cache = CiCache::load_strict(temp.path()).unwrap();
+        let a = cache.branches.get("a").unwrap();
+        assert_eq!(a.ci_state.as_deref(), Some("success"));
+        assert_eq!(a.pr_state.as_deref(), Some("OPEN"));
+        assert_eq!(cache.branches["b"].pr_state.as_deref(), Some("MERGED"));
     }
 
     #[test]

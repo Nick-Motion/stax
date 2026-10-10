@@ -22,8 +22,9 @@ use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use futures_util::stream::{self, StreamExt};
 use std::cell::LazyCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub(super) const PR_METADATA_REFRESH_CONCURRENCY: usize = 8;
@@ -3917,21 +3918,22 @@ fn refresh_pr_draft_states(
         .await
     });
 
+    let mut pr_states = Vec::new();
     for (branch_name, live_pr) in live_prs {
         let Some(live_pr) = live_pr else {
             continue;
         };
 
-        observations.insert(branch_name.clone(), live_pr.clone());
-        apply_live_pr_state(
-            repo,
-            &stack,
-            &cache_dir,
-            &branch_name,
-            &live_pr.info,
-            tx.as_deref_mut(),
-        )?;
+        apply_live_pr_state(repo, &stack, &branch_name, &live_pr.info, tx.as_deref_mut())?;
+        pr_states.push((branch_name.clone(), live_pr.info.state.to_uppercase()));
+        observations.insert(branch_name, live_pr);
     }
+    let _ = CiCache::update_branch_prs(
+        &cache_dir,
+        pr_states
+            .iter()
+            .map(|(branch, state)| (branch.as_str(), Some(state.clone()))),
+    );
 
     LiveTimer::maybe_finish_timed(timer);
     Ok(Some(started_at.elapsed()))
@@ -3940,7 +3942,6 @@ fn refresh_pr_draft_states(
 fn apply_live_pr_state(
     repo: &GitRepo,
     stack: &Stack,
-    cache_dir: &Path,
     branch_name: &str,
     live_pr: &ForgePrInfo,
     mut tx: Option<&mut Transaction>,
@@ -3981,21 +3982,23 @@ fn apply_live_pr_state(
             }
         }
 
-        // Only snapshot when the refresh actually rewrites the blob. Metadata is
-        // content-addressed, so an unchanged rewrite leaves the ref OID untouched --
-        // snapshotting it would turn a no-op sync into an undoable receipt and break
-        // the lazy-snapshot guard in `finish_transaction` (see
+        // Skip unchanged metadata: rewriting it costs two git processes and leaves the
+        // content-addressed ref OID untouched, and snapshotting it would turn a no-op
+        // sync into an undoable receipt and break the lazy-snapshot guard in
+        // `finish_transaction` (see
         // sync_undo_tests::sync_that_changes_nothing_leaves_the_previous_receipt_undoable).
-        let metadata_changed = meta != before;
+        if meta == before {
+            return Ok(());
+        }
 
-        if metadata_changed && let Some(tx) = tx.as_deref_mut() {
+        if let Some(tx) = tx.as_deref_mut() {
             tx.plan_metadata_ref(repo, branch_name)?;
             tx.snapshot()?;
         }
 
         let _ = meta.write(repo.inner(), branch_name);
 
-        if metadata_changed && let Some(tx) = tx {
+        if let Some(tx) = tx {
             // Metadata refs are written by `git update-ref` (subprocess); libgit2's
             // cached refdb may not see them, so resolve the after-OID the same way
             // `cleanup_merged_branches` does (see `record_known_after`'s doc comment).
@@ -4005,8 +4008,6 @@ fn apply_live_pr_state(
             tx.record_known_metadata_after(branch_name, meta_after.as_deref());
         }
     }
-
-    let _ = CiCache::update_branch_pr(cache_dir, branch_name, Some(pr_state));
 
     Ok(())
 }
@@ -4192,19 +4193,30 @@ fn prune_stale_remote_tracking_refs(
     stack: &Stack,
     remote_branches: &HashSet<String>,
 ) {
-    for branch in stack.branches.keys() {
-        if branch == &stack.trunk {
-            continue;
-        }
-        if remote_branches.contains(branch.as_str()) {
-            continue;
-        }
-        let refname = format!("refs/remotes/{}/{}", remote_name, branch);
-        let _ = Command::new("git")
-            .args(["update-ref", "-d", &refname])
-            .current_dir(workdir)
-            .status();
+    let deletions: String = stack
+        .branches
+        .keys()
+        .filter(|branch| *branch != &stack.trunk && !remote_branches.contains(branch.as_str()))
+        .map(|branch| format!("delete refs/remotes/{}/{}\n", remote_name, branch))
+        .collect();
+    if deletions.is_empty() {
+        return;
     }
+    // One process for every branch; deleting an absent ref is a no-op in the batch.
+    let Ok(mut child) = Command::new("git")
+        .args(["update-ref", "--stdin"])
+        .current_dir(workdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(deletions.as_bytes());
+    }
+    let _ = child.wait();
 }
 
 #[derive(Debug, Clone)]
@@ -7454,7 +7466,6 @@ else: sys.exit(41)
             .unwrap();
 
         let stack = Stack::load(&repo).unwrap();
-        let cache_dir = repo.common_git_dir().unwrap();
         let ops_dir = path.join(".git/stax/ops");
         std::fs::create_dir_all(&ops_dir).unwrap();
 
@@ -7474,15 +7485,7 @@ else: sys.exit(41)
             is_draft: false,
             base: "main".to_string(),
         };
-        apply_live_pr_state(
-            &repo,
-            &stack,
-            &cache_dir,
-            "branch-b",
-            &live_pr,
-            Some(&mut tx),
-        )
-        .unwrap();
+        apply_live_pr_state(&repo, &stack, "branch-b", &live_pr, Some(&mut tx)).unwrap();
 
         let finalized = tx.finish_ok_preserving_receipt();
         let entry = finalized
@@ -7511,7 +7514,6 @@ else: sys.exit(41)
             .unwrap();
 
         let stack = Stack::load(&repo).unwrap();
-        let cache_dir = repo.common_git_dir().unwrap();
         let ops_dir = path.join(".git/stax/ops");
         std::fs::create_dir_all(&ops_dir).unwrap();
 
@@ -7523,15 +7525,7 @@ else: sys.exit(41)
             is_draft: false,
             base: "branch-a".to_string(),
         };
-        apply_live_pr_state(
-            &repo,
-            &stack,
-            &cache_dir,
-            "branch-b",
-            &live_pr,
-            Some(&mut tx),
-        )
-        .unwrap();
+        apply_live_pr_state(&repo, &stack, "branch-b", &live_pr, Some(&mut tx)).unwrap();
 
         assert!(!tx.is_snapshotted());
         let finalized = tx.finish_ok_preserving_receipt();
@@ -7564,6 +7558,47 @@ else: sys.exit(41)
             branches,
             trunk: "main".to_string(),
         }
+    }
+
+    #[test]
+    fn prune_drops_only_tracking_refs_of_branches_gone_from_the_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let main_oid = init_repo_with_two_branches(path);
+        for name in ["main", "branch-a", "branch-b"] {
+            Command::new("git")
+                .args([
+                    "update-ref",
+                    &format!("refs/remotes/origin/{name}"),
+                    &main_oid,
+                ])
+                .current_dir(path)
+                .output()
+                .unwrap();
+        }
+        // branch-c never had a tracking ref; deleting it must not abort the batch.
+        let stack = stack_of(
+            &[
+                ("main", &[]),
+                ("branch-a", &[]),
+                ("branch-b", &[]),
+                ("branch-c", &[]),
+            ],
+            &[],
+        );
+        let remote_branches = HashSet::from(["branch-b".to_string()]);
+
+        prune_stale_remote_tracking_refs(path, "origin", &stack, &remote_branches);
+
+        let refs = Command::new("git")
+            .args(["for-each-ref", "--format=%(refname)", "refs/remotes/origin"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&refs.stdout),
+            "refs/remotes/origin/branch-b\nrefs/remotes/origin/main\n"
+        );
     }
 
     #[test]

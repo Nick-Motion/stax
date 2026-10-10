@@ -4474,15 +4474,13 @@ pub(super) fn init_forge_client(
     repo: &GitRepo,
     config: &Config,
 ) -> Option<(tokio::runtime::Runtime, ForgeClient)> {
-    let remote_info = RemoteInfo::from_repo(repo, config).ok();
-    if let Some(info) = remote_info {
-        tokio::runtime::Runtime::new().ok().and_then(|rt| {
-            let _enter = rt.enter();
-            ForgeClient::new(&info).ok().map(|client| (rt, client))
-        })
-    } else {
-        None
-    }
+    forge_client(&RemoteInfo::from_repo(repo, config).ok()?)
+}
+
+pub(super) fn forge_client(remote: &RemoteInfo) -> Option<(tokio::runtime::Runtime, ForgeClient)> {
+    let rt = tokio::runtime::Runtime::new().ok()?;
+    let _enter = rt.enter();
+    ForgeClient::new(remote).ok().map(|client| (rt, client))
 }
 
 fn print_blocked_or_skipped(

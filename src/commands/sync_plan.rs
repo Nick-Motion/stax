@@ -1,8 +1,8 @@
 use crate::commands::sync::{
     BlockingWorktreeCleanup, MergeType, MergedBranchInfo, PR_METADATA_REFRESH_CONCURRENCY,
     PartialMergeReason, StashPolicy, count_commits_between, diff_line_stats_between,
-    find_partially_merged_notes, find_upstream_gone_branches, imported_branches_for_cleanup,
-    init_forge_client, is_ancestor, local_branch_exists, plan_merged_worktree_cleanup,
+    find_partially_merged_notes, find_upstream_gone_branches, forge_client,
+    imported_branches_for_cleanup, is_ancestor, local_branch_exists, plan_merged_worktree_cleanup,
     print_cleanup_candidates, print_retained_closed_prs, resolve_fallback_parent_skipping_doomed,
     resolve_ref_oid, retained_closed_prs,
 };
@@ -284,10 +284,9 @@ pub(super) fn would_need_restack(
 
 fn patch_stack_pr_states_in_memory(
     stack: &mut Stack,
-    repo: &GitRepo,
-    config: &Config,
+    forge: Option<(tokio::runtime::Runtime, crate::forge::ForgeClient)>,
 ) -> HashMap<String, crate::forge::PrInfoWithHead> {
-    let Some((rt, client)) = init_forge_client(repo, config) else {
+    let Some((rt, client)) = forge else {
         return HashMap::new();
     };
 
@@ -349,6 +348,12 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
     let remote_name = config.remote_name().to_string();
     let trunk = repo.trunk_branch()?;
     let remote_trunk_ref = format!("{}/{}", remote_name, trunk);
+    // The forge client resolves a token, often with a `gh auth token` process,
+    // and loads TLS roots. Build it while ls-remote, the stack load and the
+    // status check run.
+    let forge = remote::RemoteInfo::from_repo(&repo, &config)
+        .ok()
+        .map(|remote| std::thread::spawn(move || forge_client(&remote)));
 
     // Stderr warnings for inert flags — always emitted regardless of --quiet
     if force {
@@ -445,13 +450,18 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
     // --- Load stack (in-memory only; no ref writes) ---
     let mut stack = Stack::load(&repo)?;
     let current = repo.current_branch()?;
+    let dirty = repo.is_dirty().unwrap_or(false);
 
     // Patch PR states in memory BEFORE any &Stack borrows for detection
-    let live_pr_observations = patch_stack_pr_states_in_memory(&mut stack, &repo, &config);
+    let forge = forge.and_then(|thread| {
+        thread
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    });
+    let live_pr_observations = patch_stack_pr_states_in_memory(&mut stack, forge);
 
     // --- Trunk section ---
     let on_trunk = current == trunk;
-    let dirty = repo.is_dirty().unwrap_or(false);
     let trunk_plan = classify_trunk_plan(
         &workdir,
         &trunk,

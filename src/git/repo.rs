@@ -523,17 +523,43 @@ impl GitRepo {
 
         let mut entries: Vec<(PathBuf, Option<String>, bool)> = vec![(main_path, None, false)];
 
+        // Resolve linked HEADs through one common ref database instead of
+        // reloading repository configuration and object data for every worktree.
+        let common_repo = Repository::open(self.repo.commondir()).ok();
         let worktree_names = self.repo.worktrees()?;
         for name in worktree_names.iter().filter_map(|r| r.ok().flatten()) {
             let worktree = self.repo.find_worktree(name)?;
             let is_prunable = worktree.is_prunable(None).unwrap_or(false);
             let path = Self::normalize_path(worktree.path());
-            let branch = Repository::open(worktree.path()).ok().and_then(|repo| {
-                repo.head()
-                    .ok()
-                    .filter(|head| head.is_branch())
-                    .and_then(|head| head.shorthand().ok().map(str::to_string))
-            });
+            let branch = common_repo
+                .as_ref()
+                .filter(|repo| {
+                    let admin_dir = repo.path().join("worktrees").join(name);
+                    let default_config = match std::fs::metadata(admin_dir.join("config.worktree"))
+                    {
+                        Ok(metadata) => metadata.len() == 0,
+                        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                    };
+                    default_config
+                        && std::fs::read_to_string(worktree.path().join(".git")).is_ok_and(|link| {
+                            link.trim() == format!("gitdir: {}", admin_dir.display())
+                        })
+                })
+                .and_then(|repo| {
+                    repo.find_reference(&format!("worktrees/{name}/HEAD"))
+                        .ok()
+                        .and_then(|head| head.resolve().ok())
+                        .filter(|head| head.is_branch())
+                        .and_then(|head| head.shorthand().ok().map(str::to_string))
+                })
+                .or_else(|| {
+                    Repository::open(worktree.path()).ok().and_then(|repo| {
+                        repo.head()
+                            .ok()
+                            .filter(|head| head.is_branch())
+                            .and_then(|head| head.shorthand().ok().map(str::to_string))
+                    })
+                });
             entries.push((path, branch, is_prunable));
         }
 
@@ -3108,6 +3134,96 @@ mod tests {
             .output()
             .expect("failed to run git");
         String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    #[test]
+    fn test_linked_worktree_names_match_from_main_and_linked_repositories() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+        run_git(path, &["init", "-b", "main"]);
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test"]);
+        run_git(path, &["commit", "--allow-empty", "-m", "initial"]);
+        let linked = path.join("linked");
+        run_git(
+            path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/nested",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let detached = path.join("detached");
+        run_git(
+            path,
+            &["worktree", "add", "--detach", detached.to_str().unwrap()],
+        );
+        run_git(path, &["pack-refs", "--all"]);
+
+        for repo_path in [path, linked.as_path()] {
+            let repo = GitRepo::open_from_path(repo_path).unwrap();
+            assert_eq!(
+                repo.linked_worktree_names_by_branch().unwrap(),
+                HashMap::from([("feature/nested".to_string(), "linked".to_string())])
+            );
+        }
+
+        fs::write(
+            path.join(".git/worktrees/linked/config.worktree"),
+            "# custom config\n",
+        )
+        .unwrap();
+        let repo = GitRepo::open_from_path(path).unwrap();
+        assert_eq!(
+            repo.linked_worktree_names_by_branch().unwrap(),
+            HashMap::from([("feature/nested".to_string(), "linked".to_string())])
+        );
+        fs::remove_file(path.join(".git/worktrees/linked/config.worktree")).unwrap();
+
+        fs::write(linked.join(".git"), "gitdir: ../.git/worktrees/linked\n").unwrap();
+        let repo = GitRepo::open_from_path(path).unwrap();
+        assert_eq!(
+            repo.linked_worktree_names_by_branch().unwrap(),
+            HashMap::from([("feature/nested".to_string(), "linked".to_string())])
+        );
+
+        run_git(&linked, &["switch", "-c", "renamed"]);
+        let repo = GitRepo::open_from_path(path).unwrap();
+        assert_eq!(
+            repo.linked_worktree_names_by_branch().unwrap(),
+            HashMap::from([("renamed".to_string(), "linked".to_string())])
+        );
+        run_git(&linked, &["switch", "--detach"]);
+        assert!(repo.linked_worktree_names_by_branch().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_linked_worktree_names_omit_unavailable_and_unborn_heads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+        run_git(path, &["init", "-b", "main"]);
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test"]);
+        run_git(path, &["commit", "--allow-empty", "-m", "initial"]);
+        let linked = path.join("linked");
+        run_git(
+            path,
+            &["worktree", "add", "-b", "feature", linked.to_str().unwrap()],
+        );
+        run_git(path, &["worktree", "lock", linked.to_str().unwrap()]);
+        let repo = GitRepo::open_from_path(path).unwrap();
+        fs::remove_file(linked.join(".git")).unwrap();
+        assert!(repo.linked_worktree_names_by_branch().unwrap().is_empty());
+
+        fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", path.join(".git/worktrees/linked").display()),
+        )
+        .unwrap();
+        run_git(&linked, &["symbolic-ref", "HEAD", "refs/heads/unborn"]);
+        assert!(repo.linked_worktree_names_by_branch().unwrap().is_empty());
     }
 
     #[test]

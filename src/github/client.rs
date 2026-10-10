@@ -224,15 +224,6 @@ struct RepoListIssue {
 }
 
 impl GitHubClient {
-    /// Create a new GitHub client from config
-    pub fn new(owner: &str, repo: &str, api_base_url: Option<String>) -> Result<Self> {
-        let (auth_source, token) = Config::github_token_with_source().context(
-            "GitHub auth not configured. Use one of: `stax auth`, `stax auth --from-gh`, \
-             `gh auth login`, or set `STAX_GITHUB_TOKEN`.",
-        )?;
-        Self::new_with_auth(owner, repo, api_base_url, auth_source, token)
-    }
-
     pub(crate) fn new_for_trusted_remote(
         owner: &str,
         repo: &str,

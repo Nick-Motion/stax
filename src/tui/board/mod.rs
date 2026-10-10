@@ -18,6 +18,7 @@ use crate::ci::CheckRunInfo;
 use crate::commands::board::{BoardScope, BoardTabSelection};
 use crate::commands::open::open_url_in_browser;
 use crate::config::Config;
+use crate::forge::ForgeClient;
 use crate::forge::{MergeMethod, PrComment};
 use crate::git::GitRepo;
 use crate::github::client::GitHubClient;
@@ -573,13 +574,12 @@ fn create_board_client(
     scope: &BoardScope,
 ) -> Result<GitHubClient> {
     let _enter = runtime.enter();
-    GitHubClient::new_for_trusted_remote(
-        scope.remote.owner(),
-        &scope.remote.repo,
-        scope.remote.api_base_url.clone(),
-        &scope.config,
-        &scope.remote.host,
-    )
+    match ForgeClient::new(&scope.remote)? {
+        ForgeClient::GitHub(client) => Ok(client),
+        ForgeClient::GitLab(_) | ForgeClient::Gitea(_) => {
+            anyhow::bail!("`stax board` supports GitHub only")
+        }
+    }
 }
 
 async fn handle_request(

@@ -195,16 +195,7 @@ fn validate_trusted_network_remote(remote: &RemoteInfo, global_config: &Config) 
         "Noninteractive repository network access requires a resolved provider API URL in global configuration",
     )?;
     let api_host = network_url_host(api_url, "provider API URL")?;
-    let built_in_relationship = matches!(
-        (remote.forge, remote_host.as_str(), api_host.as_str()),
-        (ForgeType::GitHub, "github.com", "api.github.com")
-            | (ForgeType::GitLab, "gitlab.com", "gitlab.com")
-            | (ForgeType::Gitea, "gitea.com", "gitea.com")
-    );
-    if api_host != remote_host
-        && !built_in_relationship
-        && global_config.remote.api_base_url.is_none()
-    {
+    if !api_host_is_trusted(remote, &api_host, global_config) {
         anyhow::bail!(
             "Noninteractive repository network access blocked an untrusted provider API hostname; configure the \
              remote/API relationship explicitly in global remote.api_base_url"
@@ -212,6 +203,46 @@ fn validate_trusted_network_remote(remote: &RemoteInfo, global_config: &Config) 
     }
 
     Ok(())
+}
+
+/// Refuse to attach forge credentials when the API URL, which a repository's
+/// `stax.toml` can set, points at a host the user never trusted.
+pub(crate) fn ensure_trusted_api_destination(
+    remote: &RemoteInfo,
+    global_config: &Config,
+) -> Result<()> {
+    let api_url = remote
+        .api_base_url
+        .as_deref()
+        .context("Missing provider API URL")?;
+    let api_host = network_url_host(api_url, "provider API URL")?;
+    if !api_host_is_trusted(remote, &api_host, global_config) {
+        anyhow::bail!(
+            "Refusing to send {} credentials to {api_host}, which is not the Git remote host {}; \
+             to trust it, set remote.api_base_url in the global stax config",
+            remote.forge,
+            remote.host
+        );
+    }
+    Ok(())
+}
+
+/// Credentials may go to the Git remote's own host, the official API host of
+/// github.com, gitlab.com, or gitea.com, or the host of the global API URL.
+fn api_host_is_trusted(remote: &RemoteInfo, api_host: &str, global_config: &Config) -> bool {
+    let remote_host = remote.host.to_ascii_lowercase();
+    let built_in_relationship = matches!(
+        (remote.forge, remote_host.as_str(), api_host),
+        (ForgeType::GitHub, "github.com", "api.github.com")
+            | (ForgeType::GitLab, "gitlab.com", "gitlab.com")
+            | (ForgeType::Gitea, "gitea.com", "gitea.com")
+    );
+    let global_api_host = global_config
+        .remote
+        .api_base_url
+        .as_deref()
+        .and_then(|url| network_url_host(url, "global provider API URL").ok());
+    api_host == remote_host || built_in_relationship || global_api_host.as_deref() == Some(api_host)
 }
 
 fn official_forge_for_host(host: &str) -> Option<ForgeType> {
@@ -926,6 +957,52 @@ mod tests {
             assert_eq!(remote.base_url, base_url);
             assert_eq!(remote.api_base_url.as_deref(), Some(api_base_url));
         }
+    }
+
+    #[test]
+    fn credentials_go_only_to_trusted_api_hosts() {
+        let remote = |host: &str, api: &str| RemoteInfo {
+            name: "origin".to_string(),
+            forge: ForgeType::GitHub,
+            host: host.to_string(),
+            namespace: "org".to_string(),
+            repo: "repo".to_string(),
+            base_url: format!("https://{host}"),
+            api_base_url: Some(api.to_string()),
+        };
+        let none = Config::default();
+        for (host, api) in [
+            ("github.com", "https://api.github.com"),
+            ("ghe.corp.example", "https://ghe.corp.example/api/v3"),
+            ("GHE.corp.example", "https://ghe.corp.example/api/v3"),
+        ] {
+            ensure_trusted_api_destination(&remote(host, api), &none).unwrap();
+        }
+
+        // A repository stax.toml pointing the API elsewhere must not receive the token.
+        let error =
+            ensure_trusted_api_destination(&remote("github.com", "https://evil.example"), &none)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Refusing to send GitHub credentials to evil.example")
+        );
+
+        let mut global = Config::default();
+        global.remote.api_base_url = Some("https://api.corp.example/v3".to_string());
+        ensure_trusted_api_destination(
+            &remote("git.corp.example", "https://api.corp.example/v3"),
+            &global,
+        )
+        .unwrap();
+        assert!(
+            ensure_trusted_api_destination(
+                &remote("git.corp.example", "https://other.corp.example/v3"),
+                &global,
+            )
+            .is_err()
+        );
     }
 
     #[test]

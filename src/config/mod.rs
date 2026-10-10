@@ -899,12 +899,6 @@ impl Config {
         Self::resolve_github_auth_with_config(&auth_config).map(|(_, token)| token)
     }
 
-    /// Like `github_token` but also returns the source for error messages.
-    pub fn github_token_with_source() -> Option<(GitHubAuthSource, String)> {
-        let auth_config = Self::load().map(|c| c.auth).unwrap_or_default();
-        Self::resolve_github_auth_with_config(&auth_config)
-    }
-
     /// Resolve GitHub auth for a validated trusted network destination.
     ///
     /// The gh CLI lookup is always scoped to the validated Git remote host. An
@@ -922,7 +916,7 @@ impl Config {
         {
             anyhow::bail!(
                 "Configured GitHub auth hostname does not match the validated Git remote \
-                 hostname; update global auth.gh_hostname before noninteractive repository network access"
+                 hostname; update global auth.gh_hostname before repository network access"
             );
         }
 

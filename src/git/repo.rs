@@ -2080,16 +2080,27 @@ Use --auto-stash-pop or stash/commit changes first.",
 
     /// Fill the merge-base memo for `trunk` and each of `tips` from the output
     /// of `git --no-replace-objects rev-list --parents <positives> --not
-    /// <trunk>`, whose positives must include every tip. A tip that the walk
-    /// does not list is an ancestor of trunk, so it is its own merge base.
-    /// Otherwise every merge base is a trunk commit that one of the tip's own
-    /// commits points at, so a single such commit is the merge base. Tips that
-    /// point at several are left to libgit2.
-    pub fn remember_merge_bases(&self, trunk: git2::Oid, rev_list: &str, tips: &[git2::Oid]) {
+    /// <trunk>`, whose positives must include every tip, and the descendant
+    /// memo for trunk and each tip. A tip that the walk does not list is an
+    /// ancestor of trunk, so it is its own merge base. Otherwise every merge
+    /// base is a trunk commit that one of the tip's own commits points at, so
+    /// a single such commit is the merge base. Returns the tips that point at
+    /// none or several, with those commits, and leaves them to libgit2.
+    pub fn remember_merge_bases(
+        &self,
+        trunk: git2::Oid,
+        rev_list: &str,
+        tips: &[git2::Oid],
+    ) -> HashMap<git2::Oid, Vec<String>> {
         let parents = parent_graph(rev_list);
+        let mut undecided = HashMap::new();
         for &tip in tips {
             let hex = tip.to_string();
-            let base = if parents.contains_key(hex.as_str()) {
+            let listed = parents.contains_key(hex.as_str());
+            self.descendants
+                .borrow_mut()
+                .insert((trunk, tip), !listed && tip != trunk);
+            let base = if listed {
                 let boundary: HashSet<&str> = reachable(&parents, &hex)
                     .into_iter()
                     .flat_map(|commit| parents[commit].iter().copied())
@@ -2097,7 +2108,10 @@ Use --auto-stash-pop or stash/commit changes first.",
                     .collect();
                 match Vec::from_iter(boundary).as_slice() {
                     [base] => git2::Oid::from_str(base).ok(),
-                    _ => None,
+                    boundary => {
+                        undecided.insert(tip, boundary.iter().map(|c| c.to_string()).collect());
+                        None
+                    }
                 }
             } else {
                 Some(tip)
@@ -2106,6 +2120,7 @@ Use --auto-stash-pop or stash/commit changes first.",
                 self.merge_bases.borrow_mut().insert((trunk, tip), base);
             }
         }
+        undecided
     }
 
     /// Whether `descendant` descends from `ancestor`, as libgit2's
@@ -2413,8 +2428,9 @@ Use --auto-stash-pop or stash/commit changes first.",
             .get()
             .peel_to_commit()?;
 
-        // Branch is merged if its commit is an ancestor of trunk
-        Ok(self.merge_base_oid(trunk_commit.id(), branch_commit.id())? == branch_commit.id())
+        // Branch is merged if its commit is trunk or an ancestor of trunk
+        let (trunk, tip) = (trunk_commit.id(), branch_commit.id());
+        Ok(tip == trunk || self.graph_descendant_of(trunk, tip)?)
     }
 
     /// Cheap merge-equivalence checks only (ancestor + identical tree). Returns `Some(())` if
@@ -3595,10 +3611,14 @@ mod tests {
         ]
         .map(|(descendant, ancestor)| (oid(descendant), oid(ancestor)));
         repo.remember_descendants(&walk, &pairs);
-        // The walk cannot tell which trunk commits a branch reaches.
-        let expected: HashMap<_, _> = pairs[..5]
+        // The walk cannot tell which trunk commits a branch reaches, but it
+        // shows whether trunk reaches each branch tip.
+        let proven = pairs[..5]
             .iter()
-            .map(|&(descendant, ancestor)| {
+            .copied()
+            .chain(branches.map(|branch| (main, oid(branch))));
+        let expected: HashMap<_, _> = proven
+            .map(|(descendant, ancestor)| {
                 let descends = repo.repo.graph_descendant_of(descendant, ancestor).unwrap();
                 ((descendant, ancestor), descends)
             })

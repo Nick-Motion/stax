@@ -39,6 +39,10 @@ pub(super) struct SyncHistoryCache {
     trunk_walk: Option<TrunkWalk>,
     /// The last walk of `cached_branch_walk`.
     branch_walk: Option<BranchWalk>,
+    /// By trunk and branch tip, the trunk commits that the tip's own commits
+    /// point at, as `git rev-list --boundary <tip> --not <trunk>` lists them,
+    /// for tips whose merge base `walk_stack` left to libgit2.
+    boundaries: HashMap<(git2::Oid, git2::Oid), Vec<String>>,
 }
 
 /// The output of `git rev-list --parents <tip> --not <tip>~<depth>`, with
@@ -109,11 +113,13 @@ fn cached_branch_walk<'c>(
 }
 
 /// Walk every tracked branch, its recorded parent, its remote-tracking branch
-/// and the remote trunk once. Each branch's trunk merge base, and whether its
-/// recorded parent descends from it, come from this walk, and
-/// `count_extra_commits` reuses it. Returns the tracked branches whose tips
-/// trunk reaches, one `<branch> <tip>` line each, as `git for-each-ref
-/// --merged <trunk> --format='%(refname:short) %(objectname)'` lists them.
+/// and the remote trunk once. Each branch's trunk merge base, and whether trunk
+/// and its recorded parent descend from it, come from this walk. A branch
+/// whose merge base the walk leaves to libgit2 keeps its boundary commits for
+/// `trunk_merge_base_within`. `count_extra_commits` reuses the walk. Returns
+/// the tracked branches whose tips trunk reaches, one `<branch> <tip>` line
+/// each, as `git for-each-ref --merged <trunk> --format='%(refname:short)
+/// %(objectname)'` lists them.
 fn walk_stack(
     cache: &mut SyncHistoryCache,
     repo: &GitRepo,
@@ -152,19 +158,24 @@ fn walk_stack(
         .ok()
         .flatten()?;
     let branch_tips: Vec<git2::Oid> = tips.iter().map(|&(_, tip, _)| tip).collect();
-    repo.remember_merge_bases(trunk, walk, &branch_tips);
+    let boundaries = repo.remember_merge_bases(trunk, walk, &branch_tips);
     let pairs: Vec<(git2::Oid, git2::Oid)> = tips
         .iter()
         .filter_map(|&(_, tip, parent)| Some((parent?, tip)))
         .collect();
     repo.remember_descendants(walk, &pairs);
     let unmerged = parent_graph(walk);
-    Some(
-        tips.iter()
-            .filter(|(_, tip, _)| !unmerged.contains_key(tip.to_string().as_str()))
-            .map(|(branch, tip, _)| format!("{branch} {tip}\n"))
-            .collect(),
-    )
+    let listing = tips
+        .iter()
+        .filter(|(_, tip, _)| !unmerged.contains_key(tip.to_string().as_str()))
+        .map(|(branch, tip, _)| format!("{branch} {tip}\n"))
+        .collect();
+    cache.boundaries.extend(
+        boundaries
+            .into_iter()
+            .map(|(tip, boundary)| ((trunk, tip), boundary)),
+    );
+    Some(listing)
 }
 
 /// Resolve a `base..head` range to object ids, so cache entries stay valid
@@ -263,17 +274,7 @@ fn trunk_count_within(
     cap: usize,
 ) -> Result<Option<usize>> {
     let (merge_base, trunk) = range_key(repo, merge_base, trunk);
-    let reusable = cache
-        .trunk_walk
-        .as_ref()
-        .is_some_and(|walk| walk.tip == trunk && walk.depth == cap);
-    if !reusable {
-        cache.trunk_walk = Some(walk_trunk(workdir, &trunk, cap)?);
-    }
-    let walk = cache
-        .trunk_walk
-        .as_mut()
-        .expect("trunk walk was just stored");
+    let walk = trunk_window(&mut cache.trunk_walk, workdir, &trunk, cap)?;
     if let Some(count) = walk.counts.get(&merge_base) {
         return Ok(*count);
     }
@@ -287,6 +288,55 @@ fn trunk_count_within(
     .filter(|count| *count <= cap);
     walk.counts.insert(merge_base, count);
     Ok(count)
+}
+
+/// The walk of trunk's last `depth` first-parent commits, kept for later calls.
+fn trunk_window<'w>(
+    slot: &'w mut Option<TrunkWalk>,
+    workdir: &Path,
+    tip: &str,
+    depth: usize,
+) -> Result<&'w mut TrunkWalk> {
+    let reusable = slot
+        .as_ref()
+        .is_some_and(|walk| walk.tip == tip && walk.depth == depth);
+    if !reusable {
+        *slot = Some(walk_trunk(workdir, tip, depth)?);
+    }
+    Ok(slot.as_mut().expect("trunk walk was just stored"))
+}
+
+/// The merge base of `trunk` and `branch`, with the count of
+/// `merge_base..trunk` when that range holds at most `cap` commits, else
+/// `None`. A branch whose merge base `walk_stack` left to libgit2 skips that
+/// walk, about 8 ms on a monorepo, when none of its boundary commits is in
+/// the trunk window or is its bound. Each merge base is a boundary commit, so
+/// it is then below the bound, and its range holds the bound and the window's
+/// `cap` or more commits.
+fn trunk_merge_base_within(
+    cache: &mut SyncHistoryCache,
+    repo: &GitRepo,
+    workdir: &Path,
+    trunk: &str,
+    branch: &str,
+    cap: usize,
+) -> Result<Option<(String, usize)>> {
+    let key = commit_oid(repo, trunk).zip(commit_oid(repo, &format!("refs/heads/{branch}")));
+    if let Some((trunk_oid, tip)) = key
+        && let Some(boundary) = cache.boundaries.get(&(trunk_oid, tip))
+    {
+        let window = trunk_window(&mut cache.trunk_walk, workdir, &trunk_oid.to_string(), cap)?;
+        let parents = parent_graph(&window.rev_list);
+        let in_window = |commit: &String| {
+            window.bound.as_ref() == Some(commit) || parents.contains_key(commit.as_str())
+        };
+        if !boundary.iter().any(in_window) {
+            return Ok(None);
+        }
+    }
+    let merge_base = repo.merge_base(trunk, branch)?;
+    let count = trunk_count_within(cache, repo, workdir, &merge_base, trunk, cap)?;
+    Ok(count.map(|count| (merge_base, count)))
 }
 
 /// Trunk's last `depth` first-parent commits with the commits they merged, or
@@ -4349,7 +4399,14 @@ fn find_merged_branches_with_prs_after_enumeration(
                 });
             }
             Ok(None) => {
-                if let Ok(mb) = repo.merge_base(trunk, branch) {
+                if let Ok(Some((mb, _))) = trunk_merge_base_within(
+                    history_cache,
+                    repo,
+                    workdir,
+                    trunk,
+                    branch,
+                    GitRepo::PATCH_ID_TRUNK_COMMIT_CAP,
+                ) {
                     need_patch_id.push((branch.to_string(), mb));
                 }
             }
@@ -4431,15 +4488,12 @@ pub(super) fn find_partially_merged_notes(
         ) {
             PartialMergeReason::PrClosed
         } else {
-            let Ok(merge_base) = repo.merge_base(&trunk, &branch) else {
-                continue;
-            };
-            let Ok(Some(trunk_count)) = trunk_count_within(
+            let Ok(Some((merge_base, trunk_count))) = trunk_merge_base_within(
                 history_cache,
                 repo,
                 workdir,
-                &merge_base,
                 &trunk,
+                &branch,
                 GitRepo::PATCH_ID_TRUNK_COMMIT_CAP,
             ) else {
                 continue;
@@ -6098,6 +6152,73 @@ mod tests {
         assert!(equivalent("picked"));
         assert!(!equivalent("partial"));
         assert!(equivalent("other"));
+
+        let tracked = ["picked", "partial", "other"].map(|name| {
+            let info = crate::engine::stack::StackBranch {
+                name: name.to_string(),
+                parent: Some("main".to_string()),
+                parent_revision: None,
+                children: Vec::new(),
+                needs_restack: false,
+                pr_number: None,
+                pr_state: None,
+                pr_is_draft: None,
+            };
+            (name.to_string(), info)
+        });
+        let stack = Stack {
+            branches: HashMap::from(tracked),
+            trunk: "main".to_string(),
+        };
+        // Without a PR or a remote branch, only patch ids show these merges.
+        let merged = find_merged_branches_with_prs(
+            &repo,
+            path,
+            &stack,
+            "origin",
+            &HashSet::new(),
+            false,
+            &HashMap::new(),
+            &mut SyncHistoryCache::default(),
+        )
+        .unwrap();
+        let found: Vec<_> = merged
+            .iter()
+            .map(|info| {
+                let squash = matches!(info.merge_type, MergeType::SquashMerge);
+                (info.branch.as_str(), squash)
+            })
+            .collect();
+        assert_eq!(found, [("other", true), ("picked", true)]);
+
+        // With none of them marked merged, each gets a "history merged" note
+        // for the commits that trunk does not reach.
+        let notes = find_partially_merged_notes(
+            &repo,
+            path,
+            &stack,
+            "origin",
+            &HashSet::new(),
+            &[],
+            &mut cache,
+        )
+        .unwrap();
+        let mut found: Vec<_> = notes
+            .iter()
+            .map(|note| {
+                let history_merged = matches!(note.pr_label, PartialMergeReason::HistoryMerged);
+                (note.branch.as_str(), note.extra_commits, history_merged)
+            })
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("other", 1, true),
+                ("partial", 3, true),
+                ("picked", 2, true)
+            ]
+        );
     }
 
     #[test]
@@ -6232,6 +6353,92 @@ mod tests {
                 })
                 .collect();
             assert_eq!(counts, expected, "cap {cap}");
+        }
+    }
+
+    #[test]
+    fn trunk_merge_bases_within_the_cap_match_rev_list_for_branches_that_merged_trunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let commit = |file: &str| {
+            std::fs::write(path.join(file), format!("{file}\n")).unwrap();
+            run(&["add", file]);
+            run(&["commit", "-m", file]);
+            run(&["rev-parse", "HEAD"])
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        let base = commit("base.txt");
+        let m1 = commit("m1.txt");
+        run(&["branch", "merged"]);
+        let m2 = commit("m2.txt");
+        let m3 = commit("m3.txt");
+        commit("m4.txt");
+        run(&["branch", "at-trunk"]);
+        // Each branch forks from base and later merges a trunk commit, so its
+        // own commits point at two trunk commits.
+        let branches = ["below", "at-bound", "inside"];
+        for (branch, merged) in branches.into_iter().zip([&m1, &m2, &m3]) {
+            run(&["switch", "-c", branch, &base]);
+            commit(&format!("{branch}.txt"));
+            run(&["merge", "--no-edit", merged]);
+        }
+
+        let entry = |name: &str| {
+            let info = crate::engine::stack::StackBranch {
+                name: name.to_string(),
+                parent: Some("main".to_string()),
+                parent_revision: None,
+                children: Vec::new(),
+                needs_restack: false,
+                pr_number: None,
+                pr_state: None,
+                pr_is_draft: None,
+            };
+            (name.to_string(), info)
+        };
+        let stack = Stack {
+            branches: branches
+                .into_iter()
+                .chain(["merged", "at-trunk"])
+                .map(entry)
+                .collect(),
+            trunk: "main".to_string(),
+        };
+        let repo = GitRepo::open_from_path(path).unwrap();
+        let mut cache = SyncHistoryCache::default();
+        walk_stack(&mut cache, &repo, path, &stack, "origin").unwrap();
+        assert_eq!(
+            ["below", "merged", "at-trunk"].map(|branch| repo.is_branch_merged(branch).unwrap()),
+            [false, true, true]
+        );
+        // `git rev-list --count <merge base>..main` gives 3, 2 and 1. With cap 2
+        // the window holds m4 and m3 above its bound m2. Trunk has no 200th
+        // first parent, so that cap walks all of trunk.
+        for (cap, expected) in [
+            (2, [None, Some((&m2, 2)), Some((&m3, 1))]),
+            (200, [Some((&m1, 3)), Some((&m2, 2)), Some((&m3, 1))]),
+        ] {
+            let found = branches.map(|branch| {
+                trunk_merge_base_within(&mut cache, &repo, path, "main", branch, cap).unwrap()
+            });
+            let expected = expected.map(|found| found.map(|(base, count)| (base.clone(), count)));
+            assert_eq!(found, expected, "cap {cap}");
         }
     }
 

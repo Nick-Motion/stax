@@ -1662,85 +1662,83 @@ pub fn run(scope: SubmitScope, options: SubmitOptions) -> Result<()> {
                 let fork_remote_configured = config.fork_remote().is_some();
                 let fork_remote_name = config.fork_remote().unwrap_or("fork").to_string();
 
-                let (resolved_owner, fork_freshly_created) = if fork_remote_configured
-                    && repo.remote_exists(&fork_remote_name)
-                {
-                    // Trust the user-configured fork remote's URL for the owner
-                    // rather than assuming the authenticated login: a fork under
-                    // an org would otherwise be qualified with the wrong owner in
-                    // `owner:branch`.
-                    let configured_url =
-                        remote::get_remote_url(repo.workdir()?, &fork_remote_name)?;
-                    let owner_from_url = remote::parse_remote_url(&configured_url)
-                        .ok()
-                        .and_then(|(_, path)| path.split('/').next().map(str::to_string))
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| login.clone());
-                    (owner_from_url, false)
-                } else {
-                    let origin_url = remote::get_remote_url(repo.workdir()?, &remote_info.name)?;
-                    let is_https =
-                        origin_url.starts_with("http://") || origin_url.starts_with("https://");
-                    let existing =
-                        fork_rt.block_on(async { fork_client.find_pushable_fork(&login).await })?;
-
-                    // Pre-create conflict check: use the real URL when a fork already
-                    // exists, otherwise the predicted URL for `login` — we know the
-                    // target owner before ever calling `create_fork()`.
-                    let candidate_url = match &existing {
-                        Some(target) => {
-                            if is_https {
-                                target.https_url.clone()
-                            } else {
-                                target.ssh_url.clone()
-                            }
-                        }
-                        None => remote::fork_url_for_owner(&origin_url, &login)?,
-                    };
-                    if let Err(conflict) =
-                        ensure_fork_remote_url_free(&repo, &fork_remote_name, &candidate_url)
-                    {
-                        LiveTimer::maybe_finish_err(push_timer, "failed");
-                        if let Some(tx) = tx {
-                            tx.finish_err(
-                                &format!("Fork remote conflict: {}", conflict),
-                                Some("push"),
-                                None,
-                            )?;
-                        }
-                        return Err(conflict);
-                    }
-
-                    let (target, freshly_created) = match existing {
-                        Some(target) => (target, false),
-                        None => (
-                            fork_rt.block_on(async { fork_client.create_fork().await })?,
-                            true,
-                        ),
-                    };
-                    let fork_url = if is_https {
-                        target.https_url.clone()
+                let (resolved_owner, fork_freshly_created) =
+                    if fork_remote_configured && repo.remote_exists(&fork_remote_name) {
+                        // Trust the user-configured fork remote's URL for the owner
+                        // rather than assuming the authenticated login: a fork under
+                        // an org would otherwise be qualified with the wrong owner in
+                        // `owner:branch`.
+                        let configured_url = remote::get_remote_url(&repo, &fork_remote_name)?;
+                        let owner_from_url = remote::parse_remote_url(&configured_url)
+                            .ok()
+                            .and_then(|(_, path)| path.split('/').next().map(str::to_string))
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| login.clone());
+                        (owner_from_url, false)
                     } else {
-                        target.ssh_url.clone()
-                    };
-                    // Re-check with the URL GitHub actually returned (cheap; guards a
-                    // name mismatch against the predicted URL above).
-                    if let Err(conflict) =
-                        ensure_fork_remote_url_free(&repo, &fork_remote_name, &fork_url)
-                    {
-                        LiveTimer::maybe_finish_err(push_timer, "failed");
-                        if let Some(tx) = tx {
-                            tx.finish_err(
-                                &format!("Fork remote conflict: {}", conflict),
-                                Some("push"),
-                                None,
-                            )?;
+                        let origin_url = remote::get_remote_url(&repo, &remote_info.name)?;
+                        let is_https =
+                            origin_url.starts_with("http://") || origin_url.starts_with("https://");
+                        let existing = fork_rt
+                            .block_on(async { fork_client.find_pushable_fork(&login).await })?;
+
+                        // Pre-create conflict check: use the real URL when a fork already
+                        // exists, otherwise the predicted URL for `login` — we know the
+                        // target owner before ever calling `create_fork()`.
+                        let candidate_url = match &existing {
+                            Some(target) => {
+                                if is_https {
+                                    target.https_url.clone()
+                                } else {
+                                    target.ssh_url.clone()
+                                }
+                            }
+                            None => remote::fork_url_for_owner(&origin_url, &login)?,
+                        };
+                        if let Err(conflict) =
+                            ensure_fork_remote_url_free(&repo, &fork_remote_name, &candidate_url)
+                        {
+                            LiveTimer::maybe_finish_err(push_timer, "failed");
+                            if let Some(tx) = tx {
+                                tx.finish_err(
+                                    &format!("Fork remote conflict: {}", conflict),
+                                    Some("push"),
+                                    None,
+                                )?;
+                            }
+                            return Err(conflict);
                         }
-                        return Err(conflict);
-                    }
-                    repo.ensure_remote(&fork_remote_name, &fork_url)?;
-                    (target.owner, freshly_created)
-                };
+
+                        let (target, freshly_created) = match existing {
+                            Some(target) => (target, false),
+                            None => (
+                                fork_rt.block_on(async { fork_client.create_fork().await })?,
+                                true,
+                            ),
+                        };
+                        let fork_url = if is_https {
+                            target.https_url.clone()
+                        } else {
+                            target.ssh_url.clone()
+                        };
+                        // Re-check with the URL GitHub actually returned (cheap; guards a
+                        // name mismatch against the predicted URL above).
+                        if let Err(conflict) =
+                            ensure_fork_remote_url_free(&repo, &fork_remote_name, &fork_url)
+                        {
+                            LiveTimer::maybe_finish_err(push_timer, "failed");
+                            if let Some(tx) = tx {
+                                tx.finish_err(
+                                    &format!("Fork remote conflict: {}", conflict),
+                                    Some("push"),
+                                    None,
+                                )?;
+                            }
+                            return Err(conflict);
+                        }
+                        repo.ensure_remote(&fork_remote_name, &fork_url)?;
+                        (target.owner, freshly_created)
+                    };
 
                 // Reuse `push_branches` so the fork push honours `source_ref`
                 // (temporary publish ref for restacked branches), `--no-verify`,

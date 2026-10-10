@@ -58,7 +58,7 @@ impl TrustedRemoteInfo {
 impl RemoteInfo {
     pub fn from_repo(repo: &GitRepo, config: &Config) -> Result<Self> {
         let name = config.remote_name().to_string();
-        let url = get_remote_url(repo.workdir()?, &name)?;
+        let url = get_remote_url(repo, &name)?;
         let (host, path) = parse_remote_url(&url)?;
         let forge = detect_forge(
             &host,
@@ -264,9 +264,8 @@ fn url_authority_host(host: &str) -> String {
     }
 }
 
-pub fn get_remote_url(workdir: &Path, remote: &str) -> Result<String> {
-    if let Ok(repo) = Repository::discover(workdir)
-        && let Ok(config) = repo.config()
+pub fn get_remote_url(repo: &GitRepo, remote: &str) -> Result<String> {
+    if let Ok(config) = repo.inner().config()
         && let Ok(local) = config.open_level(ConfigLevel::Local)
         && let Ok(url) = local.get_string(&format!("remote.{}.url", remote))
         && !url.trim().is_empty()
@@ -276,7 +275,7 @@ pub fn get_remote_url(workdir: &Path, remote: &str) -> Result<String> {
 
     let output = Command::new("git")
         .args(["remote", "get-url", remote])
-        .current_dir(workdir)
+        .current_dir(repo.workdir()?)
         .output()
         .context("Failed to get remote URL")?;
 
@@ -665,7 +664,7 @@ mod tests {
             .output()
             .expect("Failed to set insteadOf");
 
-        let url = get_remote_url(path, "origin").unwrap();
+        let url = get_remote_url(&GitRepo::open_from_path(path).unwrap(), "origin").unwrap();
         assert_eq!(url, "https://github.com/test/repo.git");
     }
 

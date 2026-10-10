@@ -155,6 +155,29 @@ fn dry_run_clean_repo_says_no_changes() {
     );
 }
 
+#[test]
+fn dry_run_probes_the_remote_named_in_repository_stax_toml() {
+    let repo = TestRepo::new_with_remote();
+    repo.git(&["remote", "rename", "origin", "upstream"]);
+    std::fs::write(
+        repo.path().join("stax.toml"),
+        "[remote]\nname = \"upstream\"\n",
+    )
+    .unwrap();
+
+    let out = repo.run_stax(&["sync", "--dry-run"]);
+    assert!(
+        out.status.success(),
+        "--dry-run should exit 0; stderr: {}",
+        TestRepo::stderr(&out)
+    );
+    let stdout = TestRepo::stdout(&out);
+    assert!(
+        stdout.contains("Probed upstream via ls-remote"),
+        "--dry-run should probe the remote that stax.toml names; stdout:\n{stdout}"
+    );
+}
+
 // ─── Test (b.1) ──────────────────────────────────────────────────────────────
 // Remote discovery must use ls-remote, not fetch: both text and JSON plans leave
 // FETCH_HEAD and remote-tracking refs untouched even when origin/main advances.

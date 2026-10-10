@@ -344,7 +344,7 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
     let repo = GitRepo::open()?;
     let workdir = repo.workdir()?.to_path_buf();
     let sync_started_at = std::time::Instant::now();
-    let config = Config::load()?;
+    let config = Config::load_for_repo(&workdir)?;
     let remote_name = config.remote_name().to_string();
     let trunk = repo.trunk_branch()?;
     let remote_trunk_ref = format!("{}/{}", remote_name, trunk);

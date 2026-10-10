@@ -1066,14 +1066,16 @@ impl GitRepo {
 
         // Collect indices that need computation (cache misses).
         let mut misses: Vec<(usize, String, String)> = Vec::new();
-        for (i, ((base, head), sha_pair)) in pairs.iter().zip(shas.iter()).enumerate() {
-            if let Some((base_sha, head_sha)) = sha_pair
-                && let Some(cached) = cache.get(base_sha, head_sha)
-            {
+        for (i, sha_pair) in shas.iter().enumerate() {
+            let Some((base_sha, head_sha)) = sha_pair else {
+                results[i] = Some((0, 0));
+                continue;
+            };
+            if let Some(cached) = cache.get(base_sha, head_sha) {
                 results[i] = Some(cached);
                 continue;
             }
-            misses.push((i, base.clone(), head.clone()));
+            misses.push((i, base_sha.clone(), head_sha.clone()));
         }
 
         if !misses.is_empty() {
@@ -3388,6 +3390,46 @@ mod tests {
             .expect("patch at captured target");
         assert!(patch.iter().any(|line| line == "+captured"));
         assert!(!patch.iter().any(|line| line == "+moved"));
+    }
+
+    #[test]
+    fn test_commits_ahead_behind_many_uses_branch_oids_with_tag_collisions() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+        run_git(path, &["init", "-b", "main"]);
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test"]);
+        run_git(path, &["commit", "--allow-empty", "-m", "initial"]);
+        run_git(path, &["tag", "x"]);
+        run_git(path, &["switch", "-c", "x"]);
+        run_git(path, &["commit", "--allow-empty", "-m", "feature"]);
+        run_git(path, &["tag", "main"]);
+
+        let repo = GitRepo::open_from_path(path).unwrap();
+        let expected = repo.commits_ahead_behind("main", "x").unwrap();
+        assert_eq!(expected, (1, 0));
+        let pairs = vec![("main".to_string(), "x".to_string())];
+        assert!(!path.join(".git/stax/ahead-behind-cache.json").exists());
+        for _ in 0..2 {
+            assert_eq!(
+                repo.commits_ahead_behind_many(&pairs)[0].as_ref().unwrap(),
+                &expected
+            );
+            let cache = crate::cache::AheadBehindCache::load(&path.join(".git"));
+            assert_eq!(
+                cache.get(
+                    &repo.branch_commit("main").unwrap(),
+                    &repo.branch_commit("x").unwrap()
+                ),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            repo.commits_ahead_behind_many(&[("missing".into(), "x".into())])[0]
+                .as_ref()
+                .unwrap(),
+            &(0, 0)
+        );
     }
 
     #[test]

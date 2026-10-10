@@ -4988,27 +4988,18 @@ fn observe_retirement(
         Ok(None) if details.is_managed => Owner::Stax,
         Ok(None) => Owner::Unmanaged,
     };
-    let (evidence, contains_head) = match merged {
+    let evidence = match merged {
         Some(info) => match info.merged_pr_head_oid.as_deref() {
-            Some(pr_head) => {
-                let contains = is_ancestor(repo.workdir()?, pr_head, &head);
-                (
-                    MergeEvidence::MergedPullRequest {
-                        head_oid: pr_head,
-                        branch_contains_head: contains,
-                    },
-                    contains,
-                )
-            }
-            None if matches!(info.merge_type, MergeType::Ancestor) => (
-                MergeEvidence::Ancestry {
-                    branch_oid: &info.observed_branch_oid,
-                },
-                false,
-            ),
-            None => (MergeEvidence::Unknown, false),
+            Some(pr_head) => MergeEvidence::MergedPullRequest {
+                head_oid: pr_head,
+                branch_contains_head: is_ancestor(repo.workdir()?, pr_head, &head),
+            },
+            None if matches!(info.merge_type, MergeType::Ancestor) => MergeEvidence::Ancestry {
+                branch_oid: &info.observed_branch_oid,
+            },
+            None => MergeEvidence::Unknown,
         },
-        None => (MergeEvidence::Unknown, false),
+        None => MergeEvidence::Unknown,
     };
     let protected_operation = crate::commands::sync_retirement::protected_operation(&worktree.path);
     let operation = if worktree.is_locked {
@@ -5047,7 +5038,6 @@ fn observe_retirement(
             owner,
             evidence,
             branch_oid: &head,
-            branch_contains_merge_head: contains_head,
             operation,
         })
     };

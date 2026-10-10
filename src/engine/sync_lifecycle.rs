@@ -71,7 +71,6 @@ pub struct Observation<'a> {
     pub owner: Owner<'a>,
     pub evidence: MergeEvidence<'a>,
     pub branch_oid: &'a str,
-    pub branch_contains_merge_head: bool,
     pub operation: OperationState,
 }
 
@@ -101,9 +100,10 @@ pub fn decide(observation: Observation<'_>) -> LifecycleDecision {
     }
 
     let merge_proven = match observation.evidence {
-        MergeEvidence::MergedPullRequest { head_oid, .. } => {
-            head_oid == observation.branch_oid || observation.branch_contains_merge_head
-        }
+        MergeEvidence::MergedPullRequest {
+            head_oid,
+            branch_contains_head,
+        } => head_oid == observation.branch_oid || branch_contains_head,
         MergeEvidence::Ancestry { branch_oid } => branch_oid == observation.branch_oid,
         MergeEvidence::OpenPullRequest
         | MergeEvidence::ClosedUnmergedPullRequest
@@ -137,7 +137,6 @@ mod tests {
             owner: Owner::Stax,
             evidence,
             branch_oid: "head-1",
-            branch_contains_merge_head: false,
             operation: OperationState::Idle,
         }
     }
@@ -182,6 +181,13 @@ mod tests {
                 branch_contains_head: false,
             })),
             LifecycleDecision::Keep(RetentionReason::HeadChanged)
+        );
+        assert_eq!(
+            decide(observation(MergeEvidence::MergedPullRequest {
+                head_oid: "head-old",
+                branch_contains_head: true,
+            })),
+            LifecycleDecision::RecoverThenRetire
         );
         let mut target = observation(MergeEvidence::Ancestry {
             branch_oid: "head-1",

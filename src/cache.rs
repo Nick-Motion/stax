@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use fs4::FileExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -761,6 +761,68 @@ impl TuiStateCache {
     }
 }
 
+/// Successful ancestry checks between a branch tip and its recorded base.
+/// Only positive proofs are stored: missing objects and shallow history can heal.
+#[derive(Serialize, Deserialize, Default)]
+pub(crate) struct RecordedBaseCache {
+    history: String,
+    entries: HashSet<String>,
+}
+
+impl RecordedBaseCache {
+    fn cache_path(git_dir: &Path) -> PathBuf {
+        git_dir.join("stax").join("recorded-base-cache.json")
+    }
+
+    // Shallow boundaries and grafts change ancestry without changing commit OIDs.
+    fn history_key(git_dir: &Path) -> Result<String> {
+        let mut history = String::new();
+        for name in ["shallow", "info/grafts"] {
+            let contents = match fs::read(git_dir.join(name)) {
+                Ok(contents) => contents,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => return Err(error.into()),
+            };
+            history
+                .push_str(&git2::Oid::hash_object(git2::ObjectType::Blob, &contents)?.to_string());
+        }
+        Ok(history)
+    }
+
+    pub(crate) fn load(git_dir: &Path) -> Self {
+        match (
+            Self::history_key(git_dir),
+            load_json_unlocked::<Self>(&Self::cache_path(git_dir)),
+        ) {
+            (Ok(history), Ok(stored)) if history == stored.history => stored,
+            _ => Self::default(),
+        }
+    }
+
+    pub(crate) fn contains(&self, tip: git2::Oid, base: git2::Oid) -> bool {
+        self.entries.contains(&format!("{tip}:{base}"))
+    }
+
+    pub(crate) fn insert_persisted(git_dir: &Path, tip: git2::Oid, base: git2::Oid) -> Result<()> {
+        let path = Self::cache_path(git_dir);
+        let _lock = acquire_cache_lock(&path, LockMode::Exclusive)?;
+        let history = Self::history_key(git_dir)?;
+        let mut stored = load_json_unlocked::<Self>(&path).unwrap_or_default();
+        if stored.history != history {
+            stored = Self {
+                history,
+                entries: HashSet::new(),
+            };
+        }
+        stored.entries.insert(format!("{tip}:{base}"));
+        // A lost cache is recomputed, so atomic replacement needs no durable flush.
+        let mut temporary = NamedTempFile::new_in(path.parent().context("Cache has no parent")?)?;
+        serde_json::to_writer(temporary.as_file_mut(), &stored)?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        Ok(())
+    }
+}
+
 /// Cache for ahead/behind commit counts, keyed by (base_sha:head_sha).
 ///
 /// The key encodes the current tip OIDs of both refs, so the cache
@@ -956,6 +1018,23 @@ mod tests {
         assert!(BranchCommitsCache::load(dir.path()).entries.is_empty());
         BranchCommitsCache::default().save(dir.path()).unwrap();
         assert!(BranchCommitsCache::load(dir.path()).entries.is_empty());
+    }
+
+    #[test]
+    fn test_recorded_base_cache_preserves_pairs_and_recovers_from_corruption() {
+        let dir = TempDir::new().unwrap();
+        let tip = git2::Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+        let base = git2::Oid::from_str("2222222222222222222222222222222222222222").unwrap();
+        assert!(!RecordedBaseCache::load(dir.path()).contains(tip, base));
+        RecordedBaseCache::insert_persisted(dir.path(), tip, base).unwrap();
+        RecordedBaseCache::insert_persisted(dir.path(), base, tip).unwrap();
+        let cache = RecordedBaseCache::load(dir.path());
+        assert!(cache.contains(tip, base));
+        assert!(cache.contains(base, tip));
+        std::fs::write(RecordedBaseCache::cache_path(dir.path()), "broken JSON").unwrap();
+        assert!(!RecordedBaseCache::load(dir.path()).contains(tip, base));
+        RecordedBaseCache::insert_persisted(dir.path(), tip, base).unwrap();
+        assert!(RecordedBaseCache::load(dir.path()).contains(tip, base));
     }
 
     fn disk_diff(content: &str) -> DiskCachedDiff {

@@ -120,7 +120,7 @@ fn cached_branch_walk<'c>(
 /// the tracked branches whose tips trunk reaches, one `<branch> <tip>` line
 /// each, as `git for-each-ref --merged <trunk> --format='%(refname:short)
 /// %(objectname)'` lists them.
-fn walk_stack(
+pub(super) fn walk_stack(
     cache: &mut SyncHistoryCache,
     repo: &GitRepo,
     workdir: &Path,

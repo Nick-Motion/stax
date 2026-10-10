@@ -135,16 +135,24 @@ impl BranchMetadata {
         if branch_oid == base_oid {
             return true;
         }
-        // A stacked branch usually descends from its recorded base, so that
-        // libgit2 walk goes first and the second one rarely runs.
-        if repo
-            .graph_descendant_of(branch_oid, base_oid)
-            .unwrap_or(true)
-        {
+        let cache_dir = repo.commondir();
+        if crate::cache::RecordedBaseCache::load(cache_dir).contains(branch_oid, base_oid) {
             return true;
         }
-        repo.graph_descendant_of(base_oid, branch_oid)
-            .unwrap_or(false)
+        // A stacked branch usually descends from its recorded base, so that
+        // libgit2 walk goes first and the second one rarely runs.
+        let reachable = match repo.graph_descendant_of(branch_oid, base_oid) {
+            Ok(true) => true,
+            Err(_) => return true,
+            Ok(false) => repo
+                .graph_descendant_of(base_oid, branch_oid)
+                .unwrap_or(false),
+        };
+        if reachable {
+            let _ =
+                crate::cache::RecordedBaseCache::insert_persisted(cache_dir, branch_oid, base_oid);
+        }
+        reachable
     }
 }
 
@@ -317,5 +325,140 @@ mod git_tests {
         let meta = BranchMetadata::new("main", &c2);
 
         assert!(!meta.needs_restack(&repo, "feature").unwrap());
+    }
+
+    #[test]
+    fn recorded_base_cache_misses_when_the_recorded_base_changes() {
+        let (_dir, repo, c2) = repo_with_feature_branch_and_advanced_main();
+        let c1 = repo
+            .find_commit(git2::Oid::from_str(&c2).unwrap())
+            .unwrap()
+            .parent_id(0)
+            .unwrap()
+            .to_string();
+        assert!(BranchMetadata::recorded_base_is_reachable(
+            &repo, "feature", &c1
+        ));
+        assert!(BranchMetadata::recorded_base_is_reachable(
+            &repo, "feature", &c1
+        ));
+        assert!(!BranchMetadata::recorded_base_is_reachable(
+            &repo, "feature", &c2
+        ));
+    }
+
+    #[test]
+    fn recorded_base_cache_misses_when_the_branch_tip_changes() {
+        let (_dir, repo, c2) = repo_with_feature_branch_and_advanced_main();
+        let base = repo.find_commit(git2::Oid::from_str(&c2).unwrap()).unwrap();
+        let c1 = base.parent_id(0).unwrap().to_string();
+        assert!(BranchMetadata::recorded_base_is_reachable(
+            &repo, "feature", &c1
+        ));
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree = base.tree().unwrap();
+        let unrelated = repo
+            .commit(None, &signature, &signature, "unrelated", &tree, &[])
+            .unwrap();
+        repo.find_reference("refs/heads/feature")
+            .unwrap()
+            .set_target(unrelated, "test move")
+            .unwrap();
+        assert!(!BranchMetadata::recorded_base_is_reachable(
+            &repo, "feature", &c1
+        ));
+    }
+
+    #[test]
+    fn recorded_base_cache_does_not_store_lookup_errors() {
+        let (_dir, repo, _) = repo_with_feature_branch_and_advanced_main();
+        let tip = repo
+            .find_branch("feature", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        let missing = git2::Oid::ZERO_SHA1;
+        assert!(BranchMetadata::recorded_base_is_reachable(
+            &repo,
+            "feature",
+            &missing.to_string()
+        ));
+        assert!(!crate::cache::RecordedBaseCache::load(repo.commondir()).contains(tip, missing));
+    }
+
+    #[test]
+    fn recorded_base_cache_is_invalidated_when_grafts_change_ancestry() {
+        let (_dir, repo, c2) = repo_with_feature_branch_and_advanced_main();
+        let c1 = repo
+            .find_commit(git2::Oid::from_str(&c2).unwrap())
+            .unwrap()
+            .parent_id(0)
+            .unwrap()
+            .to_string();
+        assert!(BranchMetadata::recorded_base_is_reachable(
+            &repo, "feature", &c1
+        ));
+        let tip = repo
+            .find_branch("feature", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        std::fs::write(repo.commondir().join("info/grafts"), format!("{tip}\n")).unwrap();
+        let reopened = git2::Repository::open(repo.workdir().unwrap()).unwrap();
+        assert!(!BranchMetadata::recorded_base_is_reachable(
+            &reopened, "feature", &c1
+        ));
+    }
+
+    #[test]
+    fn recorded_base_cache_preserves_reverse_ancestry() {
+        let (_dir, repo, c2) = repo_with_feature_branch_and_advanced_main();
+        let c1 = repo
+            .find_commit(git2::Oid::from_str(&c2).unwrap())
+            .unwrap()
+            .parent_id(0)
+            .unwrap();
+        repo.find_reference("refs/heads/feature")
+            .unwrap()
+            .set_target(c1, "test move")
+            .unwrap();
+        let meta = BranchMetadata::new("main", &c2);
+        assert!(!meta.needs_restack(&repo, "feature").unwrap());
+        assert!(!meta.needs_restack(&repo, "feature").unwrap());
+        assert!(
+            crate::cache::RecordedBaseCache::load(repo.commondir())
+                .contains(c1, git2::Oid::from_str(&c2).unwrap())
+        );
+    }
+
+    #[test]
+    fn recorded_base_cache_is_invalidated_when_history_becomes_shallow() {
+        let (_dir, repo, c2) = repo_with_feature_branch_and_advanced_main();
+        let c1 = repo
+            .find_commit(git2::Oid::from_str(&c2).unwrap())
+            .unwrap()
+            .parent_id(0)
+            .unwrap()
+            .to_string();
+        assert!(BranchMetadata::recorded_base_is_reachable(
+            &repo, "feature", &c1
+        ));
+        let tip = repo
+            .find_branch("feature", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        std::fs::write(repo.commondir().join("shallow"), format!("{tip}\n")).unwrap();
+        let reopened = git2::Repository::open(repo.workdir().unwrap()).unwrap();
+        assert!(reopened.is_shallow());
+        assert!(!BranchMetadata::recorded_base_is_reachable(
+            &reopened, "feature", &c1
+        ));
     }
 }

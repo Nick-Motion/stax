@@ -840,23 +840,13 @@ impl AheadBehindCache {
     }
 
     pub fn load(git_dir: &std::path::Path) -> Self {
-        let path = Self::cache_path(git_dir);
-        if !path.exists() {
-            return Self::default();
-        }
-        fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        load_json_unlocked(&Self::cache_path(git_dir)).unwrap_or_default()
     }
 
     pub fn save(&self, git_dir: &std::path::Path) -> Result<()> {
         let path = Self::cache_path(git_dir);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, serde_json::to_string(self)?)?;
-        Ok(())
+        fs::create_dir_all(git_dir.join("stax"))?;
+        persist_json_atomic(&path, self)
     }
 
     pub fn get(&self, base_sha: &str, head_sha: &str) -> Option<(usize, usize)> {
@@ -883,19 +873,13 @@ impl LineDiffCache {
     }
 
     pub fn load(git_dir: &Path) -> Self {
-        fs::read_to_string(Self::cache_path(git_dir))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        load_json_unlocked(&Self::cache_path(git_dir)).unwrap_or_default()
     }
 
     pub fn save(&self, git_dir: &Path) -> Result<()> {
         let path = Self::cache_path(git_dir);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, serde_json::to_string(self)?)?;
-        Ok(())
+        fs::create_dir_all(git_dir.join("stax"))?;
+        persist_json_atomic(&path, self)
     }
 
     pub fn prune(&mut self, keys: &std::collections::HashSet<String>) {
@@ -946,6 +930,45 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use tempfile::TempDir;
+
+    #[test]
+    fn ahead_behind_cache_save_atomically_replaces_previous_file() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = AheadBehindCache::default();
+        cache.set("base", "head", 1, 2);
+        cache.save(dir.path()).unwrap();
+        let path = AheadBehindCache::cache_path(dir.path());
+        let previous = dir.path().join("previous.json");
+        fs::hard_link(&path, &previous).unwrap();
+        cache.set("base", "head", 3, 4);
+        cache.save(dir.path()).unwrap();
+
+        let old: AheadBehindCache = load_json_unlocked(&previous).unwrap();
+        assert_eq!(old.get("base", "head"), Some((1, 2)));
+        assert_eq!(
+            AheadBehindCache::load(dir.path()).get("base", "head"),
+            Some((3, 4))
+        );
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn line_diff_cache_save_atomically_replaces_previous_file() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = LineDiffCache::default();
+        cache.entries.insert("base:head".into(), (1, 2));
+        cache.save(dir.path()).unwrap();
+        let path = LineDiffCache::cache_path(dir.path());
+        let previous = dir.path().join("previous.json");
+        fs::hard_link(&path, &previous).unwrap();
+        cache.entries.insert("base:head".into(), (3, 4));
+        cache.save(dir.path()).unwrap();
+
+        let old: LineDiffCache = load_json_unlocked(&previous).unwrap();
+        assert_eq!(old.entries["base:head"], (1, 2));
+        assert_eq!(LineDiffCache::load(dir.path()).entries["base:head"], (3, 4));
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
 
     #[test]
     fn line_diff_cache_round_trip_and_prune() {

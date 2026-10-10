@@ -1,4 +1,4 @@
-use crate::cache::CiCache;
+use crate::cache::{BranchCommitsCache, CiCache};
 use crate::config::Config;
 use crate::engine::Stack;
 use crate::git::GitRepo;
@@ -170,6 +170,37 @@ pub fn run(
         .map(|((_, name), result)| (name.as_str(), result.unwrap_or((0, 0))))
         .collect();
 
+    let tip = |name: &str| {
+        repo.inner()
+            .find_branch(name, git2::BranchType::Local)
+            .ok()?
+            .get()
+            .peel_to_commit()
+            .ok()
+            .map(|commit| commit.id())
+    };
+    let commit_keys: HashMap<_, _> = stack
+        .branches
+        .iter()
+        .filter_map(|(name, info)| {
+            let head = tip(name)?;
+            let parent = info.parent.as_deref().and_then(tip);
+            let key = format!(
+                "{}:{}",
+                head,
+                parent.map_or_else(|| "none".into(), |oid| oid.to_string())
+            );
+            Some((name.as_str(), (key, head, parent)))
+        })
+        .collect();
+    let mut commit_cache = BranchCommitsCache::load(&cache_dir);
+    let mut commit_cache_dirty = commit_cache.prune(
+        &commit_keys
+            .values()
+            .map(|(key, _, _)| key.clone())
+            .collect(),
+    );
+
     let mut branch_logs: Vec<BranchLogJson> = Vec::new();
     let mut branch_log_map: HashMap<String, BranchLogJson> = HashMap::new();
 
@@ -186,9 +217,24 @@ pub fn run(
         let pr_url = pr_number.and_then(|n| remote_info.as_ref().map(|r| r.pr_url(n)));
         let ci_state = ci_states.get(name).cloned();
 
-        let commits = repo
-            .branch_commits(name, parent.as_deref())
-            .unwrap_or_default()
+        let revisions = commit_keys.get(name.as_str());
+        let cached = revisions
+            .and_then(|(key, _, _)| commit_cache.entries.get(key))
+            .cloned();
+        let commits = cached
+            .unwrap_or_else(|| {
+                let Some((key, head, parent)) = revisions else {
+                    return Vec::new();
+                };
+                match repo.branch_commits(*head, *parent) {
+                    Ok(commits) => {
+                        commit_cache.entries.insert(key.clone(), commits.clone());
+                        commit_cache_dirty = true;
+                        commits
+                    }
+                    Err(_) => Vec::new(),
+                }
+            })
             .into_iter()
             .map(|c| CommitJson {
                 short_hash: c.short_hash,
@@ -218,6 +264,10 @@ pub fn run(
 
         branch_log_map.insert(name.clone(), entry.clone());
         branch_logs.push(entry);
+    }
+
+    if commit_cache_dirty {
+        let _ = commit_cache.save(&cache_dir);
     }
 
     if json {

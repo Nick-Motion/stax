@@ -954,6 +954,85 @@ fn test_log_json_output() {
 }
 
 #[test]
+fn test_log_commit_cache_hits_and_invalidates_both_tips() {
+    let repo = TestRepo::new();
+    assert!(repo.run_stax(&["bc", "feature"]).status.success());
+    let branch = repo.current_branch();
+    repo.create_file("feature.txt", "first");
+    repo.commit("First feature");
+    for index in 1..=5 {
+        repo.create_file("feature.txt", &format!("feature {index}"));
+        repo.commit(&format!("Feature {index}"));
+    }
+    let cache_path = repo.path().join(".git/stax/branch-commits-cache.json");
+    let log = || {
+        let output = repo.run_stax(&["log", "--json"]);
+        assert!(output.status.success(), "{}", TestRepo::stderr(&output));
+        serde_json::from_slice::<Value>(&output.stdout).expect("log JSON")
+    };
+    let key = || {
+        let tip = |name: &str| {
+            let output = repo.git(&["rev-parse", name]);
+            assert!(output.status.success());
+            TestRepo::stdout(&output).trim().to_string()
+        };
+        format!("{}:{}", tip(&branch), tip("main"))
+    };
+    let read_cache =
+        || serde_json::from_slice::<Value>(&fs::read(&cache_path).unwrap()).expect("cache JSON");
+    let cold = log();
+    assert_eq!(cold, log());
+    let old_key = key();
+    let mut cache = read_cache();
+    assert_eq!(cache["entries"][&old_key].as_array().unwrap().len(), 5);
+    assert_eq!(cache["entries"][&old_key][0]["message"], "Feature 5");
+    assert_eq!(
+        cache["entries"][&old_key][0]["short_hash"]
+            .as_str()
+            .unwrap()
+            .len(),
+        10
+    );
+    // A sentinel proves the second process reads the entry instead of walking again.
+    cache["entries"][&old_key][0]["message"] = Value::from("Cached summary");
+    fs::write(&cache_path, serde_json::to_vec(&cache).unwrap()).unwrap();
+    let hit = log();
+    let entry = hit["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == branch)
+        .unwrap();
+    assert_eq!(entry["commits"][0]["message"], "Cached summary");
+
+    repo.create_file("feature.txt", "second");
+    repo.commit("Second feature");
+    let moved = log();
+    let new_key = key();
+    assert_ne!(old_key, new_key);
+    let cache = read_cache();
+    assert!(cache["entries"].get(&old_key).is_none());
+    assert_eq!(cache["entries"][&new_key][0]["message"], "Second feature");
+    fs::remove_file(&cache_path).unwrap();
+    assert_eq!(moved, log());
+
+    assert!(repo.git(&["checkout", "main"]).status.success());
+    repo.create_file("trunk.txt", "trunk");
+    repo.commit("Trunk update");
+    let parent_moved = log();
+    assert_ne!(new_key, key());
+    assert!(read_cache()["entries"].get(&new_key).is_none());
+    fs::remove_file(&cache_path).unwrap();
+    assert_eq!(parent_moved, log());
+
+    fs::write(&cache_path, b"{").unwrap();
+    assert_eq!(parent_moved, log());
+    fs::remove_file(&cache_path).unwrap();
+    fs::create_dir(&cache_path).unwrap();
+    assert_eq!(parent_moved, log());
+}
+
+#[test]
 fn test_log_json_ahead_behind_cache_tracks_each_parent_and_ref_moves() {
     let repo = TestRepo::new();
     assert!(repo.run_stax(&["bc", "feature-1"]).status.success());

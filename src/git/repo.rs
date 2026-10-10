@@ -2352,21 +2352,18 @@ Use --auto-stash-pop or stash/commit changes first.",
         &self.repo
     }
 
-    /// Get commits unique to a branch (not in parent)
-    pub fn branch_commits(&self, branch: &str, parent: Option<&str>) -> Result<Vec<CommitInfo>> {
-        let branch_ref = self.repo.find_branch(branch, BranchType::Local)?;
-        let branch_commit = branch_ref.get().peel_to_commit()?;
-
+    /// Get the first five commits reachable from a tip but not its parent tip.
+    pub fn branch_commits(
+        &self,
+        branch_tip: git2::Oid,
+        parent_tip: Option<git2::Oid>,
+    ) -> Result<Vec<CommitInfo>> {
         let mut commits = Vec::new();
         let mut revwalk = self.repo.revwalk()?;
-        revwalk.push(branch_commit.id())?;
+        revwalk.push(branch_tip)?;
 
-        // If parent specified, exclude its commits
-        if let Some(parent_name) = parent
-            && let Ok(parent_ref) = self.repo.find_branch(parent_name, BranchType::Local)
-            && let Ok(parent_commit) = parent_ref.get().peel_to_commit()
-        {
-            revwalk.hide(parent_commit.id())?;
+        if let Some(parent_tip) = parent_tip {
+            revwalk.hide(parent_tip)?;
         }
 
         for oid in revwalk.take(5) {
@@ -3045,7 +3042,7 @@ pub struct RebaseOutcome {
     pub timings: RebaseTimings,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct CommitInfo {
     pub short_hash: String,
     pub message: String,

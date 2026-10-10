@@ -2366,7 +2366,12 @@ exit 1
     );
 }
 
-async fn check_sync_token_scope(host: &str, repo_trust: bool, dry_run: bool) {
+async fn check_sync_token_scope(
+    host: &str,
+    repo_trust: bool,
+    dry_run: bool,
+    config_override: bool,
+) {
     let server = MockServer::start().await;
     let repo = TestRepo::new_with_remote();
     let home = repo.clean_home();
@@ -2403,6 +2408,17 @@ async fn check_sync_token_scope(host: &str, repo_trust: bool, dry_run: bool) {
         );
         repo.commit("Configure repository forge");
     }
+    if config_override {
+        repo.git(&[
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/other-owner/other-repo.git",
+        ])
+        .assert_success();
+        repo.create_file("stax.toml", "[remote]\nname = \"upstream\"\n");
+        repo.commit("Select repository remote");
+    }
     let fake = fake_gh_dir(
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_CALL_LOG\"\nprintf 'fake-token\\n'\n",
     );
@@ -2414,16 +2430,40 @@ async fn check_sync_token_scope(host: &str, repo_trust: bool, dry_run: bool) {
     } else {
         vec!["sync", "--force"]
     };
-    let output = repo.run_stax_with_env(
-        &args,
-        &[
-            ("HOME", &home),
-            ("XDG_CONFIG_HOME", &format!("{home}/.config")),
-            ("PATH", &path),
-            ("GH_CALL_LOG", log.to_str().unwrap()),
-        ],
-    );
+    let xdg_config_home = format!("{home}/.config");
+    let config_dir = format!("{xdg_config_home}/stax");
+    let mut env = vec![
+        ("HOME", home.as_str()),
+        ("XDG_CONFIG_HOME", &xdg_config_home),
+        ("PATH", &path),
+        ("GH_CALL_LOG", log.to_str().unwrap()),
+    ];
+    if config_override {
+        env.push(("STAX_CONFIG_DIR", &config_dir));
+    }
+    let output = repo.run_stax_with_env(&args, &env);
     output.assert_success();
+    if config_override {
+        let paths: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert!(
+            paths
+                .iter()
+                .all(|path| !path.contains("other-owner") && !path.contains("other-repo")),
+            "sync used the repository override remote; paths: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.starts_with("/repos/test-owner/test-repo/")),
+            "sync must query the git remote repository; paths: {paths:?}"
+        );
+    }
     let calls = fs::read_to_string(log).unwrap();
     if host == "github.com" {
         assert!(!calls.is_empty(), "sync must construct a forge client");
@@ -2443,30 +2483,40 @@ async fn check_sync_token_scope(host: &str, repo_trust: bool, dry_run: bool) {
 
 #[tokio::test]
 async fn test_sync_token_scope_untrusted_dry_run() {
-    check_sync_token_scope("git.example.test", false, true).await;
+    check_sync_token_scope("git.example.test", false, true, false).await;
 }
 
 #[tokio::test]
 async fn test_sync_token_scope_untrusted_sync() {
-    check_sync_token_scope("git.example.test", false, false).await;
+    check_sync_token_scope("git.example.test", false, false, false).await;
 }
 
 #[tokio::test]
 async fn test_sync_token_scope_repo_cannot_trust_dry_run() {
-    check_sync_token_scope("git.example.test", true, true).await;
+    check_sync_token_scope("git.example.test", true, true, false).await;
 }
 
 #[tokio::test]
 async fn test_sync_token_scope_repo_cannot_trust_sync() {
-    check_sync_token_scope("git.example.test", true, false).await;
+    check_sync_token_scope("git.example.test", true, false, false).await;
 }
 
 #[tokio::test]
 async fn test_sync_token_scope_github_dry_run() {
-    check_sync_token_scope("github.com", false, true).await;
+    check_sync_token_scope("github.com", false, true, false).await;
 }
 
 #[tokio::test]
 async fn test_sync_token_scope_github_sync() {
-    check_sync_token_scope("github.com", false, false).await;
+    check_sync_token_scope("github.com", false, false, false).await;
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_config_dir_dry_run() {
+    check_sync_token_scope("github.com", false, true, true).await;
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_config_dir_sync() {
+    check_sync_token_scope("github.com", false, false, true).await;
 }

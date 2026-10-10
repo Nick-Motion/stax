@@ -351,7 +351,7 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
     // The forge client resolves a token, often with a `gh auth token` process,
     // and loads TLS roots. Build it while ls-remote, the stack load and the
     // status check run.
-    let forge = trusted_forge_remote(&repo)
+    let forge = trusted_forge_remote(&repo, &remote_name)
         .map(|(remote, config)| std::thread::spawn(move || forge_client(&remote, &config)));
     // ls-remote and the status check are git processes that need nothing from
     // each other or from the stack load, so all three run at once.

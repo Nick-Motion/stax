@@ -1543,12 +1543,13 @@ impl SyncContext {
         self.live_pr_observations.clear();
         let refreshed = {
             let Self {
+                config,
                 quiet,
                 tx,
                 live_pr_observations,
                 ..
             } = self;
-            refresh_pr_draft_states(repo, *quiet, tx.as_mut(), live_pr_observations)?
+            refresh_pr_draft_states(repo, config, *quiet, tx.as_mut(), live_pr_observations)?
         };
         if let Some(pr_refresh_elapsed) = refreshed {
             self.step_timings
@@ -1984,7 +1985,7 @@ impl SyncContext {
             let repo = repo.refresh()?;
 
             // Initialize forge client once up-front for any PR base updates below.
-            let forge_client = init_forge_client(&repo);
+            let forge_client = init_forge_client(&repo, self.config.remote_name());
 
             if !merged.is_empty() {
                 if !self.quiet {
@@ -2662,7 +2663,7 @@ impl SyncContext {
                 };
 
                 // Initialize forge client once up-front for any PR base updates below.
-                let forge_client = init_forge_client(repo);
+                let forge_client = init_forge_client(repo, self.config.remote_name());
 
                 let gone_deletions: HashSet<String> = gone.iter().cloned().collect();
                 for branch in &gone {
@@ -3857,6 +3858,7 @@ fn run_sync_phases(ctx: &mut SyncContext, repo: GitRepo) -> Result<()> {
 /// `gh pr edit --base` are reflected in time for cleanup.
 fn refresh_pr_draft_states(
     repo: &GitRepo,
+    config: &Config,
     quiet: bool,
     mut tx: Option<&mut Transaction>,
     observations: &mut HashMap<String, crate::forge::PrInfoWithHead>,
@@ -3889,7 +3891,7 @@ fn refresh_pr_draft_states(
 
     let timer = LiveTimer::maybe_new(!quiet, "Refresh PR metadata");
 
-    let Some((rt, client)) = init_forge_client(repo) else {
+    let Some((rt, client)) = init_forge_client(repo, config.remote_name()) else {
         LiveTimer::maybe_finish_skipped(timer, "skipped");
         return Ok(Some(started_at.elapsed()));
     };
@@ -4806,14 +4808,22 @@ pub(super) fn local_branch_exists(workdir: &std::path::Path, branch: &str) -> bo
         .unwrap_or(false)
 }
 
-pub(super) fn trusted_forge_remote(repo: &GitRepo) -> Option<(TrustedRemoteInfo, Config)> {
-    let config = Config::load_for_trusted_network(repo.workdir().ok()?).ok()?;
+// Use the same remote as sync's git commands, even when repository config is skipped.
+pub(super) fn trusted_forge_remote(
+    repo: &GitRepo,
+    remote_name: &str,
+) -> Option<(TrustedRemoteInfo, Config)> {
+    let mut config = Config::load_global().ok()?;
+    config.remote.name = remote_name.to_string();
     let remote = TrustedRemoteInfo::from_repo(repo, &config).ok()?;
     Some((remote, config))
 }
 
-pub(super) fn init_forge_client(repo: &GitRepo) -> Option<(tokio::runtime::Runtime, ForgeClient)> {
-    let (remote, config) = trusted_forge_remote(repo)?;
+pub(super) fn init_forge_client(
+    repo: &GitRepo,
+    remote_name: &str,
+) -> Option<(tokio::runtime::Runtime, ForgeClient)> {
+    let (remote, config) = trusted_forge_remote(repo, remote_name)?;
     forge_client(&remote, &config)
 }
 

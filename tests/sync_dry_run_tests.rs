@@ -178,6 +178,25 @@ fn dry_run_probes_the_remote_named_in_repository_stax_toml() {
     );
 }
 
+#[test]
+fn dry_run_compares_local_trunk_with_the_remote() {
+    let repo = TestRepo::new_with_remote();
+    repo.create_file("local-only.txt", "local");
+    repo.commit("local-only trunk commit");
+
+    let out = repo.run_stax(&["sync", "--dry-run"]);
+    assert!(
+        out.status.success(),
+        "--dry-run should exit 0; stderr: {}",
+        TestRepo::stderr(&out)
+    );
+    let stdout = TestRepo::stdout(&out);
+    assert!(
+        stdout.contains("main diverged from remote (1 ahead, 0 behind)"),
+        "--dry-run should compare local main, not origin/main, with the remote; stdout:\n{stdout}"
+    );
+}
+
 // ─── Test (b.1) ──────────────────────────────────────────────────────────────
 // Remote discovery must use ls-remote, not fetch: both text and JSON plans leave
 // FETCH_HEAD and remote-tracking refs untouched even when origin/main advances.

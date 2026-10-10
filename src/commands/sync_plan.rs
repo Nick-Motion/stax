@@ -60,7 +60,7 @@ pub(super) enum TrunkPlan {
 
 pub(super) fn classify_trunk_plan(
     workdir: &Path,
-    trunk: &str,
+    local_oid: Option<&str>,
     remote_head_oid: Option<&str>,
     safe: bool,
     on_trunk: bool,
@@ -71,7 +71,7 @@ pub(super) fn classify_trunk_plan(
         None => return TrunkPlan::RemoteUnknown,
     };
 
-    let local_oid = match resolve_ref_oid(workdir, trunk) {
+    let local_oid = match local_oid {
         Some(oid) => oid,
         None => {
             return TrunkPlan::ObjectsAbsent {
@@ -91,7 +91,7 @@ pub(super) fn classify_trunk_plan(
         };
     }
 
-    if is_ancestor(workdir, &local_oid, remote_oid) {
+    if is_ancestor(workdir, local_oid, remote_oid) {
         // Fast-forward is possible. If on trunk with a dirty tree, git merge --ff-only may fail.
         if on_trunk && dirty {
             if safe {
@@ -106,8 +106,8 @@ pub(super) fn classify_trunk_plan(
             }
         }
         match (
-            count_commits_between(workdir, &local_oid, remote_oid),
-            diff_line_stats_between(workdir, &local_oid, remote_oid),
+            count_commits_between(workdir, local_oid, remote_oid),
+            diff_line_stats_between(workdir, local_oid, remote_oid),
         ) {
             (Ok(commits), Ok((files, additions, deletions))) => TrunkPlan::FastForward {
                 commits,
@@ -120,8 +120,8 @@ pub(super) fn classify_trunk_plan(
             },
         }
     } else {
-        let ahead = count_commits_between(workdir, remote_oid, &local_oid).unwrap_or(0);
-        let behind = count_commits_between(workdir, &local_oid, remote_oid).unwrap_or(0);
+        let ahead = count_commits_between(workdir, remote_oid, local_oid).unwrap_or(0);
+        let behind = count_commits_between(workdir, local_oid, remote_oid).unwrap_or(0);
         TrunkPlan::Diverged { ahead, behind }
     }
 }
@@ -519,9 +519,14 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
 
     // --- Trunk section ---
     let on_trunk = current == trunk;
+    let local_trunk_oid = repo
+        .inner()
+        .revparse_single(&trunk)
+        .ok()
+        .map(|object| object.id().to_string());
     let trunk_plan = classify_trunk_plan(
         &workdir,
-        &trunk,
+        local_trunk_oid.as_deref(),
         remote_head_oid.as_deref(),
         safe,
         on_trunk,
@@ -1349,7 +1354,7 @@ mod tests {
     #[test]
     fn classify_trunk_plan_remote_unknown_when_no_remote_oid() {
         let dir = std::env::temp_dir();
-        let plan = classify_trunk_plan(&dir, "main", None, false, false, false);
+        let plan = classify_trunk_plan(&dir, None, None, false, false, false);
         assert!(matches!(plan, TrunkPlan::RemoteUnknown));
     }
 

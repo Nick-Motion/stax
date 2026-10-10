@@ -73,10 +73,25 @@ struct BranchWalk {
     rev_list: String,
 }
 
-/// The commit `name` resolves to.
+/// `name` as an object id when it spells all of one. `Oid::from_str` pads a
+/// shorter prefix with zeros.
+fn full_oid(name: &str) -> Option<git2::Oid> {
+    git2::Oid::from_str(name).ok().filter(|_| name.len() == 40)
+}
+
+/// The commit `name` resolves to. A full object id, as a recorded parent
+/// revision is, needs only its object header read.
 fn commit_oid(repo: &GitRepo, name: &str) -> Option<git2::Oid> {
-    repo.inner()
-        .revparse_single(&format!("{name}^{{commit}}"))
+    let repo = repo.inner();
+    if let Some(oid) = full_oid(name)
+        && repo
+            .odb()
+            .and_then(|odb| odb.read_header(oid))
+            .is_ok_and(|(_, kind)| kind == git2::ObjectType::Commit)
+    {
+        return Some(oid);
+    }
+    repo.revparse_single(&format!("{name}^{{commit}}"))
         .ok()
         .map(|commit| commit.id())
 }
@@ -189,10 +204,14 @@ pub(super) fn walk_stack(
 /// after sync moves refs.
 fn range_key(repo: &GitRepo, base: &str, head: &str) -> (String, String) {
     // Resolve through libgit2. Spawning `git rev-parse` for each endpoint used
-    // to consume the subprocess savings from sharing the patch scans.
-    let base_oid = repo.resolve_ref(base).unwrap_or_else(|_| base.to_string());
-    let head_oid = repo.resolve_ref(head).unwrap_or_else(|_| head.to_string());
-    (base_oid, head_oid)
+    // to consume the subprocess savings from sharing the patch scans. A full
+    // object id, as a merge base is, is kept: `resolve_ref` tries three ref
+    // lookups and then loads the object.
+    let resolve = |name: &str| match full_oid(name) {
+        Some(oid) => oid.to_string(),
+        None => repo.resolve_ref(name).unwrap_or_else(|_| name.to_string()),
+    };
+    (resolve(base), resolve(head))
 }
 
 /// Of the commits of `merge_base..branch` with a diff, how many have the
@@ -6553,6 +6572,46 @@ mod tests {
         // Nor does it know that trunk now has ahead's commits.
         run(&["update-ref", "refs/heads/main", "ahead"]);
         assert_eq!(counts(&["ahead", "merging"]), [0, 2]);
+    }
+
+    #[test]
+    fn object_ids_and_hex_branch_names_resolve_as_revparse_resolves_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["commit", "--allow-empty", "-m", "base"]);
+        let base = run(&["rev-parse", "HEAD"]);
+        run(&["switch", "-c", "cafe"]);
+        run(&["commit", "--allow-empty", "-m", "cafe"]);
+        let cafe = run(&["rev-parse", "HEAD"]);
+        run(&["tag", "-a", "-m", "tag", "annotated", &base]);
+        let tag = run(&["rev-parse", "annotated"]);
+        let tree = run(&["rev-parse", "HEAD^{tree}"]);
+
+        let repo = GitRepo::open_from_path(path).unwrap();
+        let commit = |name: &str| commit_oid(&repo, name).map(|oid| oid.to_string());
+        assert_eq!(commit(&base), Some(base.clone()));
+        assert_eq!(commit(&tag), Some(base.clone()));
+        assert_eq!(commit(&tree), None);
+        assert_eq!(commit(&"1".repeat(40)), None);
+        // `Oid::from_str` reads "cafe" as cafe000…
+        assert_eq!(range_key(&repo, &base, "cafe"), (base, cafe));
     }
 
     #[test]

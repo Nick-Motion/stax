@@ -809,6 +809,38 @@ impl AheadBehindCache {
     }
 }
 
+/// Cache for Git numstat totals, keyed by parent and branch tip OIDs.
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct LineDiffCache {
+    pub entries: HashMap<String, (usize, usize)>,
+}
+
+impl LineDiffCache {
+    fn cache_path(git_dir: &Path) -> PathBuf {
+        git_dir.join("stax").join("line-diff-cache.json")
+    }
+
+    pub fn load(git_dir: &Path) -> Self {
+        fs::read_to_string(Self::cache_path(git_dir))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, git_dir: &Path) -> Result<()> {
+        let path = Self::cache_path(git_dir);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, serde_json::to_string(self)?)?;
+        Ok(())
+    }
+
+    pub fn prune(&mut self, keys: &std::collections::HashSet<String>) {
+        self.entries.retain(|key, _| keys.contains(key));
+    }
+}
+
 #[cfg(test)]
 fn current_unix_time() -> u64 {
     SystemTime::now()
@@ -823,6 +855,36 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use tempfile::TempDir;
+
+    #[test]
+    fn line_diff_cache_round_trip_and_prune() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = LineDiffCache::default();
+        cache.entries.insert("parent:head".into(), (12, 3));
+        cache.entries.insert("old:head".into(), (1, 2));
+        cache.save(dir.path()).unwrap();
+        let mut loaded = LineDiffCache::load(dir.path());
+        assert_eq!(loaded.entries, cache.entries);
+        loaded.prune(&["parent:head".to_string()].into_iter().collect());
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries["parent:head"], (12, 3));
+        loaded.save(dir.path()).unwrap();
+        assert_eq!(LineDiffCache::load(dir.path()).entries, loaded.entries);
+    }
+
+    #[test]
+    fn line_diff_cache_ignores_missing_malformed_and_unreadable_files() {
+        let dir = TempDir::new().unwrap();
+        assert!(LineDiffCache::load(dir.path()).entries.is_empty());
+        let path = LineDiffCache::cache_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{").unwrap();
+        assert!(LineDiffCache::load(dir.path()).entries.is_empty());
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(LineDiffCache::load(dir.path()).entries.is_empty());
+        assert!(LineDiffCache::default().save(dir.path()).is_err());
+    }
 
     fn disk_diff(content: &str) -> DiskCachedDiff {
         DiskCachedDiff {

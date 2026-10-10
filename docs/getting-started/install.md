@@ -44,16 +44,10 @@ Download `stax-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/ce
 
 ## Build from source
 
-Requires Rust and system OpenSSL (Debian/Ubuntu: `libssl-dev pkg-config` · Fedora/RHEL: `openssl-devel` · Arch: `openssl pkg-config`).
+Requires Rust and a C compiler.
 
 ```bash
 cargo install --path . --locked
-```
-
-Without system OpenSSL:
-
-```bash
-cargo install --path . --locked --features vendored-openssl
 ```
 
 ## Verify and onboard

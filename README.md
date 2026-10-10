@@ -84,24 +84,12 @@ mv stax st ~/.local/bin/
 
 ### Build from source
 
-Prereqs:
-- Debian/Ubuntu: `sudo apt-get install libssl-dev pkg-config`
-- Fedora/RHEL: `sudo dnf install openssl-devel`
-- Arch: `sudo pacman -S openssl pkg-config`
-- macOS: OpenSSL included
-
-Then:
+Requires Rust and a C compiler.
 
 ```bash
 cargo install --path . --locked
 # or
 make install
-```
-
-No system OpenSSL? Use the vendored feature:
-
-```bash
-cargo install --path . --locked --features vendored-openssl
 ```
 
 </details>

@@ -56,15 +56,15 @@ path = "tests/all_tests.rs"
 
 [features]
 default = []
-vendored-openssl = ["git2/vendored-openssl"]
 
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 
-# Git (no ssh — we use HTTPS + token auth exclusively)
-git2 = { version = "0.21", default-features = false, features = ["https"] }
+# Git. The git CLI does all network work, so libgit2 is built without
+# transports: an HTTPS build loads OpenSSL and its CA bundle on every run.
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 
 # GitHub API
 octocrab = "0.54.1"

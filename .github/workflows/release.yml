@@ -57,7 +57,7 @@ jobs:
         run: cargo nextest run --lib --bins
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --features vendored-openssl
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: matrix.target != 'x86_64-pc-windows-msvc'

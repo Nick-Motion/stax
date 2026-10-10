@@ -841,6 +841,35 @@ impl LineDiffCache {
     }
 }
 
+/// The five leading branch commits, keyed by branch tip and resolved parent tip.
+/// Moving either tip changes the key; an absent parent is encoded as `none`.
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct BranchCommitsCache {
+    pub entries: HashMap<String, Vec<crate::git::repo::CommitInfo>>,
+}
+
+impl BranchCommitsCache {
+    fn cache_path(git_dir: &Path) -> PathBuf {
+        git_dir.join("stax").join("branch-commits-cache.json")
+    }
+
+    pub fn load(git_dir: &Path) -> Self {
+        load_json_unlocked(&Self::cache_path(git_dir)).unwrap_or_default()
+    }
+
+    pub fn save(&self, git_dir: &Path) -> Result<()> {
+        let path = Self::cache_path(git_dir);
+        fs::create_dir_all(git_dir.join("stax"))?;
+        persist_json_atomic(&path, self)
+    }
+
+    pub fn prune(&mut self, valid_keys: &std::collections::HashSet<String>) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|key, _| valid_keys.contains(key));
+        before != self.entries.len()
+    }
+}
+
 #[cfg(test)]
 fn current_unix_time() -> u64 {
     SystemTime::now()
@@ -884,6 +913,49 @@ mod tests {
         fs::create_dir(&path).unwrap();
         assert!(LineDiffCache::load(dir.path()).entries.is_empty());
         assert!(LineDiffCache::default().save(dir.path()).is_err());
+    }
+
+    #[test]
+    fn branch_commits_cache_round_trip_and_prune() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = BranchCommitsCache::load(dir.path());
+        assert!(cache.entries.is_empty());
+        cache.entries.insert(
+            "head:parent".into(),
+            vec![crate::git::repo::CommitInfo {
+                short_hash: "0123456789".into(),
+                message: "Commit summary".into(),
+            }],
+        );
+        cache.entries.insert("trunk:none".into(), Vec::new());
+        cache.save(dir.path()).unwrap();
+        let mut loaded = BranchCommitsCache::load(dir.path());
+        assert_eq!(loaded.entries.len(), 2);
+        assert_eq!(loaded.entries["head:parent"][0].short_hash, "0123456789");
+        assert_eq!(loaded.entries["head:parent"][0].message, "Commit summary");
+        assert!(loaded.entries["trunk:none"].is_empty());
+        let valid = std::collections::HashSet::from(["head:parent".into()]);
+        assert!(loaded.prune(&valid));
+        assert!(!loaded.prune(&valid));
+        loaded.save(dir.path()).unwrap();
+        assert!(
+            !BranchCommitsCache::load(dir.path())
+                .entries
+                .contains_key("trunk:none")
+        );
+        assert!(loaded.prune(&std::collections::HashSet::new()));
+        assert!(loaded.entries.is_empty());
+    }
+
+    #[test]
+    fn branch_commits_cache_ignores_malformed_data() {
+        let dir = TempDir::new().unwrap();
+        let path = BranchCommitsCache::cache_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"{").unwrap();
+        assert!(BranchCommitsCache::load(dir.path()).entries.is_empty());
+        BranchCommitsCache::default().save(dir.path()).unwrap();
+        assert!(BranchCommitsCache::load(dir.path()).entries.is_empty());
     }
 
     fn disk_diff(content: &str) -> DiskCachedDiff {

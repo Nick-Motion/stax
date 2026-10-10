@@ -354,6 +354,16 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
     let forge = remote::RemoteInfo::from_repo(&repo, &config)
         .ok()
         .map(|remote| std::thread::spawn(move || forge_client(&remote)));
+    // ls-remote and the status check are git processes that need nothing from
+    // each other or from the stack load, so all three run at once.
+    let ls_remote = {
+        let (workdir, remote_name) = (workdir.clone(), remote_name.clone());
+        std::thread::spawn(move || remote::ls_remote_head_oids(&workdir, &remote_name))
+    };
+    let dirty = {
+        let workdir = workdir.clone();
+        std::thread::spawn(move || GitRepo::open_from_path(&workdir)?.is_dirty())
+    };
 
     // Stderr warnings for inert flags — always emitted regardless of --quiet
     if force {
@@ -402,42 +412,50 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
         println!();
     }
 
+    // --- Load stack (in-memory only; no ref writes) ---
+    // It prints nothing, so it runs before the probe output, while ls-remote
+    // and the status check run.
+    let mut stack = Stack::load(&repo)?;
+    let current = repo.current_branch()?;
+
     // --- Probe remote (ls-remote; read-only, no FETCH_HEAD writes) ---
     let mut use_cached_remote = false;
     let mut remote_heads_by_branch: Option<std::collections::HashMap<String, String>> = None;
-    let (remote_head_oid, remote_branch_set): (Option<String>, HashSet<String>) =
-        match remote::ls_remote_head_oids(&workdir, &remote_name) {
-            Ok(heads) => {
-                let trunk_oid = heads.get(&trunk).cloned();
-                let branch_count = heads.len();
-                remote_heads_by_branch = Some(heads.clone());
-                let names: HashSet<String> = heads.into_keys().collect();
-                if !quiet {
-                    println!(
-                        "{}",
-                        format!(
-                            "  Probed {} via ls-remote ({} branches)",
-                            remote_name, branch_count
-                        )
-                        .dimmed()
-                    );
-                }
-                (trunk_oid, names)
+    let (remote_head_oid, remote_branch_set): (Option<String>, HashSet<String>) = match ls_remote
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    {
+        Ok(heads) => {
+            let trunk_oid = heads.get(&trunk).cloned();
+            let branch_count = heads.len();
+            remote_heads_by_branch = Some(heads.clone());
+            let names: HashSet<String> = heads.into_keys().collect();
+            if !quiet {
+                println!(
+                    "{}",
+                    format!(
+                        "  Probed {} via ls-remote ({} branches)",
+                        remote_name, branch_count
+                    )
+                    .dimmed()
+                );
             }
-            Err(_) => {
-                use_cached_remote = true;
-                let oid = resolve_ref_oid(&workdir, &remote_trunk_ref);
-                let names = repo.remote_branch_names(&remote_name).unwrap_or_default();
-                if !quiet {
-                    println!(
-                        "  {} {}",
-                        "⚠".yellow(),
-                        "offline — using cached remote-tracking refs".dimmed()
-                    );
-                }
-                (oid, names)
+            (trunk_oid, names)
+        }
+        Err(_) => {
+            use_cached_remote = true;
+            let oid = resolve_ref_oid(&workdir, &remote_trunk_ref);
+            let names = repo.remote_branch_names(&remote_name).unwrap_or_default();
+            if !quiet {
+                println!(
+                    "  {} {}",
+                    "⚠".yellow(),
+                    "offline — using cached remote-tracking refs".dimmed()
+                );
             }
-        };
+            (oid, names)
+        }
+    };
 
     if use_cached_remote && !quiet {
         println!(
@@ -447,10 +465,10 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
         );
     }
 
-    // --- Load stack (in-memory only; no ref writes) ---
-    let mut stack = Stack::load(&repo)?;
-    let current = repo.current_branch()?;
-    let dirty = repo.is_dirty().unwrap_or(false);
+    let dirty = dirty
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        .unwrap_or(false);
 
     // Patch PR states in memory BEFORE any &Stack borrows for detection
     let forge = forge.and_then(|thread| {

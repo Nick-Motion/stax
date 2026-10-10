@@ -180,6 +180,15 @@ fn dry_run_remote_probe_does_not_update_fetch_head_or_tracking_refs() {
             args.join(" "),
             TestRepo::stderr(&out)
         );
+        if !args.contains(&"--json") {
+            // Only the live probe sees the new origin/main.
+            let stdout = TestRepo::stdout(&out);
+            assert!(
+                stdout.contains("objects absent locally"),
+                "{} should report the unfetched origin/main; stdout:\n{stdout}",
+                args.join(" ")
+            );
+        }
         assert_eq!(
             fetch_head(&repo),
             fetch_head_before,

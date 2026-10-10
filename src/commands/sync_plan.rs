@@ -1359,16 +1359,15 @@ mod tests {
 
     #[test]
     fn render_trunk_plan_up_to_date_contains_check() {
-        colored::control::set_override(false);
+        let _colors = crate::test_support::color_override(false);
         let plan = TrunkPlan::UpToDate;
         // Just exercise the render path — primarily ensures no panic
         render_trunk_plan("main", &plan);
-        colored::control::unset_override();
     }
 
     #[test]
     fn render_trunk_plan_fast_forward_contains_commit_count() {
-        colored::control::set_override(false);
+        let _colors = crate::test_support::color_override(false);
         let plan = TrunkPlan::FastForward {
             commits: 3,
             files: 5,
@@ -1376,18 +1375,16 @@ mod tests {
             deletions: 7,
         };
         render_trunk_plan("main", &plan);
-        colored::control::unset_override();
     }
 
     #[test]
     fn render_trunk_plan_diverged_shows_ahead_behind() {
-        colored::control::set_override(false);
+        let _colors = crate::test_support::color_override(false);
         let plan = TrunkPlan::Diverged {
             ahead: 2,
             behind: 4,
         };
         render_trunk_plan("main", &plan);
-        colored::control::unset_override();
     }
 
     #[test]

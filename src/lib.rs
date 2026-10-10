@@ -20,6 +20,8 @@ mod ops;
 mod parallel;
 mod progress;
 mod remote;
+#[cfg(test)]
+mod test_support;
 mod tui;
 mod update;
 pub mod web;

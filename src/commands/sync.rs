@@ -6155,7 +6155,6 @@ fn parse_diff_shortstat(output: &str) -> Option<(usize, usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use colored::control;
     use std::path::PathBuf;
 
     #[test]
@@ -6900,7 +6899,7 @@ mod tests {
 
     #[test]
     fn render_sync_footer_is_colored_and_compact() {
-        control::set_override(true);
+        let _colors = crate::test_support::color_override(true);
 
         let footer = render_sync_footer(
             &SyncStats {
@@ -6919,8 +6918,6 @@ mod tests {
             Duration::from_millis(14_022),
         );
 
-        control::unset_override();
-
         assert!(footer.contains("main"));
         assert!(footer.contains("+1 commit"));
         assert!(footer.contains("12 files"));
@@ -6936,7 +6933,7 @@ mod tests {
 
     #[test]
     fn render_sync_footer_handles_up_to_date_branch() {
-        control::set_override(true);
+        let _colors = crate::test_support::color_override(true);
 
         let footer = render_sync_footer(
             &SyncStats {
@@ -6950,8 +6947,6 @@ mod tests {
             },
             Duration::from_secs(2),
         );
-
-        control::unset_override();
 
         assert!(footer.contains("main"));
         assert!(footer.contains("up to date"));
@@ -7173,7 +7168,7 @@ mod tests {
 
     #[test]
     fn deleted_tip_suffix_renders_seven_char_short_sha() {
-        colored::control::set_override(false);
+        let _colors = crate::test_support::color_override(false);
         let sha = "abcdef1234567890";
         let suffix = deleted_tip_suffix(Some(sha));
         assert!(
@@ -7189,14 +7184,14 @@ mod tests {
 
     #[test]
     fn deleted_tip_suffix_is_empty_without_a_tip() {
-        colored::control::set_override(false);
+        let _colors = crate::test_support::color_override(false);
         assert_eq!(deleted_tip_suffix(None), "");
         assert_eq!(deleted_tip_suffix(Some("")), "");
     }
 
     #[test]
     fn stale_stack_warning_names_consequence_and_error() {
-        colored::control::set_override(false);
+        let _colors = crate::test_support::color_override(false);
         let error = anyhow::anyhow!("metadata ref not found");
         let msg = stale_stack_warning("using snapshot from sync start", &error);
         assert!(msg.contains("using snapshot from sync start"));
@@ -7206,7 +7201,7 @@ mod tests {
 
     #[test]
     fn stash_left_behind_warning_tells_user_how_to_recover() {
-        colored::control::set_override(false);
+        let _colors = crate::test_support::color_override(false);
         let msg = stash_left_behind_warning();
         assert!(
             msg.contains("stax auto-stash"),
@@ -7280,7 +7275,7 @@ mod tests {
 
     #[test]
     fn prune_deprecation_warning_names_both_flags() {
-        colored::control::set_override(false);
+        let _colors = crate::test_support::color_override(false);
         let msg = prune_deprecation_warning();
         assert!(msg.contains("--prune"), "must name --prune: {msg}");
         assert!(msg.contains("--full"), "must name --full: {msg}");
@@ -7384,7 +7379,6 @@ mod tests {
                 let refs = run(&["show-ref"]);
                 let checkout = run(&["-C", t, "branch", "--show-current"]);
                 if mutation == "owner" {
-                    use std::os::unix::fs::PermissionsExt;
                     run(&["remote", "add", "origin", "https://example/repo.git"]);
                     let cli_path = path.join("bb.py");
                     let script = format!(
@@ -7399,9 +7393,7 @@ else: sys.exit(41)
 "#,
                         target = serde_json::to_string(&target).unwrap()
                     );
-                    std::fs::write(&cli_path, script).unwrap();
-                    std::fs::set_permissions(&cli_path, std::fs::Permissions::from_mode(0o755))
-                        .unwrap();
+                    crate::test_support::write_executable(&cli_path, &script);
                     let cli = crate::commands::sync_retirement::BbCli::test_cli(cli_path);
                     // Both effect paths call this boundary before Git switch or delete.
                     assert!(

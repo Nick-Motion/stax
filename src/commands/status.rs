@@ -819,11 +819,10 @@ mod tests {
 
     #[test]
     fn status_restack_label_is_bold_white() {
-        colored::control::set_override(true);
+        let _colors = crate::test_support::color_override(true);
 
         let label = restack_label();
 
-        colored::control::unset_override();
         assert_eq!(label, "\u{1b}[1;37m(needs restack)\u{1b}[0m");
     }
 }

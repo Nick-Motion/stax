@@ -720,7 +720,6 @@ pub(crate) fn restore_recovery(recovery: &RecoveryReady, destination: &Path) -> 
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     fn fail_durability_sync(_: &Path) -> Result<()> {
         bail!("injected durability failure")
@@ -838,10 +837,7 @@ else: fail()
         .replace("MARKER_PATH", &serde_json::to_string(&marker.to_string_lossy()).unwrap())
         .replace("ROOT_PATH", &serde_json::to_string(&target.to_string_lossy()).unwrap())
         .replace("MODE_VALUE", &serde_json::to_string(mode).unwrap());
-        fs::write(&executable, script).unwrap();
-        let mut permissions = fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&executable, permissions).unwrap();
+        crate::test_support::write_executable(&executable, &script);
         (
             BbCli {
                 executable,
@@ -995,7 +991,7 @@ else: fail()
                 registered_path: canonical(dir.path()).unwrap(),
             };
             assert!(
-                retire_bb_environment_with_timeout(&identity, &cli, Duration::from_millis(500))
+                retire_bb_environment_with_timeout(&identity, &cli, Duration::from_secs(5))
                     .is_err()
             );
             let calls = fs::read_to_string(log).unwrap();
@@ -1075,8 +1071,10 @@ else: fail()
             deadline: None,
             current_thread: Arc::default(),
         };
-        fs::write(&executable, "#!/usr/bin/env python3\nimport json,sys\nsys.stderr.write('e'*1000000)\nprint(json.dumps({'data':'x'*1000000}))\n").unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(
+            &executable,
+            "#!/usr/bin/env python3\nimport json,sys\nsys.stderr.write('e'*1000000)\nprint(json.dumps({'data':'x'*1000000}))\n",
+        );
         let out = cli
             .run_until(&[], Instant::now() + Duration::from_secs(5))
             .unwrap();
@@ -1092,7 +1090,7 @@ else: fail()
                     "time.sleep(5)"
                 }
             );
-            fs::write(&executable, script).unwrap();
+            crate::test_support::write_executable(&executable, &script);
             let start = Instant::now();
             assert!(
                 cli.run_until(&[], start + Duration::from_millis(300))
@@ -1104,14 +1102,13 @@ else: fail()
             assert!(!marker.exists(), "descendant survived timeout");
             fs::remove_file(&started_marker).unwrap();
         }
-        fs::write(
+        crate::test_support::write_executable(
             &executable,
-            format!(
+            &format!(
                 "#!/usr/bin/env python3\nopen({:?},'w').close()\nprint('{{}}')\n",
                 marker
             ),
-        )
-        .unwrap();
+        );
         assert!(cli.run_until(&[], Instant::now()).is_err());
         assert!(!marker.exists(), "expired deadline still spawned a process");
     }

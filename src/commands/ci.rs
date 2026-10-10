@@ -2271,10 +2271,10 @@ mod tests {
             let remote = crate::remote::RemoteInfo {
                 name: "origin".to_string(),
                 forge: crate::remote::ForgeType::Gitea,
-                host: "gitea.example.com".to_string(),
+                host: server.address().ip().to_string(),
                 namespace: "org".to_string(),
                 repo: "repo".to_string(),
-                base_url: "https://gitea.example.com".to_string(),
+                base_url: server.uri(),
                 api_base_url: Some(server.uri()),
             };
             let client = ForgeClient::new(&remote).unwrap();
@@ -2761,7 +2761,7 @@ mod tests {
 
     #[test]
     fn oneline_row_pads_branch_to_visible_width() {
-        colored::control::set_override(false);
+        let _colors = crate::test_support::color_override(false);
         let mut status = test_branch_status(
             "success",
             vec![test_check("build", "completed", Some("success"))],
@@ -2769,7 +2769,6 @@ mod tests {
         status.branch = "abc".to_string();
         status.pr_title = Some("T".to_string());
         let row = oneline_row(&status, false, 8, 6, 0, 10, None);
-        colored::control::unset_override();
         // "abc" padded to width 8 = "abc" + 5 spaces
         assert!(row.contains("abc     "));
     }

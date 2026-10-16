@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.117.0] - 2026-10-16
+
+### 🚀 Features
+
+- *(gh-stack)* Recommend gh-stack v0.2.1 and silence its upgrade notifier ([#923](https://github.com/cesarferreira/stax/issues/923))
+- *(tui)* Open PR with o, move reorder to O ([#927](https://github.com/cesarferreira/stax/issues/927))
+
+### 💼 Other
+
+- Document current-work PR submission flow ([#818](https://github.com/cesarferreira/stax/issues/818))
+
+### 📚 Documentation
+
+- Document refresh --get reconciliation ([#891](https://github.com/cesarferreira/stax/issues/891))
 ## [0.116.0] - 2026-10-13
 
 ### 🚀 Features
@@ -11,6 +25,10 @@ All notable changes to this project will be documented in this file.
 ### 📚 Documentation
 
 - *(ai)* Complete Hermes agent references ([#919](https://github.com/cesarferreira/stax/issues/919))
+
+### ⚙️ Miscellaneous Tasks
+
+- Release
 ## [0.115.0] - 2026-10-09
 
 ### 🚀 Features

@@ -363,6 +363,40 @@ native_stack = "link"
     restore_env_var("STAX_CONFIG_DIR", original_stax_config_dir);
 }
 
+#[test]
+fn config_dir_override_skips_repository_overlay_for_every_repo_loader() {
+    let _guard = env_lock();
+
+    let original_stax_config_dir = env::var("STAX_CONFIG_DIR").ok();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo_dir = temp_dir.path().join("repo");
+    let config_dir = temp_dir.path().join("isolated");
+    fs::create_dir_all(&repo_dir).unwrap();
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[remote]\nname = \"origin\"\n\n[submit]\nstack_links = \"comment\"\n",
+    )
+    .unwrap();
+    fs::write(
+        repo_dir.join("stax.toml"),
+        "[remote]\nname = \"upstream\"\n\n[submit]\nstack_links = \"both\"\n",
+    )
+    .unwrap();
+
+    unsafe { env::set_var("STAX_CONFIG_DIR", &config_dir) };
+
+    let trusted = Config::load_for_trusted_network(&repo_dir).unwrap();
+    let preferences = Config::load_repository_submit_preferences(&repo_dir).unwrap();
+    let merged = Config::load_for_repo(&repo_dir).unwrap();
+
+    restore_env_var("STAX_CONFIG_DIR", original_stax_config_dir);
+
+    assert_eq!(trusted.remote_name(), "origin");
+    assert_eq!(merged.remote_name(), "origin");
+    assert_eq!(preferences.submit.stack_links, StackLinksMode::Comment);
+}
+
 #[cfg(unix)]
 fn write_mock_gh(home: &Path, script_body: &str) -> String {
     use std::os::unix::fs::PermissionsExt;
@@ -746,6 +780,7 @@ fn test_default_config() {
     assert!(config.auth.use_gh_cli);
     assert!(!config.auth.allow_github_token_env);
     assert!(config.auth.gh_hostname.is_none());
+    assert!(config.sync.confirm_delete);
 }
 
 #[test]
@@ -758,6 +793,23 @@ fn test_default_toml_serializes() {
     assert!(s.contains(r#""auto" | "off" | "link""#));
     assert!(s.contains(r#""comment" | "body" | "both" | "off""#));
     assert!(s.contains("[worktree.hooks]"));
+    assert!(s.contains("[sync]"));
+    assert!(s.contains("# confirm_delete = true"));
+}
+
+#[test]
+fn sync_confirm_delete_config_parses() {
+    let config: Config = toml::from_str("[sync]\nconfirm_delete = false\n").unwrap();
+    assert!(!config.sync.confirm_delete);
+
+    let config: Config = toml::from_str("[sync]\n").unwrap();
+    assert!(config.sync.confirm_delete);
+}
+
+#[test]
+fn sync_confirm_delete_config_rejects_non_bool() {
+    let result = toml::from_str::<Config>("[sync]\nconfirm_delete = \"never\"\n");
+    assert!(result.is_err());
 }
 
 #[test]
@@ -1321,6 +1373,29 @@ fn test_format_branch_name_consecutive_replacements_collapsed() {
     let config = Config::default();
     // Multiple spaces should become single dash
     assert_eq!(config.format_branch_name("my   feature"), "my-feature");
+}
+
+#[test]
+fn test_format_branch_name_lowercases_by_default() {
+    let mut config = Config::default();
+    config.branch.format = Some("{user}/{message}".to_string());
+    config.branch.user = Some("Cesar".to_string());
+    assert_eq!(
+        config.format_branch_name("Bump Fastlane Version"),
+        "cesar/bump-fastlane-version"
+    );
+}
+
+#[test]
+fn test_format_branch_name_lowercase_can_be_disabled() {
+    let mut config = Config::default();
+    config.branch.lowercase = false;
+    config.branch.format = Some("{user}/{message}".to_string());
+    config.branch.user = Some("Cesar".to_string());
+    assert_eq!(
+        config.format_branch_name("Bump Fastlane Version"),
+        "Cesar/Bump-Fastlane-Version"
+    );
 }
 
 #[test]
@@ -2059,7 +2134,7 @@ fn test_format_template_sanitizes_user() {
     config.branch.user = Some("John Doe".to_string());
 
     let result = config.format_branch_name("feature");
-    assert_eq!(result, "John-Doe/feature");
+    assert_eq!(result, "john-doe/feature");
 }
 
 #[test]

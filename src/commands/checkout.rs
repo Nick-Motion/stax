@@ -1015,9 +1015,8 @@ mod tests {
 
     #[test]
     fn checkout_completion_message_colors_status_and_branch() {
-        colored::control::set_override(true);
+        let _colors = crate::test_support::color_override(true);
         let message = checkout_completion_message("feature/payments-api");
-        colored::control::unset_override();
 
         assert_eq!(strip_ansi(&message), "Checked out feature/payments-api.");
         assert!(

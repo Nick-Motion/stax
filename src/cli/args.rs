@@ -508,9 +508,12 @@ pub(crate) enum Commands {
         /// Output the sync result as JSON (implies non-interactive; exits non-zero on failure)
         #[arg(long, conflicts_with = "continue")]
         json: bool,
+        /// Reconcile each stack branch against its own remote ref (fetch + fast-forward/rebase) before restacking
+        #[arg(long)]
+        get: bool,
     },
 
-    /// List and optionally clean up local branches (merged, upstream-gone, stale)
+    /// List and optionally clean up local branches (merged, closed PR, upstream-gone, stale)
     Sweep {
         /// Delete merged and upstream-gone branches (safe to remove)
         #[arg(short, long)]
@@ -518,6 +521,9 @@ pub(crate) enum Commands {
         /// When deleting, also include stale branches (use with --delete)
         #[arg(long, requires = "delete")]
         include_stale: bool,
+        /// When deleting, also include closed but unmerged PR branches (use with --delete)
+        #[arg(long, requires = "delete")]
+        include_closed: bool,
         /// Skip confirmation prompts (use with --delete)
         #[arg(short, long, requires = "delete")]
         force: bool,
@@ -604,6 +610,9 @@ pub(crate) enum Commands {
         /// Delete local branches whose PRs were merged (off by default, unlike `stax sync`)
         #[arg(long)]
         delete_merged: bool,
+        /// Reconcile each stack branch against its own remote ref (fetch + fast-forward/rebase) before restacking
+        #[arg(long)]
+        get: bool,
     },
 
     /// Checkout a branch in the stack
@@ -1182,6 +1191,19 @@ pub(crate) enum Commands {
     /// Interactive tutorial (no auth or repo needed)
     Demo,
 
+    /// Single-screen snapshot of local stacking health
+    Stats {
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+        /// Scope to the current stack only (default: all tracked branches)
+        #[arg(long)]
+        current: bool,
+        /// Include a CI roll-up (may add network latency)
+        #[arg(long)]
+        ci: bool,
+    },
+
     /// Generate standup summary of recent activity
     Standup {
         /// Output raw JSON (standup data, or summary JSON when combined with --ai)
@@ -1358,7 +1380,7 @@ pub(crate) enum Commands {
         /// Install AI agent skills without prompting
         #[arg(long, conflicts_with_all = ["skip_skills", "print", "refresh"])]
         install_skills: bool,
-        /// Which agent harnesses get skills: all | detected | auto | none | comma-separated ids (claude,codex,cursor,opencode,pi)
+        /// Which agent harnesses get skills: all | detected | auto | none | comma-separated ids (claude,codex,cursor,hermes,opencode,pi)
         #[arg(
             long,
             value_name = "LIST",
@@ -2018,7 +2040,8 @@ impl Commands {
             | Commands::Web(_)
             | Commands::W
             | Commands::Wtll { .. }
-            | Commands::Wtls => CommandPolicy::RebaseSafe,
+            | Commands::Wtls
+            | Commands::Stats { .. } => CommandPolicy::RebaseSafe,
             Commands::Issue { command } => match command {
                 None | Some(IssueCommands::List { .. }) => CommandPolicy::RebaseSafe,
             },

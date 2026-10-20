@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use colored::Colorize;
 use futures_util::{StreamExt, stream};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -333,6 +334,20 @@ pub(crate) async fn fetch_ci_statuses_async(
     stack: &Stack,
     branches_to_check: &[String],
 ) -> Result<Vec<BranchCiStatus>> {
+    fetch_ci_statuses_reusing_async(repo, client, stack, branches_to_check, &HashMap::new()).await
+}
+
+/// Like [`fetch_ci_statuses_async`], but a PR already fetched earlier in the
+/// same operation (`observed`, keyed by branch, matching PR number and with an
+/// exact head) is reused instead of fetched again. Use only for informational
+/// output such as CI history, never for an eligibility or deletion decision.
+async fn fetch_ci_statuses_reusing_async(
+    repo: &GitRepo,
+    client: &ForgeClient,
+    stack: &Stack,
+    branches_to_check: &[String],
+    observed: &HashMap<String, crate::forge::PrInfoWithHead>,
+) -> Result<Vec<BranchCiStatus>> {
     let prepared: Vec<(String, String, Option<u64>)> = branches_to_check
         .iter()
         .filter_map(|branch| {
@@ -350,7 +365,15 @@ pub(crate) async fn fetch_ci_statuses_async(
                     (ForgeClient::GitHub(_), Some(n)) => client.get_pr_merge_status(*n).await.ok(),
                     _ => None,
                 };
+                let reused = pr_number.and_then(|n| {
+                    observed
+                        .get(branch)
+                        .filter(|pr| pr.info.number == n && !pr.head_sha.is_empty())
+                });
                 let (pr_live, fallback_head_sha) = match (pr_number, pr_merge_status.is_some()) {
+                    (Some(_), false) if reused.is_some() => {
+                        (reused.cloned(), reused.map(|pr| pr.head_sha.clone()))
+                    }
                     (Some(n), false) => {
                         let (pr, head_sha) =
                             tokio::join!(client.get_pr_with_head(*n), client.get_pr_head_sha(*n));
@@ -469,6 +492,24 @@ pub fn fetch_ci_statuses(
         client,
         stack,
         branches_to_check,
+    ))
+}
+
+/// Blocking form of [`fetch_ci_statuses_reusing_async`]; informational only.
+pub fn fetch_ci_statuses_reusing(
+    repo: &GitRepo,
+    rt: &tokio::runtime::Runtime,
+    client: &ForgeClient,
+    stack: &Stack,
+    branches_to_check: &[String],
+    observed: &HashMap<String, crate::forge::PrInfoWithHead>,
+) -> Result<Vec<BranchCiStatus>> {
+    rt.block_on(fetch_ci_statuses_reusing_async(
+        repo,
+        client,
+        stack,
+        branches_to_check,
+        observed,
     ))
 }
 
@@ -2191,6 +2232,86 @@ mod tests {
     }
 
     #[test]
+    fn ci_history_reuses_same_operation_pr_observation_only_when_it_matches() {
+        ensure_crypto_provider();
+        let (_td, repo, sha_b1, sha_b2) = git_repo_with_two_branches();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = MockServer::start().await;
+            unsafe { std::env::set_var("STAX_GITEA_TOKEN", "test-token") };
+            let pull = |number: u64, branch: &str, sha: &str| {
+                serde_json::json!({
+                    "number": number, "state": "closed", "title": format!("PR {number}"),
+                    "draft": false, "merged": true,
+                    "head": { "ref": branch, "sha": sha, "label": branch },
+                    "base": { "ref": "main", "sha": "main-sha", "label": "main" }
+                })
+            };
+            // b1 was refreshed earlier in the operation: no second fetch.
+            Mock::given(method("GET"))
+                .and(path("/repos/org/repo/pulls/201"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull(201, "b1", &sha_b1)))
+                .expect(0)
+                .mount(&server)
+                .await;
+            // b2's observation names a different PR, so it is fetched as before.
+            Mock::given(method("GET"))
+                .and(path("/repos/org/repo/pulls/202"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull(202, "b2", &sha_b2)))
+                .expect(2)
+                .mount(&server)
+                .await;
+            for sha in [&sha_b1, &sha_b2] {
+                Mock::given(method("GET"))
+                    .and(path(format!("/repos/org/repo/commits/{sha}/statuses")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                    .mount(&server)
+                    .await;
+            }
+            let remote = crate::remote::RemoteInfo {
+                name: "origin".to_string(),
+                forge: crate::remote::ForgeType::Gitea,
+                host: server.address().ip().to_string(),
+                namespace: "org".to_string(),
+                repo: "repo".to_string(),
+                base_url: server.uri(),
+                api_base_url: Some(server.uri()),
+            };
+            let client = ForgeClient::new(&remote).unwrap();
+            let observation = |number: u64, branch: &str, sha: &str| crate::forge::PrInfoWithHead {
+                info: crate::forge::PrInfo {
+                    number,
+                    state: "merged".to_string(),
+                    is_draft: false,
+                    base: "main".to_string(),
+                },
+                head: branch.to_string(),
+                head_sha: sha.to_string(),
+                head_label: None,
+                title: format!("PR {number}"),
+            };
+            let observed = HashMap::from([
+                ("b1".to_string(), observation(201, "b1", &sha_b1)),
+                ("b2".to_string(), observation(999, "b2", &sha_b2)),
+            ]);
+            let statuses = fetch_ci_statuses_reusing_async(
+                &repo,
+                &client,
+                &test_stack_for_ci_fetch(201, 202),
+                &["b1".to_string(), "b2".to_string()],
+                &observed,
+            )
+            .await
+            .unwrap();
+            assert_eq!(statuses[0].branch, "b1");
+            assert_eq!(statuses[0].sha, sha_b1);
+            assert_eq!(statuses[0].pr_title.as_deref(), Some("PR 201"));
+            assert_eq!(statuses[1].sha, sha_b2);
+            assert_eq!(statuses[1].pr_title.as_deref(), Some("PR 202"));
+        });
+    }
+
+    #[test]
     fn fetch_ci_statuses_branch_without_pr_skips_pull_request_fetch() {
         ensure_crypto_provider();
         let (_td, repo, sha_b1, _sha_b2) = git_repo_with_two_branches();
@@ -2640,7 +2761,7 @@ mod tests {
 
     #[test]
     fn oneline_row_pads_branch_to_visible_width() {
-        colored::control::set_override(false);
+        let _colors = crate::test_support::color_override(false);
         let mut status = test_branch_status(
             "success",
             vec![test_check("build", "completed", Some("success"))],
@@ -2648,7 +2769,6 @@ mod tests {
         status.branch = "abc".to_string();
         status.pr_title = Some("T".to_string());
         let row = oneline_row(&status, false, 8, 6, 0, 10, None);
-        colored::control::unset_override();
         // "abc" padded to width 8 = "abc" + 5 spaces
         assert!(row.contains("abc     "));
     }

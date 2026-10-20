@@ -36,6 +36,8 @@ pub struct Config {
     #[serde(default)]
     pub restack: RestackConfig,
     #[serde(default)]
+    pub sync: SyncConfig,
+    #[serde(default)]
     pub skills: SkillsConfig,
     #[serde(default)]
     pub board: BoardConfig,
@@ -65,7 +67,7 @@ fn default_board_mine_only() -> bool {
 /// Which agent harnesses receive stax skill files.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SkillsConfig {
-    /// Harness ids to manage (`claude`, `codex`, `cursor`, `opencode`, `pi`).
+    /// Harness ids to manage (`claude`, `codex`, `cursor`, `opencode`, `pi`, `hermes`).
     /// Unset = auto (detected harnesses plus any that already have a skill file).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harnesses: Option<Vec<String>>,
@@ -107,6 +109,24 @@ impl Default for RestackConfig {
     }
 }
 
+/// User-configurable sync behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncConfig {
+    /// Ask before deleting merged or upstream-gone branches during an
+    /// interactive sync (default: true). Branches checked out in a linked
+    /// worktree still prompt.
+    #[serde(default = "default_true")]
+    pub confirm_delete: bool,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            confirm_delete: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchConfig {
     /// Prefix for new branches (e.g., "cesar/")
@@ -124,6 +144,10 @@ pub struct BranchConfig {
     /// Character to replace spaces and special chars (default: "-")
     #[serde(default = "default_replacement")]
     pub replacement: String,
+    /// Lowercase generated branch names (default: true). Commit messages are
+    /// never affected — only the branch name derived from them.
+    #[serde(default = "default_branch_lowercase")]
+    pub lowercase: bool,
     /// Branch name format template. Placeholders:
     /// - {user}: Git username (from config.branch.user or git user.name)
     /// - {date}: Current date (formatted by date_format)
@@ -290,7 +314,7 @@ pub struct AiFeatureConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AiConfig {
-    /// AI agent to use: "claude", "codex", "gemini", "opencode", or "pi" (default: auto-detect)
+    /// AI agent to use: "claude", "codex", "gemini", "opencode", "pi", or "hermes" (default: auto-detect)
     #[serde(default)]
     pub agent: Option<String>,
     /// Model to use with the AI agent (default: agent's own default)
@@ -487,6 +511,7 @@ impl Default for BranchConfig {
             date: false,
             date_format: default_date_format(),
             replacement: default_replacement(),
+            lowercase: default_branch_lowercase(),
             format: None,
             user: None,
             stale_days: default_stale_days(),
@@ -535,6 +560,10 @@ impl Default for AuthConfig {
 
 fn default_replacement() -> String {
     "-".to_string()
+}
+
+fn default_branch_lowercase() -> bool {
+    true
 }
 
 fn default_worktree_root_dir() -> String {
@@ -641,18 +670,19 @@ impl Config {
     /// `STAX_CONFIG_DIR` intentionally keeps its existing test-isolation
     /// behavior and disables repository overlays.
     pub(crate) fn load_for_repo(root: &Path) -> Result<Self> {
-        let path = Self::path()?;
-        let config = Self::load_path_or_default(&path)?;
-        if config_dir_override().is_some() {
-            return Ok(config);
+        let config = Self::load_global()?;
+        match Self::repo_overlay_path(root) {
+            Some(repo_path) => Self::load_with_overlay(config, &repo_path),
+            None => Ok(config),
         }
+    }
 
-        let repo_path = root.join("stax.toml");
-        if repo_path.exists() {
-            Self::load_with_overlay(config, &repo_path)
-        } else {
-            Ok(config)
+    /// The repository's `stax.toml`, unless missing or `STAX_CONFIG_DIR` disables overlays.
+    fn repo_overlay_path(root: &Path) -> Option<PathBuf> {
+        if config_dir_override().is_some() {
+            return None;
         }
+        Some(root.join("stax.toml")).filter(|path| path.exists())
     }
 
     /// Load config for noninteractive credential-bearing repository network access.
@@ -661,12 +691,10 @@ impl Config {
     /// network destinations, provider selection, and auth settings are loaded
     /// only from the trusted global config.
     pub(crate) fn load_for_trusted_network(root: &Path) -> Result<Self> {
-        let path = Self::path()?;
-        let mut config = Self::load_path_or_default(&path)?;
-        let repo_path = root.join("stax.toml");
-        if !repo_path.exists() {
+        let mut config = Self::load_global()?;
+        let Some(repo_path) = Self::repo_overlay_path(root) else {
             return Ok(config);
-        }
+        };
 
         let repo_content = fs::read_to_string(&repo_path)
             .with_context(|| format!("Failed to read repo config {}", repo_path.display()))?;
@@ -690,12 +718,10 @@ impl Config {
     /// cannot redirect trusted network endpoints.
     #[allow(dead_code)]
     pub(crate) fn load_repository_submit_preferences(root: &Path) -> Result<Self> {
-        let path = Self::path()?;
-        let mut config = Self::load_path_or_default(&path)?;
-        let repo_path = root.join("stax.toml");
-        if !repo_path.exists() {
+        let mut config = Self::load_global()?;
+        let Some(repo_path) = Self::repo_overlay_path(root) else {
             return Ok(config);
-        }
+        };
 
         let repo_content = fs::read_to_string(&repo_path)
             .with_context(|| format!("Failed to read repo config {}", repo_path.display()))?;
@@ -873,12 +899,6 @@ impl Config {
         Self::resolve_github_auth_with_config(&auth_config).map(|(_, token)| token)
     }
 
-    /// Like `github_token` but also returns the source for error messages.
-    pub fn github_token_with_source() -> Option<(GitHubAuthSource, String)> {
-        let auth_config = Self::load().map(|c| c.auth).unwrap_or_default();
-        Self::resolve_github_auth_with_config(&auth_config)
-    }
-
     /// Resolve GitHub auth for a validated trusted network destination.
     ///
     /// The gh CLI lookup is always scoped to the validated Git remote host. An
@@ -896,7 +916,7 @@ impl Config {
         {
             anyhow::bail!(
                 "Configured GitHub auth hostname does not match the validated Git remote \
-                 hostname; update global auth.gh_hostname before noninteractive repository network access"
+                 hostname; update global auth.gh_hostname before repository network access"
             );
         }
 
@@ -1078,6 +1098,15 @@ impl Config {
         name: &str,
         prefix_override: Option<&str>,
     ) -> String {
+        let formatted = self.build_branch_name(name, prefix_override);
+        if self.branch.lowercase {
+            formatted.to_lowercase()
+        } else {
+            formatted
+        }
+    }
+
+    fn build_branch_name(&self, name: &str, prefix_override: Option<&str>) -> String {
         // Sanitize the message/name first
         let sanitized_name = self.sanitize_branch_segment(name);
 

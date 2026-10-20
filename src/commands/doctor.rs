@@ -95,7 +95,7 @@ pub fn run(fix: bool) -> Result<()> {
     }
 
     let remote_name = config.remote_name();
-    match remote::get_remote_url(repo.workdir()?, remote_name) {
+    match remote::get_remote_url(&repo, remote_name) {
         Ok(url) => println!(
             "{} {} {}",
             "✓".green(),

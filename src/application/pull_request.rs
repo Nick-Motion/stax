@@ -438,6 +438,7 @@ mod tests {
                 base: "main".into(),
             },
             head: "feature".into(),
+            head_sha: "head-sha".into(),
             head_label: None,
             title: "Feature".into(),
         }

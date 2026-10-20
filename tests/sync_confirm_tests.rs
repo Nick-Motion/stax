@@ -59,7 +59,14 @@ fn sync_confirm_cancel_leaves_merged_branch_and_writes_no_receipt() {
         "cancelling before trunk update should not write a sync receipt"
     );
     let stdout = TestRepo::stdout(&out);
-    assert!(stdout.contains("Sync plan"), "stdout: {stdout}");
+    let plan_progress = stdout
+        .rfind("Prepare sync plan")
+        .expect("plan progress row");
+    let prompt = stdout.find("Sync plan").expect("sync plan prompt");
+    assert!(
+        plan_progress < prompt,
+        "finish progress before prompting: {stdout}"
+    );
     assert!(stdout.contains("Aborted."), "stdout: {stdout}");
 }
 
@@ -117,13 +124,20 @@ fn sync_does_not_prompt_when_only_trunk_moves() {
     // Advance origin/main only — nothing to delete, nothing to restack.
     repo.simulate_remote_commit("upstream.txt", "content", "Upstream commit");
 
-    let out = repo.run_stax(&["sync"]);
+    let out = repo.run_stax(&["sync", "--verbose"]);
     assert!(
         out.status.success(),
         "sync failed: {}",
         TestRepo::stderr(&out)
     );
     let stdout = TestRepo::stdout(&out);
+    let stderr = TestRepo::stderr(&out);
+    assert!(stderr.contains("✓ Prepare sync plan"), "stderr: {stderr}");
+    assert!(!stdout.contains("Prepare sync plan"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("prepare sync plan"),
+        "timing summary: {stdout}"
+    );
     assert!(
         !stdout.contains("Sync plan") && !stdout.contains("How should sync proceed?"),
         "a plain trunk fast-forward must not prompt: {stdout}"
@@ -142,7 +156,139 @@ fn sync_force_skips_interactive_sync_plan() {
         "--force must not show the interactive plan: {stdout}"
     );
     assert!(
+        !TestRepo::stderr(&out).contains("Prepare sync plan"),
+        "--force skips plan preparation"
+    );
+    assert!(
         !branch_exists(&repo, &feature),
         "force should still delete the branch"
     );
+}
+
+/// Picks "Cancel sync" if the plan prompt appears, so a regression fails the
+/// branch assertion instead of hanging on a prompt nobody answers.
+const CANCEL_IF_PLAN_PROMPTS: &str = "if STAX_TUI_WAIT_ATTEMPTS=40 wait_for_tui_text \"How should sync proceed?\"; then printf '\\033[B\\033[B\\n'; fi";
+
+fn write_home_config(home: &str, config_toml: &str) {
+    std::fs::write(
+        std::path::Path::new(home).join(".config/stax/config.toml"),
+        config_toml,
+    )
+    .expect("write config");
+}
+
+#[test]
+fn sync_confirm_delete_false_deletes_merged_branch_without_prompt() {
+    let (repo, feature) = repo_with_merged_feature("feat-no-confirm");
+
+    let home = repo.clean_home();
+    write_home_config(&home, "[sync]\nconfirm_delete = false\n");
+    let out = run_stax_in_script_with_env(
+        &repo.path(),
+        &["sync"],
+        CANCEL_IF_PLAN_PROMPTS,
+        &[("HOME", &home)],
+    );
+    assert!(out.status.success(), "stderr: {}", TestRepo::stderr(&out));
+    assert!(
+        !branch_exists(&repo, &feature),
+        "confirm_delete = false should delete the merged branch"
+    );
+    let stdout = TestRepo::stdout(&out);
+    assert!(
+        !stdout.contains("How should sync proceed?") && !stdout.contains("Delete '"),
+        "confirm_delete = false must not prompt: {stdout}"
+    );
+}
+
+#[test]
+fn get_confirm_delete_false_deletes_merged_branch_without_prompt() {
+    let (repo, feature) = repo_with_merged_feature("feat-get-no-confirm");
+
+    let home = repo.clean_home();
+    write_home_config(&home, "[sync]\nconfirm_delete = false\n");
+    let out = run_stax_in_script_with_env(
+        &repo.path(),
+        &["get"],
+        CANCEL_IF_PLAN_PROMPTS,
+        &[("HOME", &home)],
+    );
+    assert!(out.status.success(), "stderr: {}", TestRepo::stderr(&out));
+    assert!(
+        !branch_exists(&repo, &feature),
+        "`st get` should delete the merged branch without asking"
+    );
+    let stdout = TestRepo::stdout(&out);
+    assert!(
+        !stdout.contains("How should sync proceed?") && !stdout.contains("Delete '"),
+        "confirm_delete = false must not prompt: {stdout}"
+    );
+}
+
+#[test]
+fn sync_confirm_delete_false_still_asks_about_linked_worktree() {
+    let (repo, feature) = repo_with_merged_feature("feat-no-confirm-worktree");
+    let worktree_root = tempfile::tempdir().expect("create worktree root");
+    let worktree = worktree_root.path().join("feature-worktree");
+    assert!(
+        repo.git(&[
+            "worktree",
+            "add",
+            worktree.to_str().expect("utf8 worktree path"),
+            &feature,
+        ])
+        .status
+        .success()
+    );
+
+    let home = repo.clean_home();
+    write_home_config(&home, "[sync]\nconfirm_delete = false\n");
+    // First option: remove the worktree and delete the branch.
+    let out = run_stax_in_script_with_env(
+        &repo.path(),
+        &["sync"],
+        "wait_for_tui_text \"What should stax do?\"; printf '\\n'",
+        &[("HOME", &home)],
+    );
+    assert!(out.status.success(), "stderr: {}", TestRepo::stderr(&out));
+    let stdout = TestRepo::stdout(&out);
+    assert!(
+        !stdout.contains("How should sync proceed?"),
+        "confirm_delete = false should skip the plan prompt: {stdout}"
+    );
+    assert!(
+        !worktree.exists(),
+        "chosen action should remove the worktree"
+    );
+    assert!(!branch_exists(&repo, &feature));
+}
+
+#[test]
+fn sync_confirm_delete_false_keeps_quiet_mode_non_destructive() {
+    let (repo, feature) = repo_with_merged_feature("feat-no-confirm-quiet");
+
+    let home = repo.clean_home();
+    write_home_config(&home, "[sync]\nconfirm_delete = false\n");
+    let out = repo.run_stax(&["sync", "--quiet"]);
+    assert!(out.status.success(), "stderr: {}", TestRepo::stderr(&out));
+    assert!(
+        branch_exists(&repo, &feature),
+        "--quiet should still skip deletions without --force"
+    );
+}
+
+#[test]
+fn sync_rejects_non_bool_confirm_delete() {
+    let (repo, feature) = repo_with_merged_feature("feat-bad-confirm");
+
+    let home = repo.clean_home();
+    write_home_config(&home, "[sync]\nconfirm_delete = \"never\"\n");
+    let out = repo.run_stax(&["sync", "--force"]);
+    assert!(!out.status.success(), "invalid config should fail sync");
+    assert!(
+        TestRepo::stderr(&out).contains("confirm_delete"),
+        "error should name the bad key: {}",
+        TestRepo::stderr(&out)
+    );
+    assert!(branch_exists(&repo, &feature));
 }

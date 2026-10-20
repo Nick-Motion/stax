@@ -140,13 +140,21 @@ fn install_test_binary(target: &Path) -> PathBuf {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).expect("create binary parent dir");
     }
-    fs::copy(common::stax_bin(), target).expect("copy test binary");
-
+    // Copy in a child process: if this process held the copy open for writing, a
+    // parallel test forking meanwhile would inherit the handle and exec would fail
+    // with ETXTBSY.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(target, fs::Permissions::from_mode(0o755)).expect("chmod test binary");
-    }
+    assert!(
+        Command::new("cp")
+            .arg(common::stax_bin())
+            .arg(target)
+            .status()
+            .expect("run cp")
+            .success(),
+        "copy test binary"
+    );
+    #[cfg(not(unix))]
+    fs::copy(common::stax_bin(), target).expect("copy test binary");
 
     target.to_path_buf()
 }

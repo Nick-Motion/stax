@@ -4,7 +4,7 @@ default-members = ["."]
 resolver = "2"
 
 [workspace.package]
-version = "0.110.0"
+version = "0.115.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -56,15 +56,15 @@ path = "tests/all_tests.rs"
 
 [features]
 default = []
-vendored-openssl = ["git2/vendored-openssl"]
 
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 
-# Git (no ssh — we use HTTPS + token auth exclusively)
-git2 = { version = "0.21", default-features = false, features = ["https"] }
+# Git. The git CLI does all network work, so libgit2 is built without
+# transports: an HTTPS build loads OpenSSL and its CA bundle on every run.
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 
 # GitHub API
 octocrab = "0.54.1"
@@ -102,7 +102,7 @@ regex = "1"
 
 # Config
 toml = "1"
-dirs = "6"
+dirs = "7"
 chrono = "0.4"
 
 # Update checking

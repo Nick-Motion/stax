@@ -135,14 +135,16 @@ impl BranchMetadata {
         if branch_oid == base_oid {
             return true;
         }
+        // A stacked branch usually descends from its recorded base, so that
+        // libgit2 walk goes first and the second one rarely runs.
         if repo
-            .graph_descendant_of(base_oid, branch_oid)
-            .unwrap_or(false)
+            .graph_descendant_of(branch_oid, base_oid)
+            .unwrap_or(true)
         {
             return true;
         }
-        repo.graph_descendant_of(branch_oid, base_oid)
-            .unwrap_or(true)
+        repo.graph_descendant_of(base_oid, branch_oid)
+            .unwrap_or(false)
     }
 }
 

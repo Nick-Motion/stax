@@ -18,11 +18,17 @@ pub struct SyncOutput {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped_branches: Vec<SkippedBranchJson>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recovery_artifacts: Vec<RecoveryArtifactJson>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub protected_branches: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub closed_prs: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub partially_merged: Vec<PartiallyMergedJson>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub restacked_branches: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reconciled_branches: Vec<ReconciledBranchJson>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub imported_branches_updated: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,9 +79,24 @@ pub struct DeletedBranchJson {
 }
 
 #[derive(Serialize)]
+pub struct ReconciledBranchJson {
+    pub branch: String,
+    pub action: String,
+}
+
+#[derive(Serialize)]
 pub struct SkippedBranchJson {
     pub name: String,
     pub reason: String,
+}
+
+#[derive(Serialize)]
+pub struct RecoveryArtifactJson {
+    pub branch: String,
+    pub operation_id: String,
+    pub directory: String,
+    pub manifest: String,
+    pub restore: String,
 }
 
 #[derive(Serialize)]
@@ -104,11 +125,10 @@ pub struct StashJson {
 #[derive(Serialize)]
 pub struct MergedCandidateJson {
     pub name: String,
-    /// `would_delete` · `would_prompt_then_delete` · `would_keep_worktree` · `would_skip` ·
-    /// `would_rebase_children`
+    /// `would_delete` · `would_prompt_then_delete` · `would_recover_then_delete` ·
+    /// `would_keep_worktree` · `would_skip` · `would_rebase_children`
     pub disposition: &'static str,
-    /// `both` · `local` — present when disposition is `would_delete` or
-    /// `would_prompt_then_delete`
+    /// `both` · `local` — present for deletion/recovery or confirmation plans.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<&'static str>,
     /// Human-readable reason — present when disposition is `would_keep_worktree` or
@@ -124,7 +144,8 @@ pub struct MergedCandidateJson {
 #[derive(Serialize)]
 pub struct UpstreamGoneDeleteJson {
     pub name: String,
-    /// `would_delete` (with `--force`) or `would_prompt_then_delete` (without)
+    /// `would_delete` / `would_recover_then_delete` (with `--force`),
+    /// or `would_prompt_then_delete` (without).
     pub disposition: &'static str,
 }
 
@@ -140,6 +161,7 @@ pub struct PredictedConflictJson {
 /// Passed from `sync_plan::run()` to `build_plan()`.
 pub(super) struct SyncPlanData {
     pub merged_candidates: Vec<MergedCandidateJson>,
+    pub closed_prs: Vec<String>,
     pub partially_merged: Vec<PartiallyMergedJson>,
     pub upstream_gone_protected: Vec<String>,
     pub upstream_gone_deletable: Vec<UpstreamGoneDeleteJson>,
@@ -242,9 +264,25 @@ pub(super) fn build(
     let skipped_branches = stats
         .cleanup_skips
         .iter()
+        .chain(stats.get_skips.iter())
         .map(|s| SkippedBranchJson {
             name: s.branch.clone(),
             reason: s.reason.clone(),
+        })
+        .collect();
+
+    let recovery_artifacts = stats
+        .recovery_artifacts
+        .iter()
+        .map(|record| RecoveryArtifactJson {
+            branch: record.branch.clone(),
+            operation_id: record.operation_id.clone(),
+            directory: record.directory.to_string_lossy().into_owned(),
+            manifest: record.manifest.to_string_lossy().into_owned(),
+            restore: format!(
+                "stax undo {} restores branch and metadata; restore workspace contents from the manifest and files in this directory",
+                record.operation_id
+            ),
         })
         .collect();
 
@@ -256,6 +294,15 @@ pub(super) fn build(
             reason: r.reason,
             pr_number: r.pr_number,
             extra_commits: r.extra_commits,
+        })
+        .collect();
+
+    let reconciled_branches = stats
+        .reconciled_branches
+        .iter()
+        .map(|r| ReconciledBranchJson {
+            branch: r.branch.clone(),
+            action: r.action.to_string(),
         })
         .collect();
 
@@ -281,9 +328,12 @@ pub(super) fn build(
         trunk,
         deleted_branches,
         skipped_branches,
+        recovery_artifacts,
         protected_branches: stats.protected_branches.clone(),
+        closed_prs: stats.closed_prs.clone(),
         partially_merged,
         restacked_branches: stats.restacked_branches.clone(),
+        reconciled_branches,
         imported_branches_updated: stats.imported_branches_updated.clone(),
         checkout_change,
         stash,
@@ -343,9 +393,12 @@ pub(super) fn build_plan(
         trunk,
         deleted_branches: vec![],
         skipped_branches: vec![],
+        recovery_artifacts: vec![],
         protected_branches: vec![],
+        closed_prs: plan_data.closed_prs,
         partially_merged: plan_data.partially_merged,
         restacked_branches: vec![],
+        reconciled_branches: vec![],
         imported_branches_updated: vec![],
         checkout_change: None,
         stash: StashJson {
@@ -392,7 +445,10 @@ pub(super) fn classify_error(e: &Error) -> ErrorJson {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::sync::{StashOutcome, SyncStats, TrunkNotUpdated, TrunkUpdateFailure};
+    use crate::commands::sync::{
+        RecoveryRecord, StashOutcome, SyncStats, TrunkNotUpdated, TrunkUpdateFailure,
+    };
+    use std::path::PathBuf;
     use std::time::Duration;
 
     fn make_default_stats() -> SyncStats {
@@ -523,6 +579,29 @@ mod tests {
     }
 
     #[test]
+    fn recovery_artifacts_are_additive_json_details() {
+        let stats = SyncStats {
+            recovery_artifacts: vec![RecoveryRecord {
+                branch: "feature".to_string(),
+                operation_id: "op-123".to_string(),
+                directory: PathBuf::from("/git/stax/recovery/op-123/feature-head"),
+                manifest: PathBuf::from("/git/stax/recovery/op-123/feature-head/manifest.json"),
+            }],
+            ..SyncStats::default()
+        };
+        let output = build("main", "origin/main", &stats, false, Duration::ZERO, None);
+        let parsed: serde_json::Value = serde_json::from_str(&emit(&output)).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["recovery_artifacts"][0]["branch"], "feature");
+        assert_eq!(parsed["recovery_artifacts"][0]["operation_id"], "op-123");
+        assert!(
+            parsed["recovery_artifacts"][0]["restore"]
+                .as_str()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn stash_left_stashed_is_computed() {
         let stats = SyncStats {
             stash: StashOutcome {
@@ -603,6 +682,7 @@ mod tests {
         use crate::commands::sync_plan::TrunkPlan;
 
         let plan_data = SyncPlanData {
+            closed_prs: vec![],
             merged_candidates: vec![
                 MergedCandidateJson {
                     name: "feat-a".to_string(),
@@ -704,6 +784,7 @@ mod tests {
 
         let plan_data = SyncPlanData {
             merged_candidates: vec![],
+            closed_prs: vec![],
             partially_merged: vec![],
             upstream_gone_protected: vec![],
             upstream_gone_deletable: vec![],

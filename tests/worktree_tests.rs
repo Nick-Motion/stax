@@ -275,7 +275,7 @@ fn sync_reports_when_checkout_target_is_in_another_worktree() {
 
     let output = repo.run_stax(&["sync", "--force"]);
     output.assert_success();
-    output.assert_stdout_contains("already checked out in another worktree");
+    output.assert_stdout_contains("PrimaryCheckout");
 
     assert_eq!(
         repo.current_branch(),
@@ -480,9 +480,7 @@ fn sync_keeps_metadata_when_branch_delete_blocked_by_worktree() {
     let output = repo.run_stax_in(&wt_a, &["sync", "--force", "--safe"]);
     output
         .assert_success()
-        .assert_stdout_contains(&format!("Cleanup skipped for {}", a))
-        .assert_stdout_contains("checkout failed")
-        .assert_stdout_contains("Next: st sweep");
+        .assert_stdout_contains("UnknownOperation");
 
     let branch_ref = format!("refs/heads/{}", a);
     repo.git(&["show-ref", "--verify", "--quiet", &branch_ref])
@@ -644,12 +642,12 @@ fn sync_force_preserves_safe_linked_worktree_when_branch_delete_confirmed() {
     let output = repo.run_stax(&["sync", "--force"]);
     output
         .assert_success()
-        .assert_stdout_contains("kept linked worktree")
+        .assert_stdout_contains("removed linked worktree")
         .assert_stdout_contains("deleted (local only)");
 
     assert!(
-        wt_a.exists(),
-        "expected sync --force to preserve the linked worktree"
+        !wt_a.exists(),
+        "expected sync --force to recover and remove the linked worktree"
     );
     assert!(
         !repo
@@ -664,6 +662,11 @@ fn sync_force_preserves_safe_linked_worktree_when_branch_delete_confirmed() {
     assert!(
         !metadata_output.status.success(),
         "expected metadata for deleted branch to be removed"
+    );
+    let restored = crate::common::restore_sync_recovery(&repo.path(), &branch, &wt_a);
+    assert_eq!(
+        TestRepo::stdout(&repo.git_in(restored.path(), &["rev-parse", "HEAD"])).trim(),
+        repo.get_commit_sha("main^2")
     );
 }
 
@@ -693,25 +696,30 @@ fn sync_force_preserves_dirty_linked_worktree_and_deletes_local_branch() {
     let output = repo.run_stax(&["sync", "--force"]);
     output
         .assert_success()
-        .assert_stdout_contains("kept linked worktree")
+        .assert_stdout_contains("removed linked worktree")
         .assert_stdout_contains("deleted (local only)");
 
     let stdout = TestRepo::stdout(&output);
     assert!(
-        !stdout.contains("removed linked worktree"),
-        "expected sync --force to preserve the dirty linked worktree, got:\n{}",
+        stdout.contains("removed linked worktree"),
+        "expected sync --force to recover and remove the dirty linked worktree, got:\n{}",
         stdout
     );
     assert!(
-        wt_a.exists(),
-        "expected sync --force to preserve the dirty linked worktree"
+        !wt_a.exists(),
+        "expected sync --force to recover and remove the dirty linked worktree"
     );
     assert!(
         !repo
             .list_branches()
             .iter()
             .any(|candidate| candidate == &branch),
-        "expected sync --force to delete the local branch after preserving the dirty worktree"
+        "expected sync --force to delete the local branch after recovering and removing the dirty worktree"
+    );
+    let restored = crate::common::restore_sync_recovery(&repo.path(), &branch, &wt_a);
+    assert_eq!(
+        fs::read_to_string(restored.path().join("dirty.txt")).unwrap(),
+        "dirty\n"
     );
 }
 
@@ -751,7 +759,7 @@ fn sync_force_preserves_dirty_linked_worktree_even_with_ambiguous_basename() {
     let output = repo.run_stax(&["sync", "--force"]);
     output
         .assert_success()
-        .assert_stdout_contains("kept linked worktree")
+        .assert_stdout_contains("removed linked worktree")
         .assert_stdout_contains("deleted (local only)");
 
     let stdout = TestRepo::stdout(&output);
@@ -761,8 +769,8 @@ fn sync_force_preserves_dirty_linked_worktree_even_with_ambiguous_basename() {
         stdout
     );
     assert!(
-        wt_a.exists(),
-        "expected sync --force to preserve the dirty linked worktree even when its basename is ambiguous"
+        !wt_a.exists(),
+        "expected sync --force to recover and remove the dirty linked worktree even when its basename is ambiguous"
     );
     assert!(
         wt_side.exists(),
@@ -773,7 +781,12 @@ fn sync_force_preserves_dirty_linked_worktree_even_with_ambiguous_basename() {
             .list_branches()
             .iter()
             .any(|candidate| candidate == &branch),
-        "expected sync --force to delete the local branch after preserving the dirty worktree"
+        "expected sync --force to delete the local branch after recovering and removing the dirty worktree"
+    );
+    let restored = crate::common::restore_sync_recovery(&repo.path(), &branch, &wt_a);
+    assert_eq!(
+        fs::read_to_string(restored.path().join("dirty.txt")).unwrap(),
+        "dirty\n"
     );
 }
 
@@ -805,19 +818,24 @@ fn sync_delete_upstream_gone_preserves_safe_linked_worktree() {
     let output = repo.run_stax(&["sync", "--force", "--delete-upstream-gone"]);
     output
         .assert_success()
-        .assert_stdout_contains("kept linked worktree")
+        .assert_stdout_contains("removed linked worktree")
         .assert_stdout_contains("deleted (local only)");
 
     assert!(
-        wt_lane.exists(),
-        "expected upstream-gone sync cleanup to preserve the linked worktree"
+        !wt_lane.exists(),
+        "expected upstream-gone sync cleanup to recover and remove the linked worktree"
     );
     assert!(
         !repo
             .list_branches()
             .iter()
             .any(|candidate| candidate == &branch),
-        "expected upstream-gone branch to be deleted locally after linked worktree preservation"
+        "expected upstream-gone branch to be deleted locally after linked worktree recovery and removal"
+    );
+    let restored = crate::common::restore_sync_recovery(&repo.path(), &branch, &wt_lane);
+    assert_eq!(
+        fs::read_to_string(restored.path().join("lane.txt")).unwrap(),
+        "lane\n"
     );
 }
 

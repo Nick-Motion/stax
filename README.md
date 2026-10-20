@@ -84,24 +84,12 @@ mv stax st ~/.local/bin/
 
 ### Build from source
 
-Prereqs:
-- Debian/Ubuntu: `sudo apt-get install libssl-dev pkg-config`
-- Fedora/RHEL: `sudo dnf install openssl-devel`
-- Arch: `sudo pacman -S openssl pkg-config`
-- macOS: OpenSSL included
-
-Then:
+Requires Rust and a C compiler.
 
 ```bash
 cargo install --path . --locked
 # or
 make install
-```
-
-No system OpenSSL? Use the vendored feature:
-
-```bash
-cargo install --path . --locked --features vendored-openssl
 ```
 
 </details>
@@ -256,7 +244,7 @@ When a rebase stops on a conflict, `st resolve` sends only the conflicted text f
 
 ```bash
 st resolve
-st resolve --agent codex --model gpt-5.3-codex
+st resolve --agent codex --model gpt-5.6-terra
 ```
 
 Before each rebase, stax also runs a **preflight repair** that compares the
@@ -266,6 +254,10 @@ automatically uses the merge-base boundary for that rebase and prints a
 one-line notice. Silence the notice with `[restack] preflight_warn = false` or
 `--quiet`; disable the automatic correction with
 `[restack] preflight_auto_repair = false`.
+
+The same preflight also detects **squash-merged parents**: if the first commits
+of a branch already landed on the parent as one squash commit, stax rebases only
+the commits after them instead of replaying the merged ones and conflicting.
 
 ### Undo / redo
 
@@ -373,8 +365,9 @@ These rules apply to AI-generated PR titles and bodies from `generate` and `subm
 | `st ci` / `st ci --oneline` | Live CI status for each PR head — full per-check table, or one compact line per branch across the stack; GitHub statuses and check runs are fetched across all pages before roll-up |
 | `st ci -w --alert` | Watch CI until all checks finish, then play success/error sounds |
 | `st ci -w --strict` | Watch CI but exit as soon as any check fails |
-| `st rs` / `st rs --restack` | Sync trunk, clean merged branches, optionally rebase |
-| `st sweep` | Classify all local branches (merged/gone/stale/active); `--delete` removes merged branches (including tracked merged PRs) and upstream-gone branches with no unique work |
+| `st rs` / `st rs --restack` | Sync trunk, clean merged branches, report closed-but-unmerged PR branches without deleting them, optionally rebase; shows live progress while preparing the sync plan |
+| `st sweep` | Classify local branches (merged/closed-pr/gone/stale/active); `--delete` cleans merged and safe upstream-gone branches, while `--delete --include-closed` explicitly discards closed PR branches |
+| `st stats` | Single-screen, local-only snapshot of stacking health (stack shape, PR mix, restack/parent/dirty health, worktree lanes, hygiene, next action); `--current` scopes to the current stack, `--json` for machine output, `--ci` adds an opt-in CI roll-up |
 | `st refresh` / `st r` | Sync trunk without merged-branch cleanup, restack current stack, then push/update PRs (pass `--delete-merged` to opt into `sync`-style cleanup) |
 | `st refresh --all-stacks` | Sync trunk once, then restack and submit every independent stack; needs a clean tree unless `--auto-stash-pop` is set and stops at the first conflict |
 | `st refresh --force --yes --no-prompt` | Run refresh without sync or submit prompts |
@@ -475,6 +468,7 @@ AI and editor integration guides:
 - [Claude Code](docs/integrations/claude-code.md)
 - [Codex](docs/integrations/codex.md)
 - [Gemini CLI](docs/integrations/gemini-cli.md)
+- [Hermes](docs/integrations/hermes.md)
 - [OpenCode](docs/integrations/opencode.md)
 - [pi](docs/integrations/pi.md)
 - [PR templates + AI generation](docs/integrations/pr-templates-and-ai.md)

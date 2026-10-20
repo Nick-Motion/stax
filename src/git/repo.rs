@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use git2::{BranchType, Repository};
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -9,8 +10,23 @@ use std::time::{Duration, Instant};
 
 use super::command;
 
+/// The leading commits of a branch that already landed on its parent as one commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SquashMergedPrefix {
+    /// Newest branch commit contained in the squash; the rebase boundary to use.
+    pub tip: String,
+    /// Number of branch commits (counted from the merge-base) the squash covers.
+    pub commit_count: usize,
+    /// The parent commit that contains their combined changes.
+    pub trunk_commit: String,
+}
+
 pub struct GitRepo {
     repo: Repository,
+    /// Merge-bases by commit pair. Commits never change, so entries never go stale.
+    merge_bases: RefCell<HashMap<(git2::Oid, git2::Oid), git2::Oid>>,
+    /// `graph_descendant_of` answers by (descendant, ancestor), taken from a walk.
+    descendants: RefCell<HashMap<(git2::Oid, git2::Oid), bool>>,
 }
 
 /// Immutable object IDs for one merge-base branch diff.
@@ -172,6 +188,47 @@ fn run_git_in(cwd: &Path, args: &[&str]) -> Result<Output> {
     command::output(cwd, args).with_context(|| format!("Failed to run git {}", args.join(" ")))
 }
 
+/// The `(patch_id, commit_id)` pairs that `git patch-id` printed.
+fn parse_patch_id_pairs(stdout: &[u8]) -> Vec<(String, String)> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.split_whitespace();
+            let patch_id = columns.next()?;
+            let commit_id = columns.next().unwrap_or_default();
+            Some((patch_id.to_string(), commit_id.to_string()))
+        })
+        .collect()
+}
+
+/// Each commit that `git rev-list --parents` listed, with its parents.
+pub(crate) fn parent_graph(rev_list: &str) -> HashMap<&str, Vec<&str>> {
+    rev_list
+        .lines()
+        .filter_map(|line| {
+            let mut commits = line.split(' ');
+            Some((commits.next()?, commits.collect()))
+        })
+        .collect()
+}
+
+/// The commits of `parents` that `tip` reaches without leaving the graph.
+pub(crate) fn reachable<'a>(
+    parents: &HashMap<&'a str, Vec<&'a str>>,
+    tip: &'a str,
+) -> HashSet<&'a str> {
+    let mut seen = HashSet::new();
+    let mut pending = vec![tip];
+    while let Some(commit) = pending.pop() {
+        if let Some(commit_parents) = parents.get(commit)
+            && seen.insert(commit)
+        {
+            pending.extend_from_slice(commit_parents);
+        }
+    }
+    seen
+}
+
 pub fn checkout_branch_in(workdir: &Path, branch: &str) -> Result<()> {
     let output = command::output(workdir, &["checkout", branch])
         .with_context(|| format!("Failed to run git checkout {}", branch))?;
@@ -260,6 +317,14 @@ struct BranchParentMetadata {
 }
 
 impl GitRepo {
+    fn new(repo: Repository) -> Self {
+        Self {
+            repo,
+            merge_bases: RefCell::default(),
+            descendants: RefCell::default(),
+        }
+    }
+
     /// Open the repository at the current directory or any parent
     pub fn open() -> Result<Self> {
         let repo = Repository::discover(".").map_err(|_| {
@@ -267,14 +332,14 @@ impl GitRepo {
                 "Not in a Git repository. Run this command from inside a Git repository."
             )
         })?;
-        Ok(Self { repo })
+        Ok(Self::new(repo))
     }
 
     /// Open the repository from a known repository path without rediscovering the cwd.
     pub fn open_from_path(path: &Path) -> Result<Self> {
         let repo = Repository::open(path)
             .with_context(|| format!("Failed to open git repository at '{}'", path.display()))?;
-        Ok(Self { repo })
+        Ok(Self::new(repo))
     }
 
     /// Re-open this repository from scratch, returning a new `GitRepo` with a fresh libgit2
@@ -366,6 +431,18 @@ impl GitRepo {
 
     pub(crate) fn is_dirty_at(&self, cwd: &Path) -> Result<bool> {
         let output = self.run_git(cwd, &["status", "--porcelain"])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!("git status failed in '{}': {}", cwd.display(), stderr);
+        }
+        Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    }
+
+    /// Like `is_dirty_at`, but ignores untracked files. Use this before an
+    /// operation (like `git reset --hard`) that only destroys tracked
+    /// changes, so an unrelated untracked scratch file doesn't block it.
+    pub(crate) fn has_tracked_changes_at(&self, cwd: &Path) -> Result<bool> {
+        let output = self.run_git(cwd, &["status", "--porcelain", "--untracked-files=no"])?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             anyhow::bail!("git status failed in '{}': {}", cwd.display(), stderr);
@@ -1336,7 +1413,8 @@ impl GitRepo {
         Ok(merged_tree == base_tree)
     }
 
-    fn run_patch_id_from_input(&self, cwd: &Path, input: &[u8]) -> Result<Vec<String>> {
+    /// Run `git patch-id --stable` and return `(patch_id, commit_id)` pairs.
+    fn run_patch_id_pairs_from_input(cwd: &Path, input: &[u8]) -> Result<Vec<(String, String)>> {
         let mut patch_id = Command::new("git")
             .args(["patch-id", "--stable"])
             .current_dir(cwd)
@@ -1373,16 +1451,19 @@ impl GitRepo {
             anyhow::bail!("git patch-id --stable failed: {}", stderr);
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| line.split_whitespace().next())
-            .map(ToString::to_string)
-            .collect())
+        Ok(parse_patch_id_pairs(&output.stdout))
     }
 
     /// Max commits in `merge_base..trunk` for patch-id merged-branch detection; beyond this we
     /// skip the expensive `git log -p` path (see `is_branch_merged_equivalent_to_trunk`).
     pub(crate) const PATCH_ID_TRUNK_COMMIT_CAP: usize = 200;
+
+    /// Max branch commits examined by `find_squash_merged_prefix`.
+    pub(crate) const SQUASH_PREFIX_BRANCH_COMMIT_CAP: usize = 100;
+
+    /// Max changed files passed as a pathspec to narrow the trunk commits searched by
+    /// `find_squash_merged_prefix`; above this the filter is skipped.
+    pub(crate) const SQUASH_PREFIX_PATHSPEC_CAP: usize = 500;
 
     pub(crate) fn rev_list_count(&self, cwd: &Path, range: &str) -> Result<usize> {
         let output = self.run_git(cwd, &["rev-list", "--count", range])?;
@@ -1396,20 +1477,305 @@ impl GitRepo {
             .unwrap_or(0))
     }
 
-    pub(crate) fn patch_ids_for_range(&self, cwd: &Path, range: &str) -> Result<HashSet<String>> {
-        let output = self.run_git(cwd, &["log", "--format=%H", "-p", "--no-merges", range])?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            anyhow::bail!(
-                "git log --format=%H -p --no-merges {} failed: {}",
-                range,
-                stderr
-            );
+    pub(crate) fn patch_ids_for_range(cwd: &Path, range: &str) -> Result<HashSet<String>> {
+        Ok(
+            Self::patch_id_pairs_of(cwd, &["log", "--format=%H", "-p", "--no-merges", range])?
+                .into_iter()
+                .map(|(patch_id, _)| patch_id)
+                .collect(),
+        )
+    }
+
+    /// `(patch_id, commit)` for each of `commits`. A commit with an empty diff has none.
+    pub(crate) fn patch_ids_for_commits(
+        &self,
+        cwd: &Path,
+        commits: &[&str],
+    ) -> Result<Vec<(String, String)>> {
+        let mut args = vec!["log", "--format=%H", "-p", "--no-walk=unsorted"];
+        args.extend_from_slice(commits);
+        Self::patch_id_pairs_of(cwd, &args)
+    }
+
+    /// `(patch_id, commit_id)` pairs of the diffs that `git <args>` prints. The
+    /// diffs stream into `git patch-id --stable`, which hashes the first ones
+    /// while git writes the rest.
+    fn patch_id_pairs_of(cwd: &Path, args: &[&str]) -> Result<Vec<(String, String)>> {
+        let (source, patch_id) = command::piped_output(cwd, args, &["patch-id", "--stable"])
+            .with_context(|| {
+                format!(
+                    "Failed to run git {} | git patch-id --stable",
+                    args.join(" ")
+                )
+            })?;
+        // A failed patch-id closes its input, which also fails the source.
+        if !patch_id.status.success() {
+            let stderr = String::from_utf8_lossy(&patch_id.stderr).trim().to_string();
+            anyhow::bail!("git patch-id --stable failed: {}", stderr);
+        }
+        if !source.status.success() {
+            let stderr = String::from_utf8_lossy(&source.stderr).trim().to_string();
+            anyhow::bail!("git {} failed: {}", args.join(" "), stderr);
+        }
+        Ok(parse_patch_id_pairs(&patch_id.stdout))
+    }
+
+    /// Each non-merge commit in `base..tip` that changes some of `paths`, with
+    /// every path it changes, rename sources included, sorted and relative to
+    /// the repository root. No paths selects every commit. `splits`,
+    /// first-parent ancestors of `tip` from newest to oldest, cut the range
+    /// into parts that separate git processes walk at the same time.
+    pub(crate) fn files_changed_by_commits(
+        cwd: &Path,
+        base: &str,
+        tip: &str,
+        splits: &[String],
+        paths: &[String],
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        // A part holds what its top reaches and the next top and `base` do
+        // not. A first parent reaches only commits that its child reaches, so
+        // the parts share no commit and together hold `base..tip`.
+        let tops: Vec<&str> = std::iter::once(tip)
+            .chain(splits.iter().map(String::as_str))
+            .collect();
+        let ranges: Vec<Vec<String>> = tops
+            .iter()
+            .enumerate()
+            .map(|(index, top)| {
+                let mut range = vec![top.to_string(), format!("^{base}")];
+                range.extend(tops.get(index + 1).map(|next| format!("^{next}")));
+                range
+            })
+            .collect();
+        let outputs = std::thread::scope(|scope| {
+            let parts: Vec<_> = ranges
+                .iter()
+                .map(|range| {
+                    scope.spawn(move || {
+                        // With log.follow set, git refuses a pathspec log. A
+                        // shown signature would mix gpg output into the paths.
+                        let mut args = vec![
+                            "-c",
+                            "log.follow=false",
+                            "--literal-pathspecs",
+                            "log",
+                            "--no-show-signature",
+                            "--format=%x00%H",
+                            "--name-only",
+                            "--full-diff",
+                            "--no-renames",
+                            "--no-merges",
+                            "--full-history",
+                            "-z",
+                        ];
+                        args.extend(range.iter().map(String::as_str));
+                        args.push("--");
+                        args.extend(paths.iter().map(String::as_str));
+                        run_git_in(cwd, &args)
+                    })
+                })
+                .collect();
+            parts
+                .into_iter()
+                .map(|part| {
+                    part.join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut commits = Vec::new();
+        for output in outputs {
+            let output = output?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                anyhow::bail!("git log --name-only {base}..{tip} failed: {stderr}");
+            }
+            let tokens: Vec<&[u8]> = output.stdout.split(|byte| *byte == 0).collect();
+            // Each commit prints as an empty token, its id, a newline and then
+            // the paths it changes.
+            commits.extend(tokens.split(|token| token.is_empty()).filter_map(|record| {
+                let (commit, changed) = record.split_first()?;
+                let mut files: Vec<String> = changed
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| {
+                        let path = if index == 0 {
+                            path.strip_prefix(b"\n").unwrap_or(path)
+                        } else {
+                            path
+                        };
+                        String::from_utf8_lossy(path).into_owned()
+                    })
+                    .collect();
+                files.sort_unstable();
+                Some((String::from_utf8_lossy(commit).into_owned(), files))
+            }));
+        }
+        Ok(commits)
+    }
+
+    /// Find the longest prefix of `branch`'s own commits that already landed on
+    /// `parent` as a single squash (or cherry-pick) commit.
+    ///
+    /// A squash commit has the *cumulative* diff of the PR's commits, so no
+    /// single branch commit shares its patch-id and git cannot drop them while
+    /// rebasing. Instead, for each branch commit `C_i` (newest first) this compares
+    /// the patch-id of `merge-base..C_i` with the patch-ids of the commits that
+    /// `parent` gained since the merge-base. The first match is returned, so the
+    /// caller can rebase only the commits after `C_i`.
+    ///
+    /// Returns `Ok(None)` when nothing matches or when the search would be too
+    /// expensive (see [`Self::PATCH_ID_TRUNK_COMMIT_CAP`] and
+    /// [`Self::SQUASH_PREFIX_BRANCH_COMMIT_CAP`]). Diffs use `-U0` so unrelated
+    /// edits near the squashed hunks on trunk do not change the patch-id.
+    pub(crate) fn find_squash_merged_prefix(
+        &self,
+        branch: &str,
+        parent: &str,
+    ) -> Result<Option<SquashMergedPrefix>> {
+        let cwd = self.workdir()?;
+        let merge_base = self.merge_base(parent, branch)?;
+
+        let parent_range = format!("{merge_base}..{parent}");
+        let parent_count = self.rev_list_count(cwd, &parent_range)?;
+        if parent_count == 0 || parent_count > Self::PATCH_ID_TRUNK_COMMIT_CAP {
+            return Ok(None);
         }
 
-        Ok(self
-            .run_patch_id_from_input(cwd, &output.stdout)?
-            .into_iter()
+        let branch_range = format!("{merge_base}..{branch}");
+        let branch_commits = self.git_stdout_lines(
+            cwd,
+            &["rev-list", "--topo-order", "--reverse", &branch_range],
+        )?;
+        if branch_commits.is_empty() || branch_commits.len() > Self::SQUASH_PREFIX_BRANCH_COMMIT_CAP
+        {
+            return Ok(None);
+        }
+
+        // Only trunk commits touching a file the branch touches can be the squash.
+        let changed_files = self.git_stdout_lines(
+            cwd,
+            &["diff", "--name-only", "--no-renames", &merge_base, branch],
+        )?;
+        let mut rev_list_args = vec!["rev-list", "--no-merges", parent_range.as_str()];
+        if !changed_files.is_empty() && changed_files.len() <= Self::SQUASH_PREFIX_PATHSPEC_CAP {
+            rev_list_args.push("--");
+            rev_list_args.extend(changed_files.iter().map(String::as_str));
+        }
+        let candidates = self.git_stdout_lines(cwd, &rev_list_args)?;
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        let mut log_args = vec![
+            "log",
+            "--format=%H",
+            "-p",
+            "-U0",
+            "--no-renames",
+            "--binary",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-walk=unsorted",
+        ];
+        log_args.extend(candidates.iter().map(String::as_str));
+        let log = self.run_git(cwd, &log_args)?;
+        if !log.status.success() {
+            return Ok(None);
+        }
+        let trunk_patch_ids: HashMap<String, String> =
+            Self::run_patch_id_pairs_from_input(cwd, &log.stdout)?
+                .into_iter()
+                .collect();
+        if trunk_patch_ids.is_empty() {
+            return Ok(None);
+        }
+
+        for (index, tip) in branch_commits.iter().enumerate().rev() {
+            let diff = self.run_git(
+                cwd,
+                &[
+                    "diff",
+                    "-U0",
+                    "--no-renames",
+                    "--binary",
+                    "--no-ext-diff",
+                    "--no-color",
+                    &merge_base,
+                    tip,
+                ],
+            )?;
+            if !diff.status.success() {
+                continue;
+            }
+            let patch_ids = Self::run_patch_id_pairs_from_input(cwd, &diff.stdout)?;
+            let Some((patch_id, _)) = patch_ids.first() else {
+                continue;
+            };
+            if let Some(trunk_commit) = trunk_patch_ids.get(patch_id)
+                && self.merging_adds_nothing(cwd, &merge_base, parent, tip)
+            {
+                return Ok(Some(SquashMergedPrefix {
+                    tip: tip.clone(),
+                    commit_count: index + 1,
+                    trunk_commit: trunk_commit.clone(),
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// True when merging `tip` into `parent` (3-way, from `merge_base`) is clean and
+    /// leaves `parent`'s tree unchanged, i.e. every change in `merge_base..tip` is
+    /// already present in `parent`.
+    ///
+    /// Patch-ids ignore line numbers and, with `-U0`, context, so the same text added
+    /// at a different place in a file would match. This check rules that out: a
+    /// misplaced copy of the change would show up as a difference in the merged tree.
+    fn merging_adds_nothing(&self, cwd: &Path, merge_base: &str, parent: &str, tip: &str) -> bool {
+        let Ok(output) = self.run_git(
+            cwd,
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--no-messages",
+                "--merge-base",
+                merge_base,
+                parent,
+                tip,
+            ],
+        ) else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let merged_tree = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .map(|line| line.trim().to_string())
+            .unwrap_or_default();
+        let Ok(parent_tree) =
+            self.git_stdout_lines(cwd, &["rev-parse", &format!("{parent}^{{tree}}")])
+        else {
+            return false;
+        };
+        !merged_tree.is_empty() && parent_tree.first() == Some(&merged_tree)
+    }
+
+    /// Run git and return non-empty stdout lines; a non-zero exit is an error.
+    fn git_stdout_lines(&self, cwd: &Path, args: &[&str]) -> Result<Vec<String>> {
+        let output = self.run_git(cwd, args)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!("git {} failed: {}", args.join(" "), stderr);
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
             .collect())
     }
 
@@ -1713,15 +2079,112 @@ Use --auto-stash-pop or stash/commit changes first.",
             .get()
             .peel_to_commit()?;
 
-        let base = self.repo.merge_base(left_commit.id(), right_commit.id())?;
+        let base = self.merge_base_oid(left_commit.id(), right_commit.id())?;
         Ok(base.to_string())
+    }
+
+    /// Sync asks for the same trunk/branch merge-base several times, and each
+    /// libgit2 walk costs ~15 ms on a large history.
+    fn merge_base_oid(&self, left: git2::Oid, right: git2::Oid) -> Result<git2::Oid, git2::Error> {
+        let cached = self.merge_bases.borrow().get(&(left, right)).copied();
+        if let Some(base) = cached {
+            return Ok(base);
+        }
+        let base = self.repo.merge_base(left, right)?;
+        self.merge_bases.borrow_mut().insert((left, right), base);
+        Ok(base)
+    }
+
+    /// Fill the merge-base memo for `trunk` and each of `tips` from the output
+    /// of `git --no-replace-objects rev-list --parents <positives> --not
+    /// <trunk>`, whose positives must include every tip, and the descendant
+    /// memo for trunk and each tip. A tip that the walk does not list is an
+    /// ancestor of trunk, so it is its own merge base. Otherwise every merge
+    /// base is a trunk commit that one of the tip's own commits points at, so
+    /// a single such commit is the merge base. Returns the tips that point at
+    /// none or several, with those commits, and leaves them to libgit2.
+    pub fn remember_merge_bases(
+        &self,
+        trunk: git2::Oid,
+        rev_list: &str,
+        tips: &[git2::Oid],
+    ) -> HashMap<git2::Oid, Vec<String>> {
+        let parents = parent_graph(rev_list);
+        let mut undecided = HashMap::new();
+        for &tip in tips {
+            let hex = tip.to_string();
+            let listed = parents.contains_key(hex.as_str());
+            self.descendants
+                .borrow_mut()
+                .insert((trunk, tip), !listed && tip != trunk);
+            let base = if listed {
+                let boundary: HashSet<&str> = reachable(&parents, &hex)
+                    .into_iter()
+                    .flat_map(|commit| parents[commit].iter().copied())
+                    .filter(|parent| !parents.contains_key(parent))
+                    .collect();
+                match Vec::from_iter(boundary).as_slice() {
+                    [base] => git2::Oid::from_str(base).ok(),
+                    boundary => {
+                        undecided.insert(tip, boundary.iter().map(|c| c.to_string()).collect());
+                        None
+                    }
+                }
+            } else {
+                Some(tip)
+            };
+            if let Some(base) = base {
+                self.merge_bases.borrow_mut().insert((trunk, tip), base);
+            }
+        }
+        undecided
+    }
+
+    /// Whether `descendant` descends from `ancestor`, as libgit2's
+    /// `graph_descendant_of` answers, unless `remember_descendants` knows.
+    pub fn graph_descendant_of(
+        &self,
+        descendant: git2::Oid,
+        ancestor: git2::Oid,
+    ) -> Result<bool, git2::Error> {
+        let known = self
+            .descendants
+            .borrow()
+            .get(&(descendant, ancestor))
+            .copied();
+        match known {
+            Some(known) => Ok(known),
+            None => self.repo.graph_descendant_of(descendant, ancestor),
+        }
+    }
+
+    /// Fill the descendant memo for each `(descendant, ancestor)` pair from the
+    /// walk that `remember_merge_bases` reads, whose positives must reach both
+    /// commits of every pair. The walk lists the commits that trunk does not
+    /// reach. An unlisted commit reaches only trunk commits, so it descends
+    /// from no listed commit, and a listed commit reaches a listed ancestor
+    /// only through listed commits. Pairs with an unlisted ancestor are left
+    /// to libgit2.
+    pub fn remember_descendants(&self, rev_list: &str, pairs: &[(git2::Oid, git2::Oid)]) {
+        let parents = parent_graph(rev_list);
+        for &(descendant, ancestor) in pairs {
+            let ancestor_hex = ancestor.to_string();
+            if !parents.contains_key(ancestor_hex.as_str()) {
+                continue;
+            }
+            let descends = descendant != ancestor
+                && reachable(&parents, &descendant.to_string()).contains(ancestor_hex.as_str());
+            self.descendants
+                .borrow_mut()
+                .insert((descendant, ancestor), descends);
+        }
     }
 
     /// Find merge-base commit between any two refs (branch names, remote refs, or SHAs).
     pub fn merge_base_refs(&self, left: &str, right: &str) -> Result<String> {
         let left_oid = self.resolve_to_oid(left)?;
         let right_oid = self.resolve_to_oid(right)?;
-        Ok(self.repo.merge_base(left_oid, right_oid)?.to_string())
+        Ok(self.merge_base_oid(left_oid, right_oid)?.to_string())
     }
 
     /// Check whether `ancestor` is an ancestor of `descendant`.
@@ -1792,8 +2255,7 @@ Use --auto-stash-pop or stash/commit changes first.",
                 let Ok(base_commit) = base_branch.get().peel_to_commit() else {
                     return false;
                 };
-                self.repo
-                    .merge_base(base_commit.id(), branch_commit.id())
+                self.merge_base_oid(base_commit.id(), branch_commit.id())
                     .map(|base_oid| base_oid == branch_commit.id())
                     .unwrap_or(false)
             });
@@ -1983,11 +2445,9 @@ Use --auto-stash-pop or stash/commit changes first.",
             .get()
             .peel_to_commit()?;
 
-        // Branch is merged if its commit is an ancestor of trunk
-        Ok(self
-            .repo
-            .merge_base(trunk_commit.id(), branch_commit.id())?
-            == branch_commit.id())
+        // Branch is merged if its commit is trunk or an ancestor of trunk
+        let (trunk, tip) = (trunk_commit.id(), branch_commit.id());
+        Ok(tip == trunk || self.graph_descendant_of(trunk, tip)?)
     }
 
     /// Cheap merge-equivalence checks only (ancestor + identical tree). Returns `Some(())` if
@@ -2033,7 +2493,7 @@ Use --auto-stash-pop or stash/commit changes first.",
 
         let cwd = self.workdir()?;
         let branch_range = format!("{}..{}", merge_base, branch);
-        let branch_patch_ids = self.patch_ids_for_range(cwd, &branch_range)?;
+        let branch_patch_ids = Self::patch_ids_for_range(cwd, &branch_range)?;
         if branch_patch_ids.is_empty() {
             return Ok(true);
         }
@@ -2044,7 +2504,7 @@ Use --auto-stash-pop or stash/commit changes first.",
             return Ok(false);
         }
 
-        let trunk_patch_ids = self.patch_ids_for_range(cwd, &trunk_range)?;
+        let trunk_patch_ids = Self::patch_ids_for_range(cwd, &trunk_range)?;
         if trunk_patch_ids.is_empty() {
             return Ok(false);
         }
@@ -2054,15 +2514,11 @@ Use --auto-stash-pop or stash/commit changes first.",
 
     /// Return true when two refs have identical trees (no content diff).
     fn refs_have_no_diff(&self, left: &str, right: &str) -> Result<bool> {
-        let output = self.run_git(self.workdir()?, &["diff", "--quiet", left, right])?;
-        match output.status.code() {
-            Some(0) => Ok(true),
-            Some(1) => Ok(false),
-            _ => {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                anyhow::bail!("git diff --quiet {} {} failed: {}", left, right, stderr)
-            }
-        }
+        let tree = |refspec| -> Result<git2::Oid> {
+            let oid = self.resolve_to_oid(refspec)?;
+            Ok(self.repo.find_object(oid, None)?.peel_to_tree()?.id())
+        };
+        Ok(tree(left)? == tree(right)?)
     }
 
     /// Check if a branch has an origin remote-tracking branch.
@@ -2162,8 +2618,7 @@ Use --auto-stash-pop or stash/commit changes first.",
             .resolve_to_oid(branch)
             .with_context(|| format!("Failed to resolve branch '{branch}' against '{parent}'"))?;
         let merge_base_oid = self
-            .repo
-            .merge_base(parent_oid, branch_oid)
+            .merge_base_oid(parent_oid, branch_oid)
             .with_context(|| {
                 format!("Failed to find merge base for parent '{parent}' and branch '{branch}'")
             })?;
@@ -2850,9 +3305,7 @@ mod tests {
         run_git(path, &["add", "b.txt"]);
         run_git(path, &["commit", "-m", "Feature B"]);
 
-        let repo = GitRepo {
-            repo: Repository::open(path).expect("open repo"),
-        };
+        let repo = GitRepo::new(Repository::open(path).expect("open repo"));
         let pairs = vec![
             ("main".to_string(), "feature-a".to_string()),
             ("main".to_string(), "feature-b".to_string()),
@@ -2868,6 +3321,45 @@ mod tests {
                     .expect("single ahead/behind")
             );
         }
+    }
+
+    #[test]
+    fn squash_merged_branch_is_merged_by_identical_tree() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path();
+
+        run_git(path, &["init", "-b", "main"]);
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test User"]);
+
+        fs::write(path.join("README.md"), "base\n").expect("write readme");
+        run_git(path, &["add", "README.md"]);
+        run_git(path, &["commit", "-m", "Initial commit"]);
+
+        run_git(path, &["checkout", "-b", "squashed"]);
+        for file in ["a.txt", "b.txt"] {
+            fs::write(path.join(file), "change\n").expect("write feature file");
+            run_git(path, &["add", file]);
+            run_git(path, &["commit", "-m", file]);
+        }
+        run_git(path, &["checkout", "-b", "unmerged"]);
+        fs::write(path.join("c.txt"), "change\n").expect("write c");
+        run_git(path, &["add", "c.txt"]);
+        run_git(path, &["commit", "-m", "c.txt"]);
+
+        run_git(path, &["checkout", "main"]);
+        run_git(path, &["merge", "--squash", "squashed"]);
+        run_git(path, &["commit", "-m", "Squash merge"]);
+
+        let repo = GitRepo::new(Repository::open(path).expect("open repo"));
+        assert_eq!(
+            repo.is_branch_merged_cheap("squashed").expect("squashed"),
+            Some(())
+        );
+        assert_eq!(
+            repo.is_branch_merged_cheap("unmerged").expect("unmerged"),
+            None
+        );
     }
 
     #[test]
@@ -2913,9 +3405,7 @@ mod tests {
         run_git(path, &["checkout", "-b", "child"]);
         run_git(path, &["checkout", "parent"]);
 
-        let repo = GitRepo {
-            repo: Repository::open(path).expect("open repo"),
-        };
+        let repo = GitRepo::new(Repository::open(path).expect("open repo"));
 
         crate::git::refs::write_metadata(
             &repo.repo,
@@ -3080,5 +3570,147 @@ mod tests {
             .branches_with_configured_upstream()
             .expect("no branch config should not be an error");
         assert!(configured.is_empty());
+    }
+
+    #[test]
+    fn walk_memos_keep_only_what_the_walk_proves() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path();
+        run_git(path, &["init", "-b", "main"]);
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test User"]);
+        let commit = |message: &str| run_git(path, &["commit", "--allow-empty", "-m", message]);
+        commit("base");
+        run_git(path, &["branch", "behind"]);
+        run_git(path, &["branch", "forked"]);
+        commit("m1");
+        run_git(path, &["branch", "later"]);
+        commit("m2");
+        run_git(path, &["switch", "forked"]);
+        commit("f1");
+        commit("f2");
+        run_git(path, &["switch", "later"]);
+        commit("l1");
+        // Two trunk commits under its own commits, but only m1 is a merge base.
+        run_git(path, &["switch", "-c", "merged-trunk", "behind"]);
+        commit("x1");
+        run_git(path, &["merge", "--no-ff", "-m", "x2", "main~1"]);
+        run_git(path, &["switch", "main"]);
+
+        let repo = GitRepo::open_from_path(path).expect("open repo");
+        let branches = ["behind", "forked", "later", "merged-trunk"];
+        let mut walk = vec!["--no-replace-objects", "rev-list", "--parents"];
+        walk.extend(branches);
+        walk.extend(["--not", "main"]);
+        let oid = |rev: &str| {
+            git2::Oid::from_str(run_git_capture(path, &["rev-parse", rev]).trim()).expect("oid")
+        };
+        let main = oid("main");
+        let walk = run_git_capture(path, &walk);
+        repo.remember_merge_bases(main, &walk, &branches.map(oid));
+
+        let expected: HashMap<_, _> = ["behind", "forked", "later"]
+            .map(|branch| {
+                let base = run_git_capture(path, &["merge-base", "main", branch]);
+                ((main, oid(branch)), oid(base.trim()))
+            })
+            .into_iter()
+            .collect();
+        assert_eq!(*repo.merge_bases.borrow(), expected);
+
+        let pairs = [
+            ("forked", "forked~1"),
+            ("forked~1", "forked"),
+            ("forked", "forked"),
+            ("later", "forked"),
+            ("behind", "forked"),
+            ("forked", "behind"),
+        ]
+        .map(|(descendant, ancestor)| (oid(descendant), oid(ancestor)));
+        repo.remember_descendants(&walk, &pairs);
+        // The walk cannot tell which trunk commits a branch reaches, but it
+        // shows whether trunk reaches each branch tip.
+        let proven = pairs[..5]
+            .iter()
+            .copied()
+            .chain(branches.map(|branch| (main, oid(branch))));
+        let expected: HashMap<_, _> = proven
+            .map(|(descendant, ancestor)| {
+                let descends = repo.repo.graph_descendant_of(descendant, ancestor).unwrap();
+                ((descendant, ancestor), descends)
+            })
+            .collect();
+        assert_eq!(*repo.descendants.borrow(), expected);
+    }
+
+    #[test]
+    fn patch_ids_for_range_reports_a_failed_log() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path();
+        run_git(path, &["init", "-b", "main"]);
+
+        let error = GitRepo::patch_ids_for_range(path, "missing..main").unwrap_err();
+
+        assert!(error.to_string().contains("missing..main"), "{error:#}");
+    }
+
+    #[test]
+    fn files_changed_by_commits_lists_every_file_of_commits_that_change_the_paths() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path();
+        run_git(path, &["init", "-b", "main"]);
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test User"]);
+        run_git(path, &["config", "log.follow", "true"]);
+        let commit = |files: &[&str], message: &str| {
+            for file in files {
+                fs::write(path.join(file), message).expect("write file");
+            }
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "--allow-empty", "-m", message]);
+            run_git_capture(path, &["rev-parse", "HEAD"])
+                .trim()
+                .to_string()
+        };
+        commit(&["a.txt", "b.txt", "c.txt"], "base");
+        let a = commit(&["a.txt"], "a");
+        let c_and_a = commit(&["c.txt", "a.txt"], "c and a");
+        let empty = commit(&[], "empty");
+        let c = commit(&["c.txt"], "c");
+        let b_and_a = commit(&["b.txt", "a.txt"], "b and a");
+
+        let to_strings =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|name| name.to_string()).collect() };
+        let files = |commit: &str, names: &[&str]| (commit.to_string(), to_strings(names));
+        for splits in [&[][..], &["main~2"], &["main~1", "main~3"]] {
+            let changed = |paths: &[&str]| {
+                GitRepo::files_changed_by_commits(
+                    path,
+                    "main~5",
+                    "main",
+                    &to_strings(splits),
+                    &to_strings(paths),
+                )
+                .expect("commits")
+            };
+            assert_eq!(
+                changed(&["b.txt", "c.txt"]),
+                [
+                    files(&b_and_a, &["a.txt", "b.txt"]),
+                    files(&c, &["c.txt"]),
+                    files(&c_and_a, &["a.txt", "c.txt"]),
+                ]
+            );
+            assert_eq!(
+                changed(&[]),
+                [
+                    files(&b_and_a, &["a.txt", "b.txt"]),
+                    files(&c, &["c.txt"]),
+                    files(&empty, &[]),
+                    files(&c_and_a, &["a.txt", "c.txt"]),
+                    files(&a, &["a.txt"]),
+                ]
+            );
+        }
     }
 }

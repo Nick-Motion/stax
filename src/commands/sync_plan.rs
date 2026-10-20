@@ -1,19 +1,20 @@
 use crate::commands::sync::{
-    BlockingWorktreeCleanup, MergeType, MergedBranchInfo, PartialMergeReason, StashPolicy,
-    count_commits_between, diff_line_stats_between, find_merged_branches,
-    find_partially_merged_notes, find_upstream_gone_branches, imported_branches_for_cleanup,
-    init_forge_client, is_ancestor, local_branch_exists, plan_blocking_worktree_cleanup,
-    print_cleanup_candidates, resolve_fallback_parent_skipping_doomed, resolve_ref_oid,
+    BlockingWorktreeCleanup, MergeType, MergedBranchInfo, PR_METADATA_REFRESH_CONCURRENCY,
+    PartialMergeReason, StashPolicy, count_commits_between, diff_line_stats_between,
+    find_partially_merged_notes, find_upstream_gone_branches, forge_client,
+    imported_branches_for_cleanup, is_ancestor, local_branch_exists, plan_merged_worktree_cleanup,
+    print_cleanup_candidates, print_retained_closed_prs, resolve_fallback_parent_skipping_doomed,
+    resolve_ref_oid, retained_closed_prs, trusted_forge_remote,
 };
 use crate::config::Config;
-use crate::engine::branch_detect::has_unique_commits_since_any_base;
 use crate::engine::{BranchMetadata, Stack};
 use crate::git::GitRepo;
 use crate::progress::LiveTimer;
 use crate::remote;
 use anyhow::Result;
 use colored::Colorize;
-use std::collections::HashSet;
+use futures_util::stream::{self, StreamExt};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -29,6 +30,7 @@ pub struct SyncPlanOptions {
     pub auto_stash_pop: bool,
     pub stash_policy: StashPolicy,
     pub json: bool,
+    pub get: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +60,7 @@ pub(super) enum TrunkPlan {
 
 pub(super) fn classify_trunk_plan(
     workdir: &Path,
-    trunk: &str,
+    local_oid: Option<&str>,
     remote_head_oid: Option<&str>,
     safe: bool,
     on_trunk: bool,
@@ -69,7 +71,7 @@ pub(super) fn classify_trunk_plan(
         None => return TrunkPlan::RemoteUnknown,
     };
 
-    let local_oid = match resolve_ref_oid(workdir, trunk) {
+    let local_oid = match local_oid {
         Some(oid) => oid,
         None => {
             return TrunkPlan::ObjectsAbsent {
@@ -89,7 +91,7 @@ pub(super) fn classify_trunk_plan(
         };
     }
 
-    if is_ancestor(workdir, &local_oid, remote_oid) {
+    if is_ancestor(workdir, local_oid, remote_oid) {
         // Fast-forward is possible. If on trunk with a dirty tree, git merge --ff-only may fail.
         if on_trunk && dirty {
             if safe {
@@ -104,8 +106,8 @@ pub(super) fn classify_trunk_plan(
             }
         }
         match (
-            count_commits_between(workdir, &local_oid, remote_oid),
-            diff_line_stats_between(workdir, &local_oid, remote_oid),
+            count_commits_between(workdir, local_oid, remote_oid),
+            diff_line_stats_between(workdir, local_oid, remote_oid),
         ) {
             (Ok(commits), Ok((files, additions, deletions))) => TrunkPlan::FastForward {
                 commits,
@@ -118,8 +120,8 @@ pub(super) fn classify_trunk_plan(
             },
         }
     } else {
-        let ahead = count_commits_between(workdir, remote_oid, &local_oid).unwrap_or(0);
-        let behind = count_commits_between(workdir, &local_oid, remote_oid).unwrap_or(0);
+        let ahead = count_commits_between(workdir, remote_oid, local_oid).unwrap_or(0);
+        let behind = count_commits_between(workdir, local_oid, remote_oid).unwrap_or(0);
         TrunkPlan::Diverged { ahead, behind }
     }
 }
@@ -280,9 +282,12 @@ pub(super) fn would_need_restack(
         .collect()
 }
 
-fn patch_stack_pr_states_in_memory(stack: &mut Stack, repo: &GitRepo, config: &Config) {
-    let Some((rt, client)) = init_forge_client(repo, config) else {
-        return;
+fn patch_stack_pr_states_in_memory(
+    stack: &mut Stack,
+    forge: Option<(tokio::runtime::Runtime, crate::forge::ForgeClient)>,
+) -> HashMap<String, crate::forge::PrInfoWithHead> {
+    let Some((rt, client)) = forge else {
+        return HashMap::new();
     };
 
     let tracked: Vec<(String, u64)> = stack
@@ -292,14 +297,27 @@ fn patch_stack_pr_states_in_memory(stack: &mut Stack, repo: &GitRepo, config: &C
         .filter_map(|(name, info)| info.pr_number.map(|n| (name.clone(), n)))
         .collect();
 
-    for (branch_name, pr_number) in tracked {
-        if let Ok(live_pr) = rt.block_on(client.get_pr(pr_number))
+    // Same bounded concurrency as sync's live refresh; `buffered` keeps the
+    // tracked order so the plan is deterministic.
+    let live_prs = rt.block_on(
+        stream::iter(tracked.into_iter().map(|(branch_name, pr_number)| {
+            let client = client.clone();
+            async move { (branch_name, client.get_pr_with_head(pr_number).await) }
+        }))
+        .buffered(PR_METADATA_REFRESH_CONCURRENCY)
+        .collect::<Vec<_>>(),
+    );
+    let mut observations = HashMap::new();
+    for (branch_name, live_pr) in live_prs {
+        if let Ok(live_pr) = live_pr
             && let Some(br) = stack.branches.get_mut(&branch_name)
         {
-            br.pr_state = Some(live_pr.state.to_uppercase());
-            br.pr_is_draft = Some(live_pr.is_draft);
+            br.pr_state = Some(live_pr.info.state.to_uppercase());
+            br.pr_is_draft = Some(live_pr.info.is_draft);
+            observations.insert(branch_name, live_pr);
         }
     }
+    observations
 }
 
 pub fn run(options: SyncPlanOptions) -> Result<()> {
@@ -315,6 +333,7 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
         auto_stash_pop,
         stash_policy,
         json,
+        get,
     } = options;
 
     // --json suppresses all human stdout (machine-readable output replaces it)
@@ -325,10 +344,25 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
     let repo = GitRepo::open()?;
     let workdir = repo.workdir()?.to_path_buf();
     let sync_started_at = std::time::Instant::now();
-    let config = Config::load()?;
+    let config = Config::load_for_repo(&workdir)?;
     let remote_name = config.remote_name().to_string();
     let trunk = repo.trunk_branch()?;
     let remote_trunk_ref = format!("{}/{}", remote_name, trunk);
+    // The forge client resolves a token, often with a `gh auth token` process,
+    // and loads TLS roots. Build it while ls-remote, the stack load and the
+    // status check run.
+    let forge = trusted_forge_remote(&repo, &remote_name)
+        .map(|(remote, config)| std::thread::spawn(move || forge_client(&remote, &config)));
+    // ls-remote and the status check are git processes that need nothing from
+    // each other or from the stack load, so all three run at once.
+    let ls_remote = {
+        let (workdir, remote_name) = (workdir.clone(), remote_name.clone());
+        std::thread::spawn(move || remote::ls_remote_head_oids(&workdir, &remote_name))
+    };
+    let dirty = {
+        let workdir = workdir.clone();
+        std::thread::spawn(move || GitRepo::open_from_path(&workdir)?.is_dirty())
+    };
 
     // Stderr warnings for inert flags — always emitted regardless of --quiet
     if force {
@@ -377,40 +411,72 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
         println!();
     }
 
+    // --- Load stack (in-memory only; no ref writes) ---
+    // The load and the merged scan's stack walk print nothing and read only
+    // local refs, so they run before the probe output, while ls-remote, the
+    // status check and the forge client run. Live PR states do not change
+    // the walk. Only the restack preview reads `needs_restack`. The merged
+    // scan's walk of trunk needs only trunk, so it runs during the stack walk.
+    let mut stack = if restack {
+        Stack::load(&repo)?
+    } else {
+        Stack::load_without_restack_check(&repo)?
+    };
+    let current = repo.current_branch()?;
+    let mut history_cache = crate::commands::sync::SyncHistoryCache::default();
+    let stack_listing = if delete_merged {
+        let store_trunk_window = crate::commands::sync::spawn_trunk_window(&repo, &workdir, &trunk);
+        let listing = crate::commands::sync::walk_stack(
+            &mut history_cache,
+            &repo,
+            &workdir,
+            &stack,
+            &remote_name,
+        );
+        store_trunk_window(&mut history_cache);
+        listing
+    } else {
+        None
+    };
+
     // --- Probe remote (ls-remote; read-only, no FETCH_HEAD writes) ---
     let mut use_cached_remote = false;
-    let (remote_head_oid, remote_branch_set): (Option<String>, HashSet<String>) =
-        match remote::ls_remote_head_oids(&workdir, &remote_name) {
-            Ok(heads) => {
-                let trunk_oid = heads.get(&trunk).cloned();
-                let branch_count = heads.len();
-                let names: HashSet<String> = heads.into_keys().collect();
-                if !quiet {
-                    println!(
-                        "{}",
-                        format!(
-                            "  Probed {} via ls-remote ({} branches)",
-                            remote_name, branch_count
-                        )
-                        .dimmed()
-                    );
-                }
-                (trunk_oid, names)
+    let mut remote_heads_by_branch: Option<std::collections::HashMap<String, String>> = None;
+    let (remote_head_oid, remote_branch_set): (Option<String>, HashSet<String>) = match ls_remote
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    {
+        Ok(heads) => {
+            let trunk_oid = heads.get(&trunk).cloned();
+            let branch_count = heads.len();
+            remote_heads_by_branch = Some(heads.clone());
+            let names: HashSet<String> = heads.into_keys().collect();
+            if !quiet {
+                println!(
+                    "{}",
+                    format!(
+                        "  Probed {} via ls-remote ({} branches)",
+                        remote_name, branch_count
+                    )
+                    .dimmed()
+                );
             }
-            Err(_) => {
-                use_cached_remote = true;
-                let oid = resolve_ref_oid(&workdir, &remote_trunk_ref);
-                let names = repo.remote_branch_names(&remote_name).unwrap_or_default();
-                if !quiet {
-                    println!(
-                        "  {} {}",
-                        "⚠".yellow(),
-                        "offline — using cached remote-tracking refs".dimmed()
-                    );
-                }
-                (oid, names)
+            (trunk_oid, names)
+        }
+        Err(_) => {
+            use_cached_remote = true;
+            let oid = resolve_ref_oid(&workdir, &remote_trunk_ref);
+            let names = repo.remote_branch_names(&remote_name).unwrap_or_default();
+            if !quiet {
+                println!(
+                    "  {} {}",
+                    "⚠".yellow(),
+                    "offline — using cached remote-tracking refs".dimmed()
+                );
             }
-        };
+            (oid, names)
+        }
+    };
 
     if use_cached_remote && !quiet {
         println!(
@@ -420,19 +486,46 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
         );
     }
 
-    // --- Load stack (in-memory only; no ref writes) ---
-    let mut stack = Stack::load(&repo)?;
-    let current = repo.current_branch()?;
+    // Live PR states only add linked branches, which the other merge passes
+    // skip. So the unlinked scan and its patch-id walks run while the forge
+    // thread resolves its token.
+    let unlinked_merged = delete_merged.then(|| {
+        crate::commands::sync::find_merged_branches_with_prs(
+            &repo,
+            &workdir,
+            &stack,
+            &remote_name,
+            &remote_branch_set,
+            false,
+            &HashMap::new(),
+            &mut history_cache,
+            stack_listing,
+        )
+    });
 
-    // Patch PR states in memory BEFORE any &Stack borrows for detection
-    patch_stack_pr_states_in_memory(&mut stack, &repo, &config);
+    let dirty = dirty
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        .unwrap_or(false);
+
+    // Patch PR states in memory before the passes that read them
+    let forge = forge.and_then(|thread| {
+        thread
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    });
+    let live_pr_observations = patch_stack_pr_states_in_memory(&mut stack, forge);
 
     // --- Trunk section ---
     let on_trunk = current == trunk;
-    let dirty = repo.is_dirty().unwrap_or(false);
+    let local_trunk_oid = repo
+        .inner()
+        .revparse_single(&trunk)
+        .ok()
+        .map(|object| object.id().to_string());
     let trunk_plan = classify_trunk_plan(
         &workdir,
-        &trunk,
+        local_trunk_oid.as_deref(),
         remote_head_oid.as_deref(),
         safe,
         on_trunk,
@@ -442,6 +535,63 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
     if !quiet {
         println!("{}", "Trunk".bold());
         render_trunk_plan(&trunk, &trunk_plan);
+    }
+
+    if get && !quiet && !json {
+        println!();
+        println!("{}", "Get (stack branches vs remote)".bold());
+
+        let scope_order: Vec<String> =
+            if current != trunk && stack.branches.contains_key(current.as_str()) {
+                stack.current_stack(&current)
+            } else {
+                Vec::new()
+            };
+
+        if scope_order.is_empty() {
+            println!("  {}", "No stack branches in scope.".dimmed());
+        } else {
+            match &remote_heads_by_branch {
+                Some(remote_heads) => {
+                    for branch in &scope_order {
+                        let remote_oid = remote_heads.get(branch);
+                        let local_oid = remote_oid.and_then(|_| repo.branch_commit(branch).ok());
+                        match (local_oid.as_deref(), remote_oid.map(String::as_str)) {
+                            (_, None) => {
+                                println!(
+                                    "  {} {} {}",
+                                    "○".dimmed(),
+                                    branch.cyan(),
+                                    "no remote branch".dimmed()
+                                );
+                            }
+                            (Some(local), Some(remote)) if local == remote => {
+                                println!(
+                                    "  {} {} {}",
+                                    "✓".green(),
+                                    branch.cyan(),
+                                    "up to date".dimmed()
+                                );
+                            }
+                            _ => {
+                                println!(
+                                    "  {} {} {}",
+                                    "→".cyan(),
+                                    branch.cyan().bold(),
+                                    "would reconcile (diverged)".dimmed()
+                                );
+                            }
+                        }
+                    }
+                }
+                None => {
+                    println!(
+                        "  {}",
+                        "Could not reach remote — --get preview unavailable".dimmed()
+                    );
+                }
+            }
+        }
     }
 
     let restack_would_fail = matches!(
@@ -459,6 +609,7 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
     // Accumulator for JSON plan output (populated always; consumed only when json=true).
     let mut plan_data = crate::commands::sync_json::SyncPlanData {
         merged_candidates: Vec::new(),
+        closed_prs: Vec::new(),
         partially_merged: Vec::new(),
         upstream_gone_protected: Vec::new(),
         upstream_gone_deletable: Vec::new(),
@@ -486,22 +637,19 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
         println!("{}", "Merged branches".bold());
     }
 
-    if !delete_merged {
-        if !quiet {
-            println!(
-                "  {}",
-                "--no-delete: merged-branch cleanup is disabled".dimmed()
-            );
-        }
-    } else {
-        let merged = find_merged_branches(
-            &repo,
+    if let Some(unlinked_merged) = unlinked_merged {
+        let mut merged = unlinked_merged?;
+        crate::commands::sync::add_live_pr_merges(
             &workdir,
-            &stack,
-            &remote_name,
-            &remote_branch_set,
-            false,
-        )?;
+            &stack.trunk,
+            &live_pr_observations,
+            &mut merged,
+        );
+        let merged_names: Vec<String> = merged.iter().map(|info| info.branch.clone()).collect();
+        plan_data.closed_prs = retained_closed_prs(&stack, &merged_names);
+        if !quiet {
+            print_retained_closed_prs(&stack, &plan_data.closed_prs);
+        }
         let exempt_imported = imported_branches_for_cleanup(&repo, &stack)?;
         let partially_merged_notes = find_partially_merged_notes(
             &repo,
@@ -510,6 +658,7 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
             &remote_name,
             &remote_branch_set,
             &merged,
+            &mut history_cache,
         )?;
 
         // Collect partially_merged for JSON (always, outside !quiet gate).
@@ -545,7 +694,7 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
             for merged_info in &merged {
                 let branch = &merged_info.branch;
                 let is_current = *branch == current;
-                let blocking = plan_blocking_worktree_cleanup(&repo, branch, force).unwrap_or(None);
+                let blocking = plan_merged_worktree_cleanup(&repo, &remote_name, merged_info)?;
                 let (fallback_parent, _) = resolve_fallback_parent_skipping_doomed(
                     &workdir,
                     &stack,
@@ -615,6 +764,17 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
                 }
             }
         }
+    } else {
+        plan_data.closed_prs = retained_closed_prs(&stack, &[]);
+        if !quiet {
+            print_retained_closed_prs(&stack, &plan_data.closed_prs);
+        }
+        if !quiet {
+            println!(
+                "  {}",
+                "--no-delete: merged-branch cleanup is disabled".dimmed()
+            );
+        }
     }
 
     // --- Upstream-gone section ---
@@ -635,23 +795,41 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
         } else {
             let mut protected: Vec<String> = Vec::new();
             let mut deletable: Vec<String> = Vec::new();
+            let mut recovering = HashSet::new();
 
             for branch in &gone {
+                if plan_data.closed_prs.contains(branch)
+                    || stack
+                        .branches
+                        .get(branch)
+                        .is_some_and(|info| info.pr_number.is_some())
+                    || crate::commands::sync::should_spare_empty_never_submitted_branch(
+                        &repo, &stack, branch,
+                    )
+                {
+                    continue;
+                }
                 if branch == &trunk {
                     continue;
                 }
-                let parent = stack
-                    .branches
-                    .get(branch.as_str())
-                    .and_then(|b| b.parent.clone())
-                    .unwrap_or_else(|| trunk.clone());
-                let has_unique =
-                    has_unique_commits_since_any_base(&workdir, branch, &[parent.as_str()])
-                        .unwrap_or(false);
-                if has_unique {
-                    protected.push(branch.clone());
+                if let Some(merge_info) = crate::commands::sync::upstream_gone_merge_evidence(
+                    &workdir,
+                    branch,
+                    &trunk,
+                    &remote_trunk_ref,
+                )? {
+                    match plan_merged_worktree_cleanup(&repo, &remote_name, &merge_info)? {
+                        Some(cleanup) if !cleanup.can_remove_during_sync() => {
+                            protected.push(branch.clone());
+                        }
+                        Some(_) => {
+                            recovering.insert(branch.clone());
+                            deletable.push(branch.clone());
+                        }
+                        None => deletable.push(branch.clone()),
+                    }
                 } else {
-                    deletable.push(branch.clone());
+                    protected.push(branch.clone());
                 }
             }
 
@@ -661,7 +839,9 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
                 plan_data.upstream_gone_deletable.push(
                     crate::commands::sync_json::UpstreamGoneDeleteJson {
                         name: b.clone(),
-                        disposition: if force {
+                        disposition: if force && recovering.contains(b) {
+                            "would_recover_then_delete"
+                        } else if force {
                             "would_delete"
                         } else {
                             "would_prompt_then_delete"
@@ -677,7 +857,7 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
                             "  {} {} {}",
                             "↷".yellow(),
                             b.cyan(),
-                            "(upstream-gone; protected — has unique commits)".dimmed()
+                            "(upstream-gone; protected — local work or checkout safety)".dimmed()
                         );
                     }
                 }
@@ -688,6 +868,13 @@ pub fn run(options: SyncPlanOptions) -> Result<()> {
                 if !quiet {
                     print_cleanup_candidates("upstream-gone", &deletable);
                     for branch in &deletable {
+                        if recovering.contains(branch) {
+                            println!(
+                                "  {} {} (would archive recovery data before removing worktree)",
+                                "↳".cyan(),
+                                branch.bright_black()
+                            );
+                        }
                         if force {
                             println!(
                                 "  {} {} {}",
@@ -902,8 +1089,20 @@ fn render_merged_branch_plan(
     exempt_imported: &HashSet<String>,
     remote_branches: &HashSet<String>,
 ) {
+    if matches!(merged_info.merge_type, MergeType::SquashMerge)
+        && merged_info.merged_pr_head_oid.is_none()
+    {
+        println!(
+            "  {} {} {}",
+            "○".yellow(),
+            branch.bright_black(),
+            "(patch-equivalent only; no retirement evidence)".dimmed()
+        );
+        return;
+    }
     // Blocking worktree takes priority
     if let Some(blocker) = blocking
+        && !blocker.can_remove_during_sync()
         && let Some(reason) = blocker.blocker_summary()
     {
         println!(
@@ -913,6 +1112,15 @@ fn render_merged_branch_plan(
             format!("(would keep worktree: {})", reason).dimmed()
         );
         return;
+    }
+
+    if blocking.is_some_and(BlockingWorktreeCleanup::can_remove_during_sync) {
+        println!(
+            "  {} {} {}",
+            "↳".cyan(),
+            branch.bright_black(),
+            "(would archive recovery data before removing worktree)".dimmed()
+        );
     }
 
     // Missing local parent → would skip
@@ -1008,7 +1216,22 @@ fn classify_merged_candidate(
 ) -> crate::commands::sync_json::MergedCandidateJson {
     use crate::commands::sync_json::MergedCandidateJson;
 
+    if matches!(merged_info.merge_type, MergeType::SquashMerge)
+        && merged_info.merged_pr_head_oid.is_none()
+    {
+        return MergedCandidateJson {
+            name: branch.to_string(),
+            disposition: "would_skip",
+            scope: None,
+            keep_reason: Some(
+                "patch-equivalent history is informational without ancestry proof".into(),
+            ),
+            children: vec![],
+        };
+    }
+
     if let Some(blocker) = blocking
+        && !blocker.can_remove_during_sync()
         && let Some(reason) = blocker.blocker_summary()
     {
         return MergedCandidateJson {
@@ -1019,6 +1242,8 @@ fn classify_merged_candidate(
             children: vec![],
         };
     }
+
+    let recovery_required = blocking.is_some_and(BlockingWorktreeCleanup::can_remove_during_sync);
 
     if !parent_exists && fallback_parent != stack.trunk {
         return MergedCandidateJson {
@@ -1057,7 +1282,9 @@ fn classify_merged_candidate(
 
     MergedCandidateJson {
         name: branch.to_string(),
-        disposition: if force {
+        disposition: if recovery_required {
+            "would_recover_then_delete"
+        } else if force {
             "would_delete"
         } else {
             "would_prompt_then_delete"
@@ -1126,22 +1353,21 @@ mod tests {
     #[test]
     fn classify_trunk_plan_remote_unknown_when_no_remote_oid() {
         let dir = std::env::temp_dir();
-        let plan = classify_trunk_plan(&dir, "main", None, false, false, false);
+        let plan = classify_trunk_plan(&dir, None, None, false, false, false);
         assert!(matches!(plan, TrunkPlan::RemoteUnknown));
     }
 
     #[test]
     fn render_trunk_plan_up_to_date_contains_check() {
-        colored::control::set_override(false);
+        let _colors = crate::test_support::color_override(false);
         let plan = TrunkPlan::UpToDate;
         // Just exercise the render path — primarily ensures no panic
         render_trunk_plan("main", &plan);
-        colored::control::unset_override();
     }
 
     #[test]
     fn render_trunk_plan_fast_forward_contains_commit_count() {
-        colored::control::set_override(false);
+        let _colors = crate::test_support::color_override(false);
         let plan = TrunkPlan::FastForward {
             commits: 3,
             files: 5,
@@ -1149,18 +1375,16 @@ mod tests {
             deletions: 7,
         };
         render_trunk_plan("main", &plan);
-        colored::control::unset_override();
     }
 
     #[test]
     fn render_trunk_plan_diverged_shows_ahead_behind() {
-        colored::control::set_override(false);
+        let _colors = crate::test_support::color_override(false);
         let plan = TrunkPlan::Diverged {
             ahead: 2,
             behind: 4,
         };
         render_trunk_plan("main", &plan);
-        colored::control::unset_override();
     }
 
     #[test]

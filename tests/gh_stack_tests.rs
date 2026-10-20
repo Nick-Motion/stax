@@ -23,7 +23,7 @@ pub(crate) fn path_with_fake_gh(fake_dir: &Path) -> String {
     format!("{}:{old_path}", fake_dir.display())
 }
 
-fn write_config(home: &str, api_base_url: &str) {
+pub(crate) fn write_config(home: &str, api_base_url: &str) {
     let config_dir = Path::new(home).join(".config").join("stax");
     fs::create_dir_all(&config_dir).expect("create stax config dir");
     fs::write(
@@ -41,7 +41,12 @@ fn git_stdout(repo: &TestRepo, args: &[&str]) -> String {
     TestRepo::stdout(&output).trim().to_string()
 }
 
-fn write_branch_pr_metadata(repo: &TestRepo, branch: &str, parent: &str, pr_number: u64) {
+pub(crate) fn write_branch_pr_metadata(
+    repo: &TestRepo,
+    branch: &str,
+    parent: &str,
+    pr_number: u64,
+) {
     let parent_revision = git_stdout(repo, &["rev-parse", parent]);
     let json = serde_json::json!({
         "parentBranchName": parent,
@@ -84,7 +89,12 @@ fn write_branch_pr_metadata(repo: &TestRepo, branch: &str, parent: &str, pr_numb
     .assert_success();
 }
 
-async fn mock_existing_pr(mock_server: &MockServer, number: u64, branch: &str, base: &str) {
+pub(crate) async fn mock_existing_pr(
+    mock_server: &MockServer,
+    number: u64,
+    branch: &str,
+    base: &str,
+) {
     let body = serde_json::json!({
         "url": format!("https://api.github.com/repos/test-owner/test-repo/pulls/{number}"),
         "id": number,
@@ -2354,4 +2364,159 @@ exit 1
         !cached.status.success(),
         "auth-token-unsupported outcome must not cache the native stack feature as disabled"
     );
+}
+
+async fn check_sync_token_scope(
+    host: &str,
+    repo_trust: bool,
+    dry_run: bool,
+    config_override: bool,
+) {
+    let server = MockServer::start().await;
+    let repo = TestRepo::new_with_remote();
+    let home = repo.clean_home();
+    write_config(&home, &server.uri());
+    let config_path = Path::new(&home).join(".config/stax/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            "{}\n[auth]\nuse_gh_cli = true\n",
+            config.replace("[remote]", "[remote]\nbase_url = \"https://github.com\"")
+        ),
+    )
+    .unwrap();
+    let url = format!("https://{host}/test-owner/test-repo.git");
+    let file_url = format!("file://{}", repo.remote_path().unwrap().display());
+    repo.git(&["remote", "set-url", "origin", &url])
+        .assert_success();
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("url.{file_url}.insteadOf"),
+        &url,
+    ])
+    .assert_success();
+    let branches = repo.create_stack(&["token-scope"]);
+    repo.git(&["push", "-u", "origin", &branches[0]])
+        .assert_success();
+    write_branch_pr_metadata(&repo, &branches[0], "main", 10);
+    if repo_trust {
+        repo.create_file(
+            "stax.toml",
+            &format!("[remote]\nbase_url = \"https://{host}\"\nforge = \"github\"\n"),
+        );
+        repo.commit("Configure repository forge");
+    }
+    if config_override {
+        repo.git(&[
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/other-owner/other-repo.git",
+        ])
+        .assert_success();
+        repo.create_file("stax.toml", "[remote]\nname = \"upstream\"\n");
+        repo.commit("Select repository remote");
+    }
+    let fake = fake_gh_dir(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_CALL_LOG\"\nprintf 'fake-token\\n'\n",
+    );
+    let log = fake.path().join("calls");
+    fs::write(&log, "").unwrap();
+    let path = path_with_fake_gh(fake.path());
+    let args = if dry_run {
+        vec!["sync", "--dry-run"]
+    } else {
+        vec!["sync", "--force"]
+    };
+    let xdg_config_home = format!("{home}/.config");
+    let config_dir = format!("{xdg_config_home}/stax");
+    let mut env = vec![
+        ("HOME", home.as_str()),
+        ("XDG_CONFIG_HOME", &xdg_config_home),
+        ("PATH", &path),
+        ("GH_CALL_LOG", log.to_str().unwrap()),
+    ];
+    if config_override {
+        env.push(("STAX_CONFIG_DIR", &config_dir));
+    }
+    let output = repo.run_stax_with_env(&args, &env);
+    output.assert_success();
+    if config_override {
+        let paths: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert!(
+            paths
+                .iter()
+                .all(|path| !path.contains("other-owner") && !path.contains("other-repo")),
+            "sync used the repository override remote; paths: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.starts_with("/repos/test-owner/test-repo/")),
+            "sync must query the git remote repository; paths: {paths:?}"
+        );
+    }
+    let calls = fs::read_to_string(log).unwrap();
+    if host == "github.com" {
+        assert!(!calls.is_empty(), "sync must construct a forge client");
+        assert!(
+            calls
+                .lines()
+                .all(|call| call == "auth token --hostname github.com"),
+            "every gh lookup must be host-scoped; calls: {calls:?}"
+        );
+    } else {
+        assert!(
+            calls.is_empty(),
+            "untrusted host must not run gh; calls: {calls:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_untrusted_dry_run() {
+    check_sync_token_scope("git.example.test", false, true, false).await;
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_untrusted_sync() {
+    check_sync_token_scope("git.example.test", false, false, false).await;
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_repo_cannot_trust_dry_run() {
+    check_sync_token_scope("git.example.test", true, true, false).await;
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_repo_cannot_trust_sync() {
+    check_sync_token_scope("git.example.test", true, false, false).await;
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_github_dry_run() {
+    check_sync_token_scope("github.com", false, true, false).await;
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_github_sync() {
+    check_sync_token_scope("github.com", false, false, false).await;
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_config_dir_dry_run() {
+    check_sync_token_scope("github.com", false, true, true).await;
+}
+
+#[tokio::test]
+async fn test_sync_token_scope_config_dir_sync() {
+    check_sync_token_scope("github.com", false, false, true).await;
 }

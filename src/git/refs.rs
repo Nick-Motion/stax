@@ -133,17 +133,24 @@ pub fn delete_metadata(repo: &Repository, branch: &str) -> Result<()> {
 
 /// List all branches that have metadata
 pub fn list_metadata_branches(repo: &Repository) -> Result<Vec<String>> {
-    let mut branches = Vec::new();
-
-    for reference in repo.references_glob(&format!("{}*", METADATA_REF_PREFIX))? {
-        let reference = reference?;
-        if let Ok(name) = reference.name() {
-            let branch = name.strip_prefix(METADATA_REF_PREFIX).unwrap_or(name);
-            branches.push(branch.to_string());
-        }
+    // A libgit2 ref glob parses and copies every packed ref, about 16 ms in a
+    // repo with 15k of them. git seeks to the prefix in the sorted file.
+    let output = command::output(
+        repo.path(),
+        &["for-each-ref", "--format=%(refname)", METADATA_REF_PREFIX],
+    )
+    .context("Failed to list metadata refs")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git for-each-ref failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-
-    Ok(branches)
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|name| name.strip_prefix(METADATA_REF_PREFIX))
+        .map(str::to_string)
+        .collect())
 }
 
 /// Check if stax has been initialized in this repo

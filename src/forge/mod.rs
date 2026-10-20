@@ -61,23 +61,23 @@ pub enum ForgeClient {
 }
 
 impl ForgeClient {
+    /// The client every interactive command uses. Auth settings come from the
+    /// global config only, and credentials go only to a trusted API host, so a
+    /// repository's `stax.toml` can neither redirect nor widen them.
     pub fn new(remote: &RemoteInfo) -> Result<Self> {
-        match remote.forge {
-            ForgeType::GitHub => Ok(Self::GitHub(GitHubClient::new(
-                remote.owner(),
-                &remote.repo,
-                remote.api_base_url.clone(),
-            )?)),
-            ForgeType::GitLab => Ok(Self::GitLab(GitLabClient::new(remote)?)),
-            ForgeType::Gitea => Ok(Self::Gitea(GiteaClient::new(remote)?)),
-        }
+        let global_config = Config::load_global()?;
+        crate::remote::ensure_trusted_api_destination(remote, &global_config)?;
+        Self::with_auth(remote, &global_config)
     }
 
     pub(crate) fn new_for_trusted_remote(
         trusted_remote: &TrustedRemoteInfo,
         config: &Config,
     ) -> Result<Self> {
-        let remote = trusted_remote.remote();
+        Self::with_auth(trusted_remote.remote(), config)
+    }
+
+    fn with_auth(remote: &RemoteInfo, config: &Config) -> Result<Self> {
         match remote.forge {
             ForgeType::GitHub => Ok(Self::GitHub(GitHubClient::new_for_trusted_remote(
                 remote.owner(),

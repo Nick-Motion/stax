@@ -106,6 +106,8 @@ mod prev_watch_tmux_tests;
 mod ready_tests;
 #[path = "refresh_all_stacks_tests.rs"]
 mod refresh_all_stacks_tests;
+#[path = "refresh_forge_tests.rs"]
+mod refresh_forge_tests;
 #[path = "refresh_visual_tests.rs"]
 mod refresh_visual_tests;
 #[path = "reorder_tests.rs"]
@@ -122,6 +124,8 @@ mod runtime_safety_tests;
 mod scoped_submit_tests;
 #[path = "skills_selection_tests.rs"]
 mod skills_selection_tests;
+#[path = "skills_symlink_tests.rs"]
+mod skills_symlink_tests;
 #[path = "split_hunk_tests.rs"]
 mod split_hunk_tests;
 #[path = "split_tests.rs"]
@@ -132,6 +136,8 @@ mod stack_test_tests;
 mod staging_menu_tests;
 #[path = "standup_tests.rs"]
 mod standup_tests;
+#[path = "stats_tests.rs"]
+mod stats_tests;
 #[path = "status_tests.rs"]
 mod status_tests;
 #[path = "submit_fetch_failure_tests.rs"]
@@ -154,8 +160,12 @@ mod sync_confirm_tests;
 mod sync_dry_run_tests;
 #[path = "sync_fetch_tests.rs"]
 mod sync_fetch_tests;
+#[path = "sync_get_tests.rs"]
+mod sync_get_tests;
 #[path = "sync_json_tests.rs"]
 mod sync_json_tests;
+#[path = "sync_next_branch_tests.rs"]
+mod sync_next_branch_tests;
 #[path = "sync_stash_tests.rs"]
 mod sync_stash_tests;
 #[path = "sync_undo_tests.rs"]

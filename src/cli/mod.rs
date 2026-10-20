@@ -411,6 +411,7 @@ pub fn run() -> Result<()> {
             no_stash,
             dry_run,
             json,
+            get,
         } => {
             if prune {
                 eprintln!("{}", commands::sync::prune_deprecation_warning());
@@ -429,6 +430,7 @@ pub fn run() -> Result<()> {
                     auto_stash_pop,
                     stash_policy,
                     json,
+                    get,
                 })
             } else {
                 commands::sync::run(
@@ -446,16 +448,25 @@ pub fn run() -> Result<()> {
                     json,
                     &[],
                     false,
+                    get,
                 )
             }
         }
         Commands::Sweep {
             delete,
             include_stale,
+            include_closed,
             force,
             stale_days,
             json,
-        } => commands::sweep::run(delete, include_stale, force, stale_days, json),
+        } => commands::sweep::run(
+            delete,
+            include_stale,
+            include_closed,
+            force,
+            stale_days,
+            json,
+        ),
         Commands::Restack {
             all,
             stop_here,
@@ -491,6 +502,7 @@ pub fn run() -> Result<()> {
             auto_stash_pop,
             all_stacks,
             delete_merged,
+            get,
         } => commands::refresh::run(
             no_pr,
             no_submit,
@@ -502,6 +514,7 @@ pub fn run() -> Result<()> {
             auto_stash_pop,
             all_stacks,
             delete_merged,
+            get,
         ),
         Commands::Checkout {
             branch,
@@ -711,6 +724,7 @@ pub fn run() -> Result<()> {
         } => commands::stack_cmd::run_test(cmd, all, stack, fail_fast, parallel, jobs),
         Commands::Demo => unreachable!(),        // Handled above
         Commands::UpdateCheck => unreachable!(), // Handled before setup/config work
+        Commands::Stats { json, current, ci } => commands::stats::run(json, current, ci),
         Commands::Standup {
             json,
             all,

@@ -60,6 +60,7 @@ single_stack = "on"    # "on" | "off"
 # user = "cesar"
 # date_format = "%m-%d"
 # replacement = "-"
+# lowercase = true # lowercase generated branch names (commit messages keep their casing)
 # stale_days = 30 # days without commits before `stax sweep` calls a branch stale
 
 [git]
@@ -98,16 +99,21 @@ single_stack = "on"    # "on" | "off"
 
 [restack]
 # preflight_auto_repair = true # automatically use merge-base when stored parent
-                               # boundary would replay a much larger range
+                               # boundary would replay a much larger range, or skip
+                               # leading commits already squash-merged into the parent
 # preflight_warn = true        # print a notice when that automatic repair happens
+
+[sync]
+# confirm_delete = true # false: `st sync` / `st get` delete merged branches without asking
+                        # (branches checked out in a linked worktree still prompt)
 
 [skills]
 # harnesses = ["claude", "codex"] # agent harnesses that receive skill files
-#   valid ids: claude, codex, cursor, opencode, pi. Unset = auto (detected + already installed).
+#   valid ids: claude, codex, cursor, hermes, opencode, pi. Unset = auto (detected + already installed).
 
 [ai]
-# agent = "claude" # "codex" | "gemini" | "opencode" | "pi" — global default
-# model = "claude-opus-4-8"
+# agent = "claude" # "codex" | "gemini" | "opencode" | "pi" | "hermes" — global default
+# model = "claude-opus-5"
 
 # Per-feature overrides — optional, fall back to [ai] above
 [ai.generate]   # st create --ai, st gen / st generate, st submit --ai
@@ -118,7 +124,7 @@ single_stack = "on"    # "on" | "off"
 
 [ai.standup]    # st standup --ai
 # agent = "gemini"
-# model = "gemini-2.5-pro"
+# model = "gemini-3.8-flash"
 
 [ai.resolve]    # st resolve
 # agent = "claude"
@@ -243,6 +249,15 @@ date_format = "%m-%d"
 ```
 
 The legacy `prefix` field still works when `format` is unset.
+
+### Branch name casing
+
+Generated branch names are lowercased by default, so `st create -am "Bump Fastlane Version"` produces the branch `bump-fastlane-version` while committing the message exactly as typed. Set `lowercase = false` to keep the original casing:
+
+```toml
+[branch]
+lowercase = false
+```
 
 ## Stale-branch threshold
 

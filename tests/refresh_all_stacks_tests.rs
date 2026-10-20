@@ -114,6 +114,95 @@ fn all_stacks_rejects_dirty_tree_without_auto_stash_pop() {
     output.assert_stderr_contains("--auto-stash-pop");
 }
 
+#[tokio::test]
+async fn all_stacks_delete_merged_removes_squash_merged_branch_and_preserves_other_stack() {
+    let repo = TestRepo::new_with_remote();
+    let (stack_a, stack_b) = build_two_stacks(&repo);
+    let parent = &stack_a[0];
+    let child = &stack_a[1];
+    let unrelated = &stack_b[0];
+
+    for branch in stack_a.iter().chain(stack_b.iter()) {
+        repo.git(&["push", "-u", "origin", branch]).assert_success();
+    }
+    repo.squash_merge_branch_on_remote(parent);
+    repo.git(&["checkout", child]).assert_success();
+
+    let (_merged_pr, proof_home) =
+        crate::common::github_mock::merged_pr_fixture(&repo.path(), parent).await;
+    repo.run_stax_with_env(
+        &[
+            "refresh",
+            "--all-stacks",
+            "--no-submit",
+            "--force",
+            "--yes",
+            "--delete-merged",
+        ],
+        &[
+            ("HOME", proof_home.path().to_str().unwrap()),
+            ("STAX_GITHUB_TOKEN", "isolated-fixture-token"),
+        ],
+    )
+    .assert_success();
+
+    let branches = repo.list_branches();
+    assert!(
+        !branches.contains(parent),
+        "--delete-merged should remove the squash-merged parent; branches: {branches:?}"
+    );
+    for branch in [child, unrelated] {
+        assert!(
+            branches.contains(branch),
+            "expected surviving branch {branch} to remain tracked locally; branches: {branches:?}"
+        );
+        repo.git(&["merge-base", "--is-ancestor", "main", branch])
+            .assert_success();
+    }
+    let novel_commit_count = repo.git(&["rev-list", "--count", &format!("main..{child}")]);
+    novel_commit_count.assert_success();
+    assert_eq!(
+        TestRepo::stdout(&novel_commit_count).trim(),
+        "1",
+        "the surviving child should retain only its novel commit"
+    );
+}
+
+#[test]
+fn all_stacks_delete_merged_is_a_noop_when_no_branches_are_merged() {
+    let repo = TestRepo::new_with_remote();
+    let (stack_a, stack_b) = build_two_stacks(&repo);
+    let before = stack_a
+        .iter()
+        .chain(stack_b.iter())
+        .map(|branch| (branch.clone(), repo.get_commit_sha(branch)))
+        .collect::<Vec<_>>();
+
+    repo.git(&["checkout", &stack_a[1]]).assert_success();
+    repo.run_stax(&[
+        "refresh",
+        "--all-stacks",
+        "--no-submit",
+        "--force",
+        "--yes",
+        "--delete-merged",
+    ])
+    .assert_success();
+
+    for (branch, sha) in before {
+        assert!(
+            repo.list_branches().contains(&branch),
+            "unmerged branch {branch} should not be deleted"
+        );
+        assert_eq!(
+            repo.get_commit_sha(&branch),
+            sha,
+            "{branch} should be a no-op"
+        );
+    }
+    assert_eq!(repo.current_branch(), stack_a[1]);
+}
+
 #[test]
 fn all_stacks_stops_at_conflict_and_retry_finishes_remaining_stacks() {
     let repo = TestRepo::new_with_remote();

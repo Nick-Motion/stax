@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::process::{Command, ExitStatus, Output};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -44,6 +44,49 @@ impl Drop for TraceGuard {
 pub(crate) fn output(cwd: &Path, args: &[&str]) -> std::io::Result<Output> {
     timed(cwd, args, || {
         Command::new("git").args(args).current_dir(cwd).output()
+    })
+}
+
+/// Runs `git <args> | git <sink>` and returns the output of each. The first
+/// output has no stdout, since the sink read it.
+pub(crate) fn piped_output(
+    cwd: &Path,
+    args: &[&str],
+    sink: &[&str],
+) -> std::io::Result<(Output, Output)> {
+    timed(cwd, args, || {
+        let mut source = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdout = source.stdout.take().expect("stdout is piped");
+        let sink = match Command::new("git")
+            .args(sink)
+            .current_dir(cwd)
+            .stdin(stdout)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(sink) => sink,
+            Err(error) => {
+                let _ = source.kill();
+                let _ = source.wait();
+                return Err(error);
+            }
+        };
+        // The source's stderr is read while it runs, so a full stderr pipe
+        // cannot stop it from writing to the sink.
+        std::thread::scope(|scope| {
+            let source = scope.spawn(move || source.wait_with_output());
+            let sink = sink.wait_with_output();
+            let source = source
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            Ok((source?, sink?))
+        })
     })
 }
 

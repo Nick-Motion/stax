@@ -833,6 +833,7 @@ fn mr_to_pr_with_head(mr: GitLabMr) -> PrInfoWithHead {
     PrInfoWithHead {
         info: mr_to_pr_info(&mr),
         head: mr.source_branch,
+        head_sha: mr.sha.unwrap_or_default(),
         head_label: mr.web_url,
         title: mr.title,
     }

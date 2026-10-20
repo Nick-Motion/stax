@@ -750,7 +750,32 @@ pub fn generate_random_lane_slug(repo: &GitRepo, config: &Config) -> Result<Stri
     bail!("Could not generate a unique random worktree name");
 }
 
+/// Whether to walk history for the ahead/behind display counts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Divergence {
+    Compute,
+    Skip,
+}
+
 pub fn compute_worktree_details(repo: &GitRepo, worktree: WorktreeInfo) -> Result<WorktreeDetails> {
+    compute_worktree_details_with(repo, worktree, Divergence::Compute)
+}
+
+/// Removal-safety observations (inventory entry, stax metadata, dirty and
+/// operation state) without the ahead/behind history walk, which no removal
+/// decision reads; `ahead` and `behind` are `None`.
+pub fn compute_worktree_removal_details(
+    repo: &GitRepo,
+    worktree: WorktreeInfo,
+) -> Result<WorktreeDetails> {
+    compute_worktree_details_with(repo, worktree, Divergence::Skip)
+}
+
+fn compute_worktree_details_with(
+    repo: &GitRepo,
+    worktree: WorktreeInfo,
+    divergence: Divergence,
+) -> Result<WorktreeDetails> {
     let branch_label = worktree
         .branch
         .clone()
@@ -763,7 +788,9 @@ pub fn compute_worktree_details(repo: &GitRepo, worktree: WorktreeInfo) -> Resul
             let marker = repo.worktree_marker(branch);
             let fallback_trunk = repo.trunk_branch().ok();
             let diff_base = parent.as_deref().or(fallback_trunk.as_deref());
-            let diff_pair = diff_base.and_then(|base| repo.commits_ahead_behind(base, branch).ok());
+            let diff_pair = diff_base
+                .filter(|_| divergence == Divergence::Compute)
+                .and_then(|base| repo.commits_ahead_behind(base, branch).ok());
 
             (
                 meta.is_some(),
@@ -895,6 +922,7 @@ pub fn yolo_flag_for_agent(agent: &str) -> Option<&'static str> {
         "claude" => Some("--dangerously-skip-permissions"),
         "codex" => Some("--dangerously-bypass-approvals-and-sandbox"),
         "gemini" => Some("--yolo"),
+        "hermes" => Some("--yolo"),
         // "opencode" and "pi" intentionally unsupported; see function-level
         // docstring.
         _ => None,
@@ -912,6 +940,7 @@ pub fn build_agent_launch_spec_with_options(
     let model = model.filter(|value| !value.trim().is_empty());
 
     let mut args = Vec::new();
+    let mut positional_args = passthrough_args;
     match agent {
         "claude" | "codex" | "opencode" | "pi" => {
             if let Some(ref model) = model {
@@ -921,6 +950,20 @@ pub fn build_agent_launch_spec_with_options(
         "gemini" => {
             if let Some(ref model) = model {
                 args.extend(["-m".to_string(), model.clone()]);
+            }
+        }
+        // Hermes has no bare positional-prompt mode: a bare word would be parsed
+        // as a subcommand. `-z/--oneshot` is the documented script/pipe entry
+        // point and takes the prompt as its value, so the prompt (the first
+        // passthrough arg) is moved into `-z` and the remainder stays positional.
+        "hermes" => {
+            if let Some(ref model) = model {
+                args.extend(["-m".to_string(), model.clone()]);
+            }
+            if let Some((prompt, rest)) = positional_args.split_first() {
+                args.push("-z".to_string());
+                args.push(prompt.clone());
+                positional_args = rest.to_vec();
             }
         }
         _ => bail!("Unsupported AI agent: {}", agent),
@@ -942,7 +985,7 @@ pub fn build_agent_launch_spec_with_options(
     // that treat trailing positional args as the prompt still work.
     args.extend(extra_agent_args.iter().cloned());
 
-    args.extend(passthrough_args);
+    args.extend(positional_args);
 
     let display = if let Some(model) = model {
         format!("{} ({})", agent, model)
@@ -1104,6 +1147,28 @@ pub fn spawn_background_hook(command: Option<&str>, cwd: &Path, label: &str) -> 
         .spawn()
         .with_context(|| format!("Failed to start {} hook", label))?;
 
+    Ok(())
+}
+
+/// Start a post-removal hook after the target directory is gone while keeping
+/// its identity explicit for scripts that need to clean up target-specific data.
+pub fn spawn_post_remove_hook(command: Option<&str>, removed_path: &Path) -> Result<()> {
+    let Some(command) = command.filter(|cmd| !cmd.trim().is_empty()) else {
+        return Ok(());
+    };
+    let context = tempfile::tempdir().context("Failed to create post_remove hook context")?;
+    let mut child = platform_shell(command)
+        .current_dir(context.path())
+        .env("STAX_REMOVED_WORKTREE_PATH", removed_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Failed to start post_remove hook")?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        drop(context);
+    });
     Ok(())
 }
 
@@ -1485,11 +1550,34 @@ mod tests {
         ExistingTmuxSessionBehavior, LaunchOptions, LaunchSpec, WorktreeDetails,
         build_agent_launch_spec_with_options, build_launch_spec, build_tmux_launch_spec,
         default_tmux_session_name, is_tmux_no_server_error, parse_tmux_sessions_output,
-        worktree_removal_blockers_for_cleanup, yolo_flag_for_agent,
+        spawn_post_remove_hook, worktree_removal_blockers_for_cleanup, yolo_flag_for_agent,
     };
     use crate::config::Config;
     use crate::git::repo::WorktreeInfo;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn post_remove_hook_receives_removed_target_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary");
+        let removed = dir.path().join("removed-worktree");
+        std::fs::create_dir(&primary).unwrap();
+        let log = dir.path().join("hook-path");
+        let command = format!(
+            "printf '%s' \"$STAX_REMOVED_WORKTREE_PATH\" > '{}'",
+            log.display()
+        );
+        spawn_post_remove_hook(Some(&command), &removed).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !log.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            removed.to_string_lossy()
+        );
+    }
 
     fn sample_worktree_details() -> WorktreeDetails {
         WorktreeDetails {
@@ -1610,11 +1698,58 @@ mod tests {
             Some("--dangerously-bypass-approvals-and-sandbox")
         );
         assert_eq!(yolo_flag_for_agent("gemini"), Some("--yolo"));
+        assert_eq!(yolo_flag_for_agent("hermes"), Some("--yolo"));
         // opencode and pi are intentionally unsupported for --yolo right now
         // (see yolo_flag_for_agent docstring).
         assert_eq!(yolo_flag_for_agent("opencode"), None);
         assert_eq!(yolo_flag_for_agent("pi"), None);
         assert_eq!(yolo_flag_for_agent("unknown"), None);
+    }
+
+    #[test]
+    fn build_agent_launch_spec_hermes_moves_prompt_into_oneshot_flag() {
+        let launch = build_agent_launch_spec_with_options(
+            "hermes",
+            Some("anthropic/claude-sonnet-4.6".to_string()),
+            vec!["trace the flaky test".to_string()],
+            false,
+            &[],
+        )
+        .expect("hermes launch");
+
+        match launch {
+            LaunchSpec::Process {
+                program,
+                args,
+                display,
+            } => {
+                assert_eq!(program, "hermes");
+                // A bare positional arg would be parsed by hermes as a
+                // subcommand, so the prompt must be carried by -z/--oneshot.
+                assert_eq!(
+                    args,
+                    vec![
+                        "-m".to_string(),
+                        "anthropic/claude-sonnet-4.6".to_string(),
+                        "-z".to_string(),
+                        "trace the flaky test".to_string(),
+                    ]
+                );
+                assert_eq!(display, "hermes (anthropic/claude-sonnet-4.6)");
+            }
+            LaunchSpec::Shell { .. } => panic!("expected process launch"),
+        }
+    }
+
+    #[test]
+    fn build_agent_launch_spec_hermes_without_prompt_has_no_oneshot_flag() {
+        let launch = build_agent_launch_spec_with_options("hermes", None, vec![], false, &[])
+            .expect("hermes launch without prompt");
+
+        match launch {
+            LaunchSpec::Process { args, .. } => assert_eq!(args, Vec::<String>::new()),
+            LaunchSpec::Shell { .. } => panic!("expected process launch"),
+        }
     }
 
     #[test]

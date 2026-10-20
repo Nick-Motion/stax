@@ -7,7 +7,8 @@ file and times `cargo build` (the stax binary) and `cargo build --tests` (the
 integration test binary) for every linker in turn, so host noise lands on each
 side alike. The linker command rustc actually ran is recorded per variant from
 `--print link-args`, so a variant that silently fell back to the default shows
-up in the report.
+up in the report. Failed timed builds are counted but excluded from the timing
+summary, and the exit code is nonzero when any build failed.
 
 Example:
   benchmark-linkers.py --repo . --linker default= \
@@ -47,6 +48,8 @@ def cargo(args, repo, env):
 
 def linker_evidence(repo, env):
     _, proc = cargo(["rustc", "--bin", "stax", "--", "--print", "link-args"], repo, env)
+    if proc.returncode:
+        sys.exit(f"link-args probe failed:\n{proc.stderr[-2000:]}")
     line = next((l for l in proc.stdout.splitlines() if "-o" in l and ("ld" in l or "cc" in l)), "")
     hits = re.findall(r'(?:"?[^"\s]*(?:ld-path|fuse-ld|gcc-ld|self-contained|linker-flavor)[^"\s]*"?)', line)
     return {"link_args_sample": line[:200], "linker_hints": hits[:6]}
@@ -60,6 +63,8 @@ def main():
     ap.add_argument("--target-root", help="defaults to <repo>/target-linkbench")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    if args.repeats < 1:
+        ap.error("--repeats must be at least 1")
     repo = Path(args.repo).resolve()
     target_root = Path(args.target_root) if args.target_root else repo / "target-linkbench"
     linkers = dict(spec.split("=", 1) for spec in args.linker)
@@ -87,15 +92,20 @@ def main():
     summary = []
     for name in linkers:
         for phase in PHASES:
-            walls = [r["wall_s"] for r in runs if r["linker"] == name and r["phase"] == phase]
-            summary.append({"linker": name, "phase": phase, "runs": len(walls), "median_s": statistics.median(walls),
-                            "min_s": min(walls), "max_s": max(walls),
-                            "failures": sum(r["exit"] != 0 for r in runs if r["linker"] == name and r["phase"] == phase)})
+            group = [r for r in runs if r["linker"] == name and r["phase"] == phase]
+            walls = [r["wall_s"] for r in group if r["exit"] == 0]
+            summary.append({"linker": name, "phase": phase, "runs": len(group),
+                            "median_s": statistics.median(walls) if walls else None,
+                            "min_s": min(walls) if walls else None, "max_s": max(walls) if walls else None,
+                            "failures": len(group) - len(walls)})
     report = {"repo": str(repo), "load_average": os.getloadavg(), "linkers": linkers, "evidence": evidence,
               "summary": summary, "runs": runs}
     Path(args.out).write_text(json.dumps(report, indent=1))
     for row in summary:
-        print(f"{row['linker']:>8} {row['phase']:<6} median {row['median_s']:7.2f}s range {row['min_s']:.2f}-{row['max_s']:.2f}s failures {row['failures']}")
+        timing = (f"median {row['median_s']:7.2f}s range {row['min_s']:.2f}-{row['max_s']:.2f}s"
+                  if row["median_s"] is not None else "no successful build")
+        print(f"{row['linker']:>8} {row['phase']:<6} {timing} failures {row['failures']}")
+    sys.exit(1 if any(r["exit"] != 0 for r in runs) else 0)
 
 
 if __name__ == "__main__":

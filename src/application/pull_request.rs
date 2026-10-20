@@ -378,7 +378,10 @@ mod tests {
         ISOLATE.call_once(|| unsafe {
             std::env::set_var(
                 "STAX_CONFIG_DIR",
-                std::env::temp_dir().join("stax-pull-request-tests-no-config"),
+                std::env::temp_dir().join(format!(
+                    "stax-pull-request-tests-no-config-{}",
+                    std::process::id()
+                )),
             )
         });
     }

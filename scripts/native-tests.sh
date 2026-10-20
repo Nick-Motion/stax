@@ -30,7 +30,7 @@ mkdir -p "${test_tmpdir}"
 # Tokens and proxy configuration both steer forge HTTP clients, so neither may
 # leak in from the developer's shell: a proxy would reroute the loopback mock
 # servers the tests talk to.
-unset GITHUB_TOKEN STAX_GITHUB_TOKEN GH_TOKEN
+unset GITHUB_TOKEN STAX_GITHUB_TOKEN GH_TOKEN BB_CLI BB_THREAD_ID
 unset ALL_PROXY HTTPS_PROXY HTTP_PROXY NO_PROXY
 unset all_proxy https_proxy http_proxy no_proxy
 export STAX_DISABLE_UPDATE_CHECK=1

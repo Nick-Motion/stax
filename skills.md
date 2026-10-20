@@ -1,4 +1,4 @@
-<!-- stax-skills-version: 0.115.0 -->
+<!-- stax-skills-version: 0.117.0 -->
 # Stax Skills for AI Coding Agents
 
 This document teaches AI coding agents (Claude Code, Codex, Cursor, Gemini CLI, Hermes, OpenCode, pi) how to use `stax` to manage stacked Git branches and PRs.
@@ -284,7 +284,8 @@ fork_remote = "fork"               # name of a pre-configured git remote for the
 # CLI authentication, including GH_TOKEN/GITHUB_TOKEN. For known older versions,
 # stax strips those overrides before `gh stack` and falls back to a keyring OAuth
 # account. `stax doctor` always shows the installed version, marks anything below
-# v0.1.0 as out of date (v0.1.0 adds `gh stack merge` for atomic `merge --stack`),
+# v0.2.1 as out of date (v0.1.0 added `gh stack merge` for atomic `merge --stack`;
+# v0.2.1 fixes custom SSH host aliases),
 # can upgrade it with `stax doctor --fix`, and probes legacy OAuth (versions
 # below v0.0.8 only) only when token overrides exist.
 # Native GitHub Stack updates are append-only. If relinking would remove or insert
@@ -387,9 +388,11 @@ stax stats --json                   # Machine-readable RepoStats document
 stax stats --ci                     # Add an opt-in CI roll-up (network call); omitted (non-fatal) without forge auth — always exits 0
 
 stax refresh|r                      # Sync trunk, restack, then submit (no merged cleanup; no Sync plan prompt)
+stax refresh --get                  # Before restacking, reconcile each branch in the current stack against its remote ref; use after another machine rebased/force-pushed the stack (add --force to let the remote win)
 stax refresh --no-pr                # Push only after trunk sync/restack
 stax refresh --no-submit            # Trunk sync/restack only
 stax refresh --all-stacks           # Sync trunk once, then restack/submit every independent stack; needs a clean tree unless --auto-stash-pop; stops at first conflict
+# With --all-stacks, --get still reconciles only the current stack; other stacks restack from local commits.
 stax refresh --all-stacks --auto-stash-pop # Stash/pop dirty worktrees while refreshing every stack
 stax refresh --force                # Force sync without prompts first
 stax refresh --force --yes --no-prompt # Full refresh without sync/submit prompts
@@ -620,6 +623,15 @@ missing-PR lookups and mutations deliberately retain their resource-level
 errors.
 
 ## Common Workflows
+
+### Create a PR for the Current Work
+
+1. Inspect `git status`, the current branch diff, `stax ll`, and repository instructions. Confirm the work belongs on the current branch and identify its stacked parent.
+2. Run the repository-prescribed checks for the changed behavior before submitting. Commit outstanding changes appropriately with stax; do not hide unrelated work in the commit.
+3. Submit only the current branch. For a new PR or an existing draft PR, run `stax branch submit --draft --ai --yes`. For an existing ready PR, run `stax branch submit --ai --yes` to preserve its ready-for-review state. Remember: plain `stax submit` submits the full stack.
+4. Validate the resulting PR URL, base branch, and draft/ready state with `stax ll`; inspect the generated description with `stax pr body`; optionally check remote status with `stax ci`.
+
+`--yes` accepts the AI-generated PR details; it does not waive repository verification. Never undraft or merge without explicit approval.
 
 ### Start a New Feature Stack
 

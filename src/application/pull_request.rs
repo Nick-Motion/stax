@@ -371,7 +371,23 @@ mod tests {
         );
     }
 
+    /// The developer's own `~/.config/stax` must not decide whether the
+    /// test remote is trusted. Nextest runs each test in its own process.
+    fn isolate_global_config() {
+        static ISOLATE: std::sync::Once = std::sync::Once::new();
+        ISOLATE.call_once(|| unsafe {
+            std::env::set_var(
+                "STAX_CONFIG_DIR",
+                std::env::temp_dir().join(format!(
+                    "stax-pull-request-tests-no-config-{}",
+                    std::process::id()
+                )),
+            )
+        });
+    }
+
     fn test_repo() -> (tempfile::TempDir, GitRepo, RepositorySession) {
+        isolate_global_config();
         let dir = tempfile::tempdir().unwrap();
         git(dir.path(), &["init", "-b", "main"]);
         git(dir.path(), &["config", "user.name", "Test User"]);

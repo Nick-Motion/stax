@@ -365,7 +365,7 @@ These rules apply to AI-generated PR titles and bodies from `generate` and `subm
 | `st ci` / `st ci --oneline` | Live CI status for each PR head — full per-check table, or one compact line per branch across the stack; GitHub statuses and check runs are fetched across all pages before roll-up |
 | `st ci -w --alert` | Watch CI until all checks finish, then play success/error sounds |
 | `st ci -w --strict` | Watch CI but exit as soon as any check fails |
-| `st rs` / `st rs --restack` | Sync trunk, clean merged branches, report closed-but-unmerged PR branches without deleting them, optionally rebase |
+| `st rs` / `st rs --restack` | Sync trunk, clean merged branches, report closed-but-unmerged PR branches without deleting them, optionally rebase; shows live progress while preparing the sync plan |
 | `st sweep` | Classify local branches (merged/closed-pr/gone/stale/active); `--delete` cleans merged and safe upstream-gone branches, while `--delete --include-closed` explicitly discards closed PR branches |
 | `st stats` | Single-screen, local-only snapshot of stacking health (stack shape, PR mix, restack/parent/dirty health, worktree lanes, hygiene, next action); `--current` scopes to the current stack, `--json` for machine output, `--ci` adds an opt-in CI roll-up |
 | `st refresh` / `st r` | Sync trunk without merged-branch cleanup, restack current stack, then push/update PRs (pass `--delete-merged` to opt into `sync`-style cleanup) |

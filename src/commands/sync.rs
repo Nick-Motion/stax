@@ -1598,6 +1598,8 @@ impl SyncContext {
             return Ok(SyncFlow::Continue);
         }
 
+        let plan_started_at = Instant::now();
+        let plan_timer = LiveTimer::maybe_new_stderr(true, "Prepare sync plan");
         let local_trunk = self.local_trunk_before_sync.as_deref();
         let remote_trunk = self.remote_trunk_after_fetch.as_deref();
 
@@ -1662,6 +1664,10 @@ impl SyncContext {
         // A trunk fast-forward is what `stax sync` is *for* — don't ask about it on its own.
         // Only branch deletions and history-rewriting restacks are worth a prompt.
         let needs_confirm = confirm_deletions || !restack_candidates.is_empty();
+
+        self.step_timings
+            .push(("prepare sync plan".to_string(), plan_started_at.elapsed()));
+        LiveTimer::maybe_finish_timed(plan_timer);
 
         if !needs_confirm {
             return Ok(SyncFlow::Continue);

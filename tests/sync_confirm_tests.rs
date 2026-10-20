@@ -59,7 +59,14 @@ fn sync_confirm_cancel_leaves_merged_branch_and_writes_no_receipt() {
         "cancelling before trunk update should not write a sync receipt"
     );
     let stdout = TestRepo::stdout(&out);
-    assert!(stdout.contains("Sync plan"), "stdout: {stdout}");
+    let plan_progress = stdout
+        .rfind("Prepare sync plan")
+        .expect("plan progress row");
+    let prompt = stdout.find("Sync plan").expect("sync plan prompt");
+    assert!(
+        plan_progress < prompt,
+        "finish progress before prompting: {stdout}"
+    );
     assert!(stdout.contains("Aborted."), "stdout: {stdout}");
 }
 
@@ -117,13 +124,20 @@ fn sync_does_not_prompt_when_only_trunk_moves() {
     // Advance origin/main only — nothing to delete, nothing to restack.
     repo.simulate_remote_commit("upstream.txt", "content", "Upstream commit");
 
-    let out = repo.run_stax(&["sync"]);
+    let out = repo.run_stax(&["sync", "--verbose"]);
     assert!(
         out.status.success(),
         "sync failed: {}",
         TestRepo::stderr(&out)
     );
     let stdout = TestRepo::stdout(&out);
+    let stderr = TestRepo::stderr(&out);
+    assert!(stderr.contains("✓ Prepare sync plan"), "stderr: {stderr}");
+    assert!(!stdout.contains("Prepare sync plan"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("prepare sync plan"),
+        "timing summary: {stdout}"
+    );
     assert!(
         !stdout.contains("Sync plan") && !stdout.contains("How should sync proceed?"),
         "a plain trunk fast-forward must not prompt: {stdout}"
@@ -140,6 +154,10 @@ fn sync_force_skips_interactive_sync_plan() {
     assert!(
         !stdout.contains("Sync plan"),
         "--force must not show the interactive plan: {stdout}"
+    );
+    assert!(
+        !TestRepo::stderr(&out).contains("Prepare sync plan"),
+        "--force skips plan preparation"
     );
     assert!(
         !branch_exists(&repo, &feature),

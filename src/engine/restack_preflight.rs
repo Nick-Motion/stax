@@ -18,7 +18,14 @@
 //! are already merged. In that case restack rebases from the merge-base (a
 //! no-op) rather than the stale stored boundary.
 //!
-//! A third signal covers *squash merges*. When the leading commits of a branch
+//! A third signal covers a stored boundary that sits strictly *behind* the
+//! merge-base. Everything between the two is already in the parent's history,
+//! so replaying from the stored boundary re-applies other people's commits and
+//! can conflict on files the branch never touched. The count heuristic can miss
+//! this when the stale range is only slightly under the ratio threshold, so the
+//! ancestry relation is checked directly.
+//!
+//! A fourth signal covers *squash merges*. When the leading commits of a branch
 //! already landed on the parent as one squash commit, their cumulative diff
 //! matches a parent commit even though no single branch commit does, so git
 //! replays them and conflicts on files the branch no longer needs to change.
@@ -59,6 +66,9 @@ pub struct RestackPreflight {
     pub parent_tip: Option<String>,
     pub stored_to_branch: Option<usize>,
     pub merge_base_to_branch: Option<usize>,
+    /// The stored boundary is a proper ancestor of the merge-base, so the
+    /// commits between them already belong to the parent.
+    pub stored_behind_merge_base: bool,
     /// Leading branch commits already on `parent` as one squash commit, when the
     /// stored boundary would still replay them.
     pub(crate) squash_merged_prefix: Option<SquashMergedPrefix>,
@@ -107,6 +117,13 @@ impl RestackPreflight {
 
         let parent_tip = repo.branch_commit(parent).ok();
 
+        let stored_behind_merge_base = match merge_base.as_deref() {
+            Some(mb) if !stored_revision.trim().is_empty() && mb != stored_revision => {
+                repo.is_ancestor(stored_revision, mb).unwrap_or(false)
+            }
+            _ => false,
+        };
+
         // Skip prefixes the stored boundary already excludes.
         let squash_merged_prefix = repo
             .find_squash_merged_prefix(branch, parent)
@@ -127,6 +144,7 @@ impl RestackPreflight {
             parent_tip,
             stored_to_branch,
             merge_base_to_branch,
+            stored_behind_merge_base,
             squash_merged_prefix,
         })
     }
@@ -172,7 +190,10 @@ impl RestackPreflight {
         if let Some(prefix) = &self.squash_merged_prefix {
             return Some(&prefix.tip);
         }
-        if !self.is_suspicious() && !self.already_rebased_externally() {
+        if !self.is_suspicious()
+            && !self.already_rebased_externally()
+            && !self.stored_behind_merge_base
+        {
             return None;
         }
         self.merge_base.as_deref()
@@ -212,7 +233,7 @@ pub fn choose_rebase_upstream(
                 report.parent,
                 &prefix.trunk_commit[..prefix.trunk_commit.len().min(12)]
             )
-        } else if report.is_suspicious() {
+        } else if report.is_suspicious() || report.stored_behind_merge_base {
             format!(
                 "'{}' stored boundary from '{}' would replay {} commit(s); using merge-base boundary ({} commit(s))",
                 report.branch,
@@ -259,6 +280,7 @@ mod tests {
             parent_tip: None,
             stored_to_branch: stored,
             merge_base_to_branch: mb,
+            stored_behind_merge_base: false,
             squash_merged_prefix: None,
         }
     }
@@ -277,6 +299,7 @@ mod tests {
             parent_tip: parent_tip.map(|s| s.into()),
             stored_to_branch: None,
             merge_base_to_branch: None,
+            stored_behind_merge_base: false,
             squash_merged_prefix: None,
         }
     }
@@ -368,5 +391,18 @@ mod tests {
             structural_pf("tip", Some("tip"), Some("tip")).corrected_upstream(),
             None
         );
+    }
+
+    #[test]
+    fn stored_behind_merge_base_uses_merge_base_even_below_ratio_threshold() {
+        // 66 stored vs 16 own commits: 66 <= 16 * RANGE_RATIO + ABSOLUTE_HEADROOM,
+        // so the count heuristic stays quiet, but the stored boundary is stale.
+        let report = RestackPreflight {
+            stored_behind_merge_base: true,
+            ..pf(Some(66), Some(16))
+        };
+        assert!(!report.is_suspicious());
+        assert_eq!(report.corrected_upstream(), Some("def"));
+        assert_eq!(pf(Some(66), Some(16)).corrected_upstream(), None);
     }
 }

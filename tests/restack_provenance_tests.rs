@@ -536,6 +536,64 @@ fn test_many_trunk_commits_linear_restack_only_replays_feature_commits() {
     );
 }
 
+/// Stored boundary sits behind the merge-base, but the stored range is only just under the
+/// count heuristic's threshold (66 stored vs 16 own commits: 66 <= 16 * 4 + 5), so only the
+/// ancestry check can notice the 50 trunk commits between them already belong to main.
+/// Replaying them from the stored boundary conflicts on a file the branch never edited.
+#[test]
+fn test_stale_stored_boundary_below_ratio_threshold_does_not_replay_trunk_commits() {
+    const TRUNK_COMMITS: usize = 50;
+    const FEATURE_COMMITS: usize = 16;
+
+    let repo = TestRepo::new();
+    let stale_boundary = repo.get_commit_sha("HEAD");
+
+    for i in 0..TRUNK_COMMITS {
+        repo.create_file("shared.txt", &format!("trunk line {i}"));
+        repo.commit(&format!("Trunk commit {i}"));
+    }
+
+    assert_git_success(
+        &repo,
+        &["checkout", "-b", "late-feature"],
+        "create late-feature from advanced main",
+    );
+    for i in 0..FEATURE_COMMITS {
+        repo.create_file(&format!("feat{i}.txt"), &format!("feature {i}"));
+        repo.commit(&format!("Feature work {i}"));
+    }
+
+    assert_git_success(&repo, &["checkout", "main"], "checkout main");
+    repo.create_file("other.txt", "main moved on");
+    repo.commit("Main advances again");
+
+    assert_eq!(
+        rev_list_count(&repo, &format!("{stale_boundary}..late-feature")),
+        TRUNK_COMMITS + FEATURE_COMMITS,
+        "sanity: stored boundary should replay trunk and feature commits"
+    );
+
+    write_branch_metadata_raw(&repo, "late-feature", "main", &stale_boundary);
+    repo.set_trunk("main");
+
+    assert_git_success(
+        &repo,
+        &["checkout", "late-feature"],
+        "checkout late-feature",
+    );
+    let output = repo.run_stax(&["restack", "--yes", "--quiet"]);
+    output.assert_success();
+    assert!(
+        !repo.has_rebase_in_progress(),
+        "rebase should finish cleanly instead of replaying trunk commits"
+    );
+    assert_eq!(
+        rev_list_count(&repo, "main..late-feature"),
+        FEATURE_COMMITS,
+        "only the feature's own commits should sit on top of main"
+    );
+}
+
 /// Same scenario as `test_many_trunk_commits_linear_restack_only_replays_feature_commits`,
 /// but through `stax sync --restack` (`st rs --restack`) after pushing trunk and feature.
 #[test]

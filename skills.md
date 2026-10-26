@@ -354,7 +354,7 @@ stax sync --continue               # Continue after resolved sync conflicts
 stax sync --safe                   # Avoid hard reset on trunk update
 stax sync --force                  # Force sync without prompts; preserve linked worktrees during cleanup
 # A deleted remote head does not make a known CLOSED PR merged. Closed branches stay local; stax sweep --delete --include-closed discards them explicitly.
-# Interactive Sync plan: stax sync/rs only (not refresh/update). After fetch + PR metadata refresh; lists trunk, deletions, restack cascade; skipped with --force, --quiet, or --json.
+# Interactive Sync plan: stax sync/rs only (not refresh/update). After fetch + PR metadata refresh, a live Prepare sync plan timer on stderr covers analysis and appears in --verbose timings; lists trunk, deletions, restack cascade; skipped with --force, --quiet, or --json.
 # [sync] confirm_delete = false in config: sync/rs and bare `stax get` delete merged branches without the prompt (linked-worktree branches still ask; --quiet/--json still skip deletions).
 stax sync --prune                  # Deprecated: accepted for compatibility, emits a stderr warning; use --full instead
 stax sync --full                   # Fetch all remote branches and tags with --prune (slower; default is trunk-only fetch + ls-remote)

@@ -2,6 +2,12 @@
 
 stax: Rust CLI for stacked Git branches and PRs. Branch metadata lives in git refs (`refs/branch-metadata/<branch>`, trunk in `refs/stax/trunk`), compatible with freephite. Everything else is discoverable from `src/`; this file only covers what isn't.
 
+## Local fork delivery policy
+
+For this `Nick-Motion/stax` fork, land verified changes on local `main` and push to `nick/main`. Do not create pull requests. Keep `origin` as the upstream source. Preserve existing histories with normal merges or fast-forwards; never force-push `main`.
+
+Keep the harness's planning, independent review, and verification gates. Its release manager must commit the verified result, fast-forward local `main` to it, and push only `nick/main`. This policy overrides the automatic draft-PR and no-main-delivery instructions in the harness and agent definitions below.
+
 ## Harness: stax-dev
 
 **Goal:** Accelerate stax feature development and bug fixing via a git-native worktree → plan → implement → review → verify → (optional) benchmark → commit → draft-PR pipeline with a bounded repair loop.
